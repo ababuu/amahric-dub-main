@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------------
+# Secrets - NEVER commit real credentials
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Tooling caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Working data (directories are kept in git via .gitkeep, contents are not)
+# ---------------------------------------------------------------------------
+data/input/*
+!data/input/.gitkeep
+# Test videos are inputs the GPU runner needs, not generated artifacts.
+!data/input/*.mp4
+
+data/working/*
+!data/working/.gitkeep
+
+data/output/*
+!data/output/.gitkeep
+
+# Run directories written by `--out` (the README's `runs/<name>` example).
+runs/
+
+# ---------------------------------------------------------------------------
+# Model weights and caches (downloaded at runtime, never committed)
+# ---------------------------------------------------------------------------
+models_cache/
+models_cache/**
+# A bare `models/` is not the configured cache directory (`models_cache` is), but a
+# relative MODEL_CACHE_DIR - which is what a test or a quick script tends to set -
+# resolves to exactly this, and a partial download landing in the tree must never be
+# committable.
+models/
+models/**
+.cache/
+.huggingface/
+torch_cache/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# ---------------------------------------------------------------------------
+# Media and audio artifacts
+# ---------------------------------------------------------------------------
+# Generated audio and video never belong in git. MP4 inputs do: a small test clip
+# is what scripts/test_gpu.py runs, so `data/input/*.mp4` re-includes it below.
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.mkv
+*.mov
+*.webm
+
+# Native-speaker voice samples are pipeline *inputs*, not artifacts: the GPU worker
+# needs them to give each character an Amharic voice instead of the film's own English
+# audio, exactly as it needs the test clip above. They are a few hundred KB each. These
+# negations have to come after the media block, because the last matching rule wins.
+!data/voice-samples/*.mp3
+!data/voice-samples/*.wav
+!data/voice-samples/*.flac
+!data/voice-samples/*.m4a
+
+# ---------------------------------------------------------------------------
+# JSON manifests generated during processing
+# ---------------------------------------------------------------------------
+data/**/*.json
+*.diarization.json
+*.transcript.json
+*.amharic.json
+*.dub.json
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

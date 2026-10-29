@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Amharic dubbing pipeline - runtime dependencies
+#
+#     pip install -r requirements.txt
+#
+# Mirrors [project.dependencies] in pyproject.toml.
+#
+# The RunPod PyTorch worker image already provides Python 3.12, PyTorch 2.8,
+# torchaudio 2.8, CUDA 12.8 and FFmpeg. The two torch entries below are kept so
+# the ABI matches the packages underneath and are normally already satisfied.
+#
+# Model weights (audio-separator, pyannote, faster-whisper, OmniVoice) are downloaded at
+# runtime into MODEL_CACHE_DIR; they are never listed here.
+# ---------------------------------------------------------------------------
+
+# --- Deep learning runtime -------------------------------------------------
+torch==2.8.0
+torchaudio==2.8.0
+
+# --- Pipeline models -------------------------------------------------------
+# GPU-enabled audio-separator provides BS-Roformer vocal/instrumental separation.
+audio-separator[gpu]>=0.47,<0.48
+# Imported internally by audio-separator's UVR audio helpers.
+audioread
+# pyannote Community-1 - speaker diarization.
+pyannote.audio==4.0.7
+# faster-whisper large-v3 - transcription (CTranslate2 backend).
+faster-whisper
+# huggingface_hub fetches the OmniVoice checkpoint and the Amharic fine-tune.
+huggingface_hub
+# safetensors is the weight format those checkpoints ship in.
+safetensors
+
+# transformers is imported directly by the NLLB backend and by the MMS engine,
+# and OmniVoice requires it (>=5.3) regardless.
+transformers
+# scipy is imported directly by the mixing and prosody stages.
+scipy
+
+# --- Dialogue adaptation / translation client ------------------------------
+# The instruction-following backend talks to any OpenAI-compatible endpoint.
+openai
+# SentencePiece: NLLB's tokenizer. The fast tokenizer ships with transformers, but
+# the checkpoint's tokenizer can fall back to the slow one, which needs this.
+sentencepiece
+
+# --- Amharic speech synthesis (MMS-TTS) ------------------------------------
+# MMS-TTS Amharic takes its text in the Latin alphabet, so Fidel script is
+# romanised with Meta's own uroman before synthesis. A hand-rolled transliteration
+# would be a mispronunciation waiting to happen, and there is no way to check one
+# against the model's own expectations.
+uroman
+
+# --- Amharic speech synthesis (OmniVoice, the default engine) --------------
+# OmniVoice is published as a package, so the default engine needs no checkout of
+# its own. It is what clones a per-character voice and accepts a per-line length,
+# which is why it is the default. Note its own floor is transformers>=5.3, and that
+# the model weights it downloads are CC-BY-NC.
+omnivoice
+
+# --- Audio I/O and numerics ------------------------------------------------
+soundfile
+# NumPy 2.x is the verified baseline: the pyannote stack needs it, and the
+# upper bound only keeps a transitive resolver from pulling a 3.x release.
+numpy>=2,<3
+
+# --- Configuration ---------------------------------------------------------
+python-dotenv
+
+# --- Transitive pins needed for a working install --------------------------
+# TorchCodec 0.7.x is the release line built against torch 2.8.
+torchcodec>=0.7,<0.8
+# PyAV 19 removed the metadata_errors keyword that faster-whisper still passes.
+av>=18.0,<19.0
+
+# --- Development / testing (not needed to run the pipeline) ----------------
+pytest>=8.0

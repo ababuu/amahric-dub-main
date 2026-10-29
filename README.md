@@ -1,0 +1,1359 @@
+# Amharic Dubbing Pipeline
+
+An open-source pipeline for dubbing movies into **Amharic** while preserving the
+original music and sound effects. The soundtrack is split into dialogue, music,
+and effects; the dialogue is transcribed, translated/adapted, re-voiced with
+cloned voices, re-timed, and mixed back with the untouched music and effects.
+
+> **Status: the pipeline is complete end to end and produces a dubbed MP4.** The
+> soundtrack is split into dialogue, music and effects; the dialogue is
+> diarized, transcribed, adapted into spoken Amharic, voiced per character, fitted
+> to the original timings, re-mixed under the untouched music and effects, and
+> muxed back into the video with the picture copied rather than re-encoded. A
+> single command drives all of it. See [Roadmap](#roadmap) for what is
+> deliberately left for later.
+
+---
+
+## Planned pipeline
+
+```mermaid
+flowchart LR
+    V["Source video"] --> SEP["Source separation<br/>BS-Roformer via audio-separator"]
+    SEP -->|dialogue| DIA["Speaker diarization<br/>pyannote Community-1"]
+    DIA --> ASR["Transcription<br/>faster-whisper large-v3"]
+    ASR --> SEN["Sentence assembly<br/>one unit per spoken thought"]
+    SEN --> TR["Adapt + translate to Amharic<br/>NLLB-200 3.3B or an LLM with<br/>scene + character bible"]
+    TR --> VP["Voice profiles<br/>best clean reference per speaker"]
+    VP --> TTS["Speech synthesis<br/>OmniVoice cloned voice per character"]
+    TTS --> TIM["Timing alignment"]
+    TIM --> MIX["Mixing"]
+    SEP -->|music + effects| MIX
+    MIX --> QC["Quality control<br/>fit, rate, crosstalk"]
+    QC --> OUT["Dubbed video<br/>Bunny Stream"]
+```
+
+## Tech stack
+
+| Concern              | Choice                                  |
+| -------------------- | --------------------------------------- |
+| Language             | Python 3.12                             |
+| Runtime              | RunPod A40 worker, NVIDIA CUDA 12.8     |
+| Framework            | PyTorch 2.8 + torchaudio 2.8            |
+| Media                | FFmpeg                                  |
+| Source separation    | audio-separator BS-Roformer (CUDA; vocals + instrumental) |
+| Diarization          | pyannote Community-1                    |
+| Transcription        | faster-whisper large-v3                 |
+| Translation/adaptation | **NLLB-200 3.3B** (default, local) or any OpenAI-compatible endpoint (opt-in) |
+| Speech synthesis     | **OmniVoice Amharic** (`african-low-resource/omnivoice-amharic`, default, cloned voice per character) or MMS-TTS Amharic (single voice) |
+| Quality control      | `qc.py` (model-free; pronunciation measurement is injected) |
+
+## Choosing a translation backend
+
+`TRANSLATION_BACKEND` selects between two genuinely different things, and the
+difference is worth understanding before changing it:
+
+| | `openai` (default) | `nllb` |
+| --- | --- | --- |
+| What it is | an instruction-following LLM | a translation model, 200 languages |
+| Amharic translation quality | weaker than NLLB on measured benchmarks | stronger |
+| Scene/character context | yes, via the character bible | no |
+| Syllable budget + validation | **yes; one request per batch** | no |
+| Borrowed-word policy (Fidel) | **enforced** | not expressible |
+| Per-line performance metadata | emotion, intensity, delivery, pauses | neutral defaults |
+| Runs locally, no key | no | yes |
+
+**Why the LLM is the default even though NLLB translates better.** Measured on a real
+run of the test clip, NLLB produced Amharic needing **1.66x** the time available, left
+`Skyler` in Latin script (which a Fidel-reading voice cannot pronounce - the run's
+`coverage` line reported it as a borrowed word still to pin), and offered no mechanism to
+shorten anything. There was nothing to send a line back *to*. The consequence was 31 of
+38 lines cut short, which is what a listener hears as words chopped mid-syllable.
+
+Translation quality is not the binding constraint for a dub. Length and pronounceability
+are, and only an instructable model can be held to them. Verified against the real API on
+the film's own lines, the LLM returns borrowed words in Fidel (`Skyler` -> `ስካይለር`,
+`Walt` -> `ዋልት`) and inflects for the character it is speaking as (`አታውቂም`, feminine, to
+Skyler). NLLB does neither.
+
+`TRANSLATION_BACKEND=nllb` remains fully supported and is the better choice if you only
+need a rough translation, are offline, or want to compare.
+
+**The honest limitation.** Amharic does not fit into English time. The English actor said
+"I am not in danger, Skyler." in 1.96s; the shortest faithful Amharic is about 12
+syllables, which no delivery squeezes into that. Measured across two independent models,
+both came back at **~1.7-1.8x** the available time. By default the pipeline makes one
+hosted call per batch; it still asks for concise Amharic and Fidel script in that first
+call, then reports lines that miss those targets rather than charging for a rewrite.
+Each batch is sent once: there are no rewrite requests, SDK retries, or provider
+failovers. The first prompt asks for concise Amharic and Fidel script, then the pipeline
+reports lines that miss those targets. A missing `GEMINI_API_KEY` selects DeepSeek before
+the first request; an actual request failure stops the run. The pipeline does not cut the
+performance (see `TIMING_TRIM_TO_FIT`).
+
+**Why NLLB, and why 3.3B.** This was checked against published Amharic numbers rather
+than assumed. NLLB-200 beats every open instruction-following model tried on Amharic:
+on AFRIDOC-MT's document-level metric the 3.3B checkpoint scores **52.2** (d-chrF,
+eng→amh) against 49.3 for the distilled 1.3B, and AfriScience-MT put the best open LLM
+(AfriqueLlama-8B) about four points of SSA-COMET behind NLLB-1.3B zero-shot while
+Gemma-2-9B collapsed to **6.5** d-chrF on this direction. Two of the newest "flagship"
+translation models - Tencent **Hunyuan-MT** and ByteDance **Seed-X** - do not support
+Amharic at all, verified from their own language tables, and `Gemma`/`Qwen` language
+counts never name it. The 3.3B checkpoint costs ~6.6 GB in bf16, which the 48 GB card
+carries without displacing anything else. Weights are **CC-BY-NC-4.0**.
+
+**What is still missing.** No Amharic dialogue, subtitle or dubbing MT benchmark exists
+anywhere - closest proxies are document-level health/scientific corpora - so "natural
+cinematic Amharic dialogue" cannot be verified from the literature, only from a
+native-speaker read of your own output. The measured path forward is *instruction
+control*: a 2M-parameter LoRA on a permissively licensed 8B model has been measured at
+**58.27 SSA-COMET** eng→amh, i.e. ~93 % of NLLB-1.3B's 62.8 while *also* being able to
+be told to shorten a line or hold a register. That is the next real upgrade here, and it
+is a fine-tuning job, not a model swap.
+
+### Swapping the adaptation model
+
+`TRANSLATION_PROVIDER` is the one knob that changes *which vendor* the `openai` backend
+talks to. It decides four things and nothing else:
+
+| | `gemini` (default) | `deepseek` | `other` |
+| --- | --- | --- | --- |
+| Endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` | `https://api.deepseek.com` | you set it |
+| Default model | `gemini-3.8-flash` | `deepseek-v4-pro` | you set it |
+| Key variable | `GEMINI_API_KEY` | `DEEPSEEK_API_KEY` | `TRANSLATION_API_KEY` |
+| Reasoning control | `reasoning_effort` | `thinking: disabled` | none sent |
+
+Everything else - the prompt, the JSON protocol, the batching, the syllable budgets, the
+reduction passes, the character bible - is identical, which is what makes the model a
+configuration choice rather than a code change. Both endpoints speak the OpenAI wire
+protocol, so the same tested request path serves both. `TRANSLATION_PROVIDER=other`
+supplies **no** defaults on purpose: guessing an address or a model name for a server
+this project has never seen would send a film's requests somewhere nobody asked for, so
+`TRANSLATION_BASE_URL` and `TRANSLATION_MODEL` are both required and a missing one is
+reported by name before any request is sent.
+
+**Swapping back is one variable.** `TRANSLATION_PROVIDER=deepseek` plus
+`DEEPSEEK_API_KEY` is the whole change; `TRANSLATION_MODEL` and `TRANSLATION_BASE_URL`
+follow the provider unless set explicitly, so a stale value copied from an old `.env` is
+the only thing that can point one vendor's key at another vendor's host.
+
+**What Gemini buys.** Syllable condensation is the binding constraint for a dub (see
+`TRANSLATION_SYLLABLES_PER_SECOND`), and an instruction-following model that can be told
+"this line has 12 syllables of room, say it in 12" is the mechanism that closes the
+1.7x gap. `TRANSLATION_THINKING` maps onto the provider's own control - Gemini 3 models
+**cannot stop reasoning**, so `off` reaches its lowest level rather than disabling it,
+and the run's `adaptation` line reports what was actually sent rather than what was
+asked for.
+
+**Checked, not assumed.** `gemini-3.7-flash` is deprecated and auto-routes to
+`gemini-3.8-flash`, so the default names the current model. `temperature` and `top_p`
+are deprecated on Gemini 3.x - ignored now, an error in future generations - so this
+pipeline never sends them. Gemini's OpenAI-compatible endpoint is documented as
+**beta**; `json_object` response mode is not guaranteed there, so a reply that arrives
+wrapped in a markdown fence or a sentence of preamble is unwrapped rather than failing a
+whole film's run, while a reply that is not a JSON object at all still fails.
+
+**If a first batch is rejected.** A beta endpoint is free to refuse a field it does not
+know, and a 400 on batch one would otherwise cost a whole pod run. `TRANSLATION_THINKING=default`
+sends no thinking field at all and lets the model use its own behaviour, which is the one
+thing that cannot be rejected. The run's `adaptation` line always states which of the two
+happened, so a manifest never claims a reasoning level the request did not carry.
+
+**What is not known.** No Google-published English-to-Amharic benchmark exists, and
+neither Gemini 3.8's nor DeepSeek's Amharic *dialogue* quality can be established from
+the literature - only from a native-speaker read of your own output. Free-tier
+requests-per-minute, -day and token limits are no longer published; a two-hour film is
+thousands of lines, so check the limits on your key in AI Studio before starting a full
+run. Treat the choice as a bake-off over a few hundred representative lines, scored
+against the `qc` block, rather than as a model swap that can be assumed to work.
+
+## Choosing a speech engine
+
+`TTS_ENGINE` selects between two genuinely different capabilities:
+
+| | `omnivoice` (default) | `mms` |
+| --- | --- | --- |
+| Voice(s) | **one per character, cloned** | one for the whole film |
+| Where the voice comes from | the character's own reference audio | nowhere - it has one |
+| Per-line length control | **yes** (`speed`) | film-wide only (`MMS_SPEAKING_RATE`) |
+| Output rate | 24 kHz | 16 kHz |
+| Voice profiles needed | yes | no |
+| Deterministic | no (OmniVoice position sampling uses its recommended default) | seeded duration predictor |
+| Amharic quality evidence | **none published** | none published |
+
+**Why OmniVoice is the default, and what that costs.** It is the only supported option
+that clones a voice *and* accepts a per-line length, which matters because the two worst
+defects in the last real run were unfitted lines (27 of 38) and a single flat voice.
+The Amharic-tuned checkpoint is used rather than the multilingual base model so the
+spoken language matches the fine-tuning. Its model card documents cloning but does not
+publish quality benchmarks, so this is a language-specific choice, not a claim that the
+output has been independently evaluated.
+
+**A third engine was removed, and why.** `TTS_ENGINE=chatterbox` used to speak through
+`gabar-tech/chatterbox-amharic` and then convert the take to the character's voice with
+Seed-VC V2. It was the only Amharic TTS with published evaluation and its numbers were
+strong (character error rate **0.095** on held-out speaker-disjoint clips, speaker
+similarity **0.860**), but it was unused, and the pair cost the install a `--no-deps`
+dance around a conflicting `torch` pin plus a separate GPL checkout. Keeping a second
+voice path that no run exercised was worse than dropping it: the code, the settings, the
+dependency and its tests are gone. If a future evaluation shows OmniVoice's unmeasured
+Amharic is not good enough, that adapter is the obvious thing to bring back - and the
+`git` history still has it.
+
+`african-low-resource/omnivoice-amharic` (also published as
+`Lab-et/omnivoice-amharic`) is the Amharic-tuned checkpoint used by default. Its model
+card documents Amharic voice cloning; the inference example passes the language name
+`"Amharic"`. The card's objective and human-evaluation metrics remain **TBD**,
+so this is the best documented Amharic-specific option, not a claim of measured
+quality. Each character uses a clean, transcript-matched reference from the film; the
+reference must contain at least four seconds of speech. The selector targets five
+seconds and prefers a reference no longer than six seconds when one is available,
+because longer reference dialogue was being echoed at the start of generated lines.
+It can use up to ten seconds when a speaker has no suitable shorter interval. The
+known transcript is passed directly to OmniVoice to avoid loading ASR, and reference
+preprocessing is disabled for that case: its silence removal shortens the prompt audio
+while the transcript keeps the original length, which made the model repeat the
+reference's final word ("room", from "even now in this very room.") at the start of
+every line. Without a transcript, OmniVoice preprocesses first and transcribes the
+processed audio, so the pair stays aligned. `instruct` is a *voice-design* control that
+only accepts a fixed vocabulary of accent, age and style words, so it is left unset in
+cloning mode.
+
+**A reference ends where the speaker stopped, not where the transcript says.** A
+recogniser's end time is not an acoustic offset, and OmniVoice's prompt is a *prefix*
+of an utterance whose masked region is trained to continue it, so a prompt that stops
+inside a word asks the model to finish that word before it speaks the line. On the run
+that exposed this, the transcript ended at 12.512s while the word "room" kept sounding
+to about 12.95s, and the prompt therefore ended mid-word. Each reference is now grown
+past its transcript line to the real acoustic offset - found with the same energy VAD
+used to score windows - and keeps 0.3s of the silence after it. The window never
+reaches into another character's speech, never exceeds
+`VOICE_REFERENCE_MAX_DURATION`, and is left exactly as cut when the tail is steady
+material with no offset to find. This is what OmniVoice's author recommends for the
+mirror-image defect as well: a reference "with appropriate silences".
+
+The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
+the actor's voice by cloning the reference rather than treating that estimate as a
+gender label or synthesizer control.
+
+There is an important cross-language trade-off: OmniVoice's own guidance recommends
+recording the reference in the target language for standard pronunciation, and warns
+that cross-language cloning can carry the reference language's accent into generated
+speech. Since film actors usually speak English while the dub is Amharic, a carefully
+selected 4-10 second English reference can preserve actor identity but cannot guarantee
+native-sounding Amharic. Avoiding that accent while retaining the actor's identity
+would require a separately validated voice-conversion approach or an Amharic reference
+of that same actor; the latter usually is not available. The attached `movie_dub.py`
+uses the same English-reference strategy, so matching it does not remove this model
+limitation. One candidate for a future short A/B is
+[Seed-VC v2](https://github.com/Plachtaa/seed-vc): its documentation separates
+voice-conversion source speech from a target-voice reference and describes a timbre-only
+mode. It does not establish Amharic dubbing quality, so it is not added as an unverified
+extra model or processing stage.
+
+`mms` is retained for a single-narrator dub. It is a single-speaker VITS model, so every
+character comes out in the same voice; with it the voice-profile stage is skipped, the
+clip records no identity reference, and `coverage` reports what the material exercised.
+
+**Per-line length, and why it is now asked for.** A cloning engine that can honour a
+rate is *asked* for a duration before synthesis, using the line's own syllable count and
+window. Asking a model for a duration changes how a line is **spoken**; time-stretching
+changes audio that has already been spoken. This was the documented single biggest
+quality gap between this pipeline and the best public dubbing projects.
+`TTS_REQUEST_RATE=false` switches it off for a controlled comparison.
+
+It is asked in **two levels, not one**, and the difference is audible. The film-wide rate
+is measured once from the whole dialogue - total syllables over total window, clamped to
+the same `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO` band the timing stage stretches within -
+and each line is then corrected only within a narrow `0.9`-`1.1` band around it. Amharic
+is systematically longer or shorter than the English it replaces, and that bias belongs
+to the *film*: paying it once, as a single delivery speed, keeps the pacing even. A
+single per-line rule gives the same rate to a line that needs no correction, but it lets
+every line pick its own speed up to the global limit - so the delivery wanders line to
+line, which is heard as unnatural pacing even when each line individually fits. The run
+reports the film rate it used (`pacing: film rate 1.083`) rather than leaving it to be
+inferred from the audio.
+
+A line that already fits is **not** sped up by the film rate. That rate exists to spread
+the cost of a language that runs long; applying it to comfortable dialogue would rush
+lines that need nothing, which is heard as a rushed line rather than a consistent film.
+Lines that run *short* are likewise left alone, since fitting one down into a longer
+window is the timing stage's job.
+
+**Why the ceiling is 1.45 and not 1.25.** The ceiling is a measured trade, not a taste.
+Replaying the failed run's own line timings through the placement policy below, with the
+Amharic the adaptation stage produced for this project, the worst line lands this far
+after the actor spoke:
+
+| stretch ceiling | hand-over allowance | worst line moved later |
+| --- | --- | --- |
+| 1.25 (the old default) | none | 9.24s |
+| 1.35 | 0.45s | 5.00s |
+| **1.45** (the default) | **0.45s** | **4.13s** |
+| 1.55 | 0.45s | 3.38s |
+
+Below 1.25 the lines have nowhere to go and the whole dub falls behind the picture; past
+1.45 the delivery starts to sound hurried for what is left to gain. The band is not a
+target: a line that already fits is left at its natural pace, and only the lines that
+cannot fit are delivered faster. The remaining time comes out of the *text*, which is what
+the shortening pass below is for.
+| Delivery (later)     | Bunny Stream                            |
+
+Target GPU: **NVIDIA RTX A40 (48 GB VRAM)**.
+
+## Runtime environment
+
+The pipeline runs on a RunPod A40 pod created from the **official RunPod PyTorch
+image**. That image already provides the heavy parts of the stack:
+
+| Provided by the worker image | Version   |
+| ---------------------------- | --------- |
+| Python                       | 3.12      |
+| PyTorch                      | 2.8       |
+| torchaudio                   | 2.8       |
+| CUDA                         | 12.8      |
+| FFmpeg                       | on `PATH` |
+
+Because of that, this repository deliberately contains **no container or
+deployment artifacts** (no Dockerfile, Compose file, or lockfile), and it does
+not install or pin a CUDA/PyTorch stack of its own. Only the application's own
+dependencies are installed, from `requirements.txt` - see
+[Quickstart](#quickstart---runpod-a40-worker) for why that is done through
+`scripts/install_dependencies.sh` rather than a plain `pip install`.
+
+## Project structure
+
+```
+amharic-dub/
+  app/
+    __init__.py
+    config.py                 # environment-driven configuration (implemented)
+    pipeline/                 # one module per stage
+      __init__.py
+      separation.py           # audio-separator BS-Roformer separation (implemented)
+      diarization.py          # pyannote Community-1 diarization (implemented)
+      transcription.py        # faster-whisper large-v3 transcription + sentence assembly (implemented)
+      translation.py          # Amharic dialogue adaptation (backend-selecting) (implemented)
+      voice_profiles.py       # per-speaker voice references + clone-prompt cache (implemented)
+      nllb.py                 # local NLLB-200 translation (default backend) (implemented)
+      dialogue_context.py     # scenes, character bible, syllable budget (implemented)
+      amharic_text.py         # Ethiopic syllables + homophone folding (implemented)
+      tts.py                  # Amharic speech synthesis (OmniVoice or MMS-TTS) (implemented)
+      timing.py               # pitch-preserving fit to the original timings (implemented)
+      mixing.py               # dialogue over ducked music + effects (implemented)
+      qc.py                   # measures each run: fit, rate, crosstalk (implemented)
+      prosody.py              # model-free pitch tracking for performance checks (implemented)
+      evaluation.py           # coverage, identity, performance, baselines (implemented)
+      video.py                # FFmpeg extraction + mux into a dubbed MP4 (implemented)
+      orchestrator.py         # runs every stage and produces the deliverable (implemented)
+    models/                   # shared model loading/caching (placeholder)
+    audio/                    # audio IO + DSP helpers (placeholder)
+    utils/                    # logging, subprocess, manifests (placeholder)
+  tests/                      # pytest suite
+  scripts/
+    check_environment.py      # runtime health check; --full is the session pre-flight
+    install_dependencies.sh   # worker install + import smoke check
+    validate_models.py        # loads each model on its own and reports the result
+    test_gpu.py               # end-to-end run of the implemented stages
+  data/
+    input/                    # source videos (not committed)
+    working/                  # intermediate artifacts (not committed), including
+                              #   voices/<SPEAKER_ID>/{reference.wav,voice_clone.pt,profile.json}
+                              #   tts/{takes,clips}/*.wav
+    output/                   # final dubbed videos (not committed)
+  .env.example
+  .gitignore
+  README.md
+  pyproject.toml
+  requirements.txt
+```
+
+## Configuration
+
+All configuration comes from environment variables. A local `.env` file is
+loaded when present but never overrides values already set in the real
+environment, so values configured on the RunPod pod always win.
+
+| Variable            | Purpose                                             | Default            |
+| ------------------- | --------------------------------------------------- | ------------------ |
+| `GEMINI_API_KEY`    | Google AI Studio key for dialogue adaptation/translation (the default provider) | *(unset)* |
+| `DEEPSEEK_API_KEY`  | DeepSeek key, read only when `TRANSLATION_PROVIDER=deepseek` | *(unset)* |
+| `TRANSLATION_API_KEY` | Key read only when `TRANSLATION_PROVIDER=other`, for a self-hosted server with its own variable name | *(unset)* |
+| `HUGGINGFACE_TOKEN` | Download gated model weights (e.g. pyannote)        | *(unset)*          |
+| `INPUT_DIR`         | Source videos                                       | `./data/input`     |
+| `WORK_DIR`          | Intermediate artifacts                              | `./data/working`   |
+| `OUTPUT_DIR`        | Final dubbed videos                                 | `./data/output`    |
+| `MODEL_CACHE_DIR`   | Runtime model weight downloads                      | `./models_cache`   |
+| `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
+| `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
+| `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
+| `DEVICE` | Device for local model stages. Separation refuses anything but `cuda`/`cuda:N` | `cuda` |
+| `ALLOW_TORCH_COMPILE` | Set to `1` to re-enable TorchInductor. It is off by default because a pod whose PyTorch CUDA build predates its GPU aborts with `nvrtc: error: invalid value for --gpu-architecture`; no stage needs compilation | *(unset)* |
+| `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
+| `TRANSCRIPTION_COMPUTE_TYPE` | CTranslate2 compute type (`float16` on GPU) | `float16`          |
+| `TRANSCRIPTION_LANGUAGE` | Source language code; unset detects it        | *(unset → detect)* |
+| `TRANSLATION_BACKEND` | `nllb` (local translation) or `openai` (instruction-following adaptation) | `openai` |
+| `TRANSLATION_PROVIDER` | Which vendor the served backend talks to: `gemini`, `deepseek`, or `other` for a self-hosted server. Decides the endpoint, the model, the key variable and how reasoning is requested - see [Swapping the adaptation model](#swapping-the-adaptation-model) | `gemini` |
+| `TRANSLATION_MODEL`  | Model for the selected backend. Unset, it follows both: `gemini-3.8-flash` or `deepseek-v4-pro` for `openai`, `facebook/nllb-200-3.3B` for `nllb`, and nothing at all for `other`, which must be told | per backend |
+| `TRANSLATION_NUM_BEAMS` | NLLB beam width; `1` is greedy and deterministic | `1` |
+| `TRANSLATION_MAX_NEW_TOKENS` | Longest NLLB output per chunk, in tokens | `512` |
+| `TRANSLATION_LENGTH_PENALTY` | NLLB's preference over output length; `<1` favours brevity | `1.0` |
+| `TRANSLATION_SHORTEN_PENALTY` | Legacy compatibility setting; NLLB translation is single-pass | `0.6` |
+| `TRANSLATION_SYLLABLES_PER_SECOND` | Amharic delivery rate used to turn time into a syllable budget | `4.0` |
+| `TRANSLATION_MAX_REDUCTION_ATTEMPTS` | Legacy compatibility setting; hosted translation always makes one request per batch | `0` |
+| `TTS_ENGINE`        | `omnivoice` (cloned, per character) or `mms` (single voice) | `omnivoice` |
+| `OMNIVOICE_MODEL`   | OmniVoice checkpoint used when `TTS_ENGINE=omnivoice` | `african-low-resource/omnivoice-amharic` |
+| `OMNIVOICE_STEPS`   | Diffusion steps; `16` is the faster documented setting | `32` |
+| `OMNIVOICE_GUIDANCE_SCALE` | Classifier-free guidance scale         | `2.0` |
+| `OMNIVOICE_TORCH_DTYPE` | Precision of the OmniVoice weights          | `float16` |
+| `MMS_SEED`          | Fixes the MMS duration predictor, so a line is the same length every run | `0` |
+| `MMS_SPEAKING_RATE` | Delivery speed for the whole film, asked of the MMS duration predictor before synthesis (`1.2` is ~16% faster; measured, not assumed) | `1.0` |
+| `TRANSLATION_BASE_URL` | OpenAI-compatible endpoint (only for `TRANSLATION_BACKEND=openai`). Unset, it follows `TRANSLATION_PROVIDER`; required for `other` | per provider |
+| `TRANSLATION_BATCH_SIZE` | Dialogue lines adapted per request           | `10`               |
+| `TRANSLATION_THINKING` | How much the model may reason before answering: `off`, `low`, `medium`, `high`, or `default` to send no thinking field at all. `off` minimizes latency/cost where supported | `off` |
+| `TRANSLATION_FALLBACK_PROVIDER` | Legacy compatibility setting; failures are surfaced and never retried against another provider. Missing Gemini credentials select DeepSeek before the first request | `deepseek` |
+| `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
+| `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
+| `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
+| `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `4.0`              |
+| `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `5.0`              |
+| `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `10.0` |
+| `DIALOGUE_BIBLE_PATH` | Persistent character/consistency state for adaptation (see [Cinematic dialogue adaptation](#cinematic-dialogue-adaptation-dialogue_contextpy)) | `$WORK_DIR/dialogue_bible.json` |
+| `TTS_MODEL` | The single-voice engine's checkpoint, used when `TTS_ENGINE=mms` | `facebook/mms-tts-amh` |
+| `TTS_MAX_PAUSE_SECONDS` | Longest pause rendered around a synthesized line | `2.0` |
+| `TTS_MIN_LINE_SECONDS` | Shortest original window that can be dubbed; shorter lines are skipped and reported | `0.30` |
+| `TTS_CONTINUE_ON_FAILURE` | Skip and report a line an engine fails on instead of ending the run | `false` |
+| `TTS_REQUEST_RATE` | Ask a cloning engine for a per-line length before falling back to stretching | `true` |
+| `TIMING_MIN_TEMPO` | Slowest a line may be stretched to fit its window | `0.80` |
+| `TIMING_MAX_TEMPO` | Fastest a line may be stretched to fit its window | `1.45` |
+| `TIMING_MAX_OVERLAP_SECONDS` | How far a line may still be sounding when the next one begins before the next one is moved instead | `0.45` |
+| `TIMING_MIN_LINE_GAP` | Silence kept between one dubbed line and the next, so two voices never sound at once | `0.12` |
+| `TIMING_TRIM_TO_FIT` | Cut a line that will not fit, with a fade, instead of letting it briefly overlap the next | `false` |
+| `QC_PRONUNCIATION` | Round-trip every delivered clip through an Amharic ASR model and report its character error rate against the text that was synthesized | `false` |
+| `MIX_DIALOGUE_GAIN_DB` | Dialogue level in the final mix (signed dB)     | `0.0`              |
+| `MIX_DUCK_DB`       | How far music/effects are ducked under dialogue    | `6.0`              |
+| `DEVICE`            | `cuda` on a GPU worker, `cpu` for CPU-only checks   | `cuda`             |
+| `LOG_LEVEL`         | `DEBUG` / `INFO` / `WARNING` / `ERROR`              | `INFO`             |
+
+**Secrets are never hard-coded.** The project runs without any API keys, so you
+can test and run the health check before configuring credentials.
+
+```bash
+cp .env.example .env   # then edit .env and fill in real values
+```
+
+### Which variables you actually have to set
+
+`.env.example` and the table above are the complete catalogue of knobs, listing
+every setting with the value it already has. **Nothing has to be copied into
+`.env`**: the credentials have no fallback, and every other variable has a working
+default resolved against the project root.
+
+| | Variables | Why |
+| --- | --- | --- |
+| Required | `HUGGINGFACE_TOKEN` | No fallback value; diarization cannot run without it |
+| Required only for the hosted API | `GEMINI_API_KEY` (default provider) or `DEEPSEEK_API_KEY` | Needed only under `TRANSLATION_BACKEND=openai`. A local OpenAI-compatible server needs no key of its own, and the `nllb` backend reads none at all |
+| Required on a Pod | `HF_HOME` | Defaults to the container's `~/.cache/huggingface`, which is lost when the Pod stops |
+| Worth setting | `MODEL_CACHE_DIR`, `DIALOGUE_BIBLE_PATH` | The first defaults under the project root, so it follows the repository onto the volume. The bible is per-film consistency state worth keeping between runs |
+| Everything else | e.g. `TRANSCRIPTION_MODEL`, `TIMING_MAX_TEMPO`, `MIX_DUCK_DB` | Set only to change behaviour |
+
+Which credentials are *required* follows the configuration, and both
+`scripts/check_environment.py --full` and `scripts/validate_models.py` report
+against it: a key the configured backend does not read is reported `[SKIP]`, not as
+a failure, so a pre-flight never fails on work the run will not do.
+
+**Running without a commercial API.** Adaptation talks to any OpenAI-compatible
+endpoint, so a self-hosted server replaces the hosted one by configuration alone -
+no code change:
+
+```
+TRANSLATION_PROVIDER=other
+TRANSLATION_BASE_URL=http://localhost:8000/v1   # vLLM, Ollama, llama.cpp server
+TRANSLATION_MODEL=<the served model name>
+TRANSLATION_API_KEY=<anything the server expects, or leave it unset>
+```
+
+`other` supplies no defaults on purpose: this project has never seen your server
+and will not guess its address or a model name for it. Both are required, and a
+missing one is reported by name before any request is sent.
+
+Which local model adapts English dialogue into performable Amharic best is an open
+question: no source publishes credible English-to-Amharic *dubbing* quality
+figures, and there is no Amharic dialogue-MT research at all. Treat the choice as a
+bake-off over a few hundred representative lines, scored against the hosted
+baseline on the `qc` block plus a native-speaker read - not as a model swap that
+can be assumed to work.
+
+Values are resolved in three layers, in this order: a real environment variable,
+then `.env`, then the built-in default. `.env` never overrides a real environment
+variable, so configuration made on the Pod always wins over a checked-out file.
+
+To see what is actually in effect - including the path every default resolved to -
+without exposing secrets:
+
+```bash
+python -c "from app.config import get_settings; print(get_settings().as_dict())"
+```
+
+The credentials appear only as the booleans `gemini_api_key_set`,
+`deepseek_api_key_set` and `huggingface_token_set`; their values are never printed
+or logged.
+
+## Quickstart - RunPod A40 worker
+
+The pipeline runs on a GPU worker; the repository is Git-based, so the runbook is
+create, configure, install, validate, run, collect. **Only the first three steps
+are setup** - after that a run is a single command, and the last step gets you the
+file.
+
+On a Pod whose network volume survived, **step 1 is already done and step 3 is a
+`git pull`** - the volume keeps the clone and the weights, so a returning session is
+two commands rather than a full setup.
+
+**1. Create the Pod.** From the official RunPod PyTorch image
+(`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, which provides Python 3.12,
+PyTorch 2.8, CUDA 12.8 and FFmpeg) on an A40, with a **network volume mounted at
+`/workspace`**. The volume is what you actually want: without one, every session
+re-downloads about 8 GiB of weights before doing any work. Keeping the repository on
+the volume is also what makes a returning session cheap - clone and install once,
+then only `git pull`.
+
+**2. Configure it through Pod environment variables, and clone the project.** Set
+these in the Pod's **Environment Variables** section (one `KEY=VALUE` per line, or
+a JSON object through the CLI) rather than exporting them in a shell later. A Pod
+environment variable exists before Python starts, which is what `HF_HOME` needs,
+and it survives reconnects:
+
+```
+HUGGINGFACE_TOKEN=hf_...             # required - gated pyannote Community-1 weights
+GEMINI_API_KEY=...                   # required - the default backend is an LLM
+HF_HOME=/workspace/models_cache      # required on a Pod - see below
+MODEL_CACHE_DIR=/workspace/models_cache    # optional; defaults under the repo
+OMNIVOICE_MODEL=african-low-resource/omnivoice-amharic  # optional checkpoint override
+TTS_ENGINE=omnivoice                 # optional - omnivoice | mms
+```
+
+Under the defaults **both** credentials are required: the token for the gated
+diarization pipeline, and a key because dialogue adaptation is an LLM call and the
+default provider is Gemini. Setting `TRANSLATION_BACKEND=nllb` removes the key
+requirement and translates locally instead -
+`scripts/check_environment.py --full` reports which credentials the configured run
+actually needs, and never blocks on one it will not read.
+
+Create the Hugging Face token with the **Read** role, or as a fine-grained token
+with read access to the gated repository. The pipeline only ever downloads from the
+Hub, so a write token would be unnecessary and riskier if it leaked. Access to a
+gated repository is granted to your **account** by accepting its licence, not by
+the token's role - so a Read token works, as long as the account has been approved
+on the
+[pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+model page.
+
+`HF_HOME` is the one variable that has to be set even though the project also
+works without it: its default is the container's `~/.cache/huggingface`, which is
+lost when the Pod stops. It is frozen when `huggingface_hub` is first imported, so
+it has to be a real environment variable - exporting it in a shell works but must
+be repeated every session, and putting it in `.env` does not work at all.
+`MODEL_CACHE_DIR` is listed for completeness: its default already resolves under
+the project root, so if you cloned onto the volume it is on the volume too. Set it
+only to put the weights somewhere else, such as a cache shared between checkouts.
+The other variables can also go in a
+`.env` in the project root, which `app.config` loads while never letting it
+override a real environment variable; `.env` is git-ignored, so it is never
+committed. Changing a running Pod's variables requires restarting it.
+
+Then clone the project onto the volume:
+
+```bash
+git clone <your fork> /workspace/amharic-dub
+cd /workspace/amharic-dub
+```
+
+**3. Install.** `scripts/install_dependencies.sh` installs the requirements, then
+imports every runtime module to prove the result is usable, and fails if the
+CUDA-matched PyTorch 2.8 the image provides was replaced:
+
+```bash
+bash scripts/install_dependencies.sh
+```
+
+**What the first run downloads** (and why a network volume matters). Hugging Face
+models are cached under `HF_HOME`; audio-separator stores its checkpoint under
+`MODEL_CACHE_DIR/audio-separator`. Neither is stored in the repository. With the
+defaults — an LLM backend and OmniVoice — there is **no translation download at all**,
+because the translation is an API call:
+
+| Model | Download | Note |
+| --- | --- | --- |
+| OmniVoice Amharic (default speech) | ~2.4 GiB | `african-low-resource/omnivoice-amharic`; the multilingual base is not downloaded |
+| faster-whisper `large-v3` | ~3 GiB | transcription |
+| BS-Roformer (`model_bs_roformer_ep_317_sdr_12.9755.ckpt`) | downloaded on first run | vocals/instrumental separation |
+| pyannote Community-1 | ~1 GiB | gated; needs the token |
+| MMS-TTS Amharic | 0.3 GiB | only for `TTS_ENGINE=mms` |
+| NLLB-200 `3.3B` | 16.4 GiB | **only** for `TRANSLATION_BACKEND=nllb`; this is why the LLM backend is also the smaller setup |
+
+That is roughly **8 GiB** by default rather than 24 GiB, and the gated pyannote checkpoint
+plus the Hugging Face token are the only things standing between a fresh pod and a run.
+
+Skip what you are not using: `scripts/validate_models.py` follows the configuration, so
+it loads only the engine and backend a run will actually use.
+
+**4. Pre-flight, then validate the models stage by stage.**
+
+```bash
+python scripts/check_environment.py --full --require-cuda
+python scripts/validate_models.py
+```
+
+`scripts/check_environment.py` reports the Python version, the PyTorch version,
+CUDA availability, GPU name, available VRAM, and FFmpeg availability. It needs no
+credentials and downloads nothing, so it is safe to run first. With `--full` it
+becomes the session pre-flight: it also checks the credentials the configured run
+actually needs (flagging a value that is still the `.env.example` placeholder) and
+every module the stages import at run time. What is required follows the
+configuration: the Hugging Face token always, and the configured provider's key only
+under `TRANSLATION_BACKEND=openai` (`GEMINI_API_KEY` by default). Anything the
+configuration does not use is reported `[SKIP]` rather than `[FAIL]`. On RunPod,
+`--require-cuda` additionally fails unless CUDA is visible and `DEVICE` is `cuda`
+or `cuda:N`; without it, CUDA absence remains a non-blocking result for local
+development checks.
+
+The separation stage explicitly requires CUDA: it rejects a non-CUDA `DEVICE`,
+forces audio-separator onto the configured GPU before loading its BS-Roformer
+checkpoint, and then verifies the loaded model's own parameters are on CUDA before
+any audio is processed. A CPU fallback therefore fails immediately instead of
+silently billing GPU-pod time for CPU inference. BS-Roformer uses the model's native
+overlapping segment inference; the wrapper's optional file-level chunker is disabled
+because it rejoins chunks with simple concatenation. Vocals feed diarization and the
+instrumental output feeds the existing music bed. A silent effects stem keeps the
+downstream three-path interface without duplicating the instrumental.
+Other local model stages use the configured device: pyannote diarization,
+faster-whisper transcription, OmniVoice synthesis, and local NLLB translation.
+TorchInductor compilation is disabled by default (`TORCH_COMPILE_DISABLE=1`):
+a pod whose PyTorch CUDA build predates its GPU fails to compile kernels with
+`nvrtc: error: invalid value for --gpu-architecture (-arch)` even though eager
+inference works, and no stage here needs compilation. Set `ALLOW_TORCH_COMPILE=1`
+only when deliberately benchmarking a compiled path.
+GPU-oriented defaults include faster-whisper `large-v3` in FP16 and OmniVoice in FP16.
+The default Gemini/DeepSeek translation backend is a remote API call, not a model
+running on the Pod GPU. FFmpeg audio/video extraction and final muxing also use
+the CPU. The installer checks the RunPod PyTorch 2.8 / CUDA 12.8 runtime and
+stops if the GPU is unavailable, before a model run begins.
+
+`scripts/validate_models.py` loads each model **on its own** - BS-Roformer,
+pyannote, faster-whisper, the configured translation backend, the configured synthesis engine -
+reports the result for each, and releases it before the next one, so a failure
+names exactly one component instead of surfacing halfway through a run after other
+weights have already been downloaded. The translation and synthesis steps go one
+step further than loading and push one probe line through the model, because a
+checkpoint that loads can still reject every input. `--only nllb` (or any
+comma-separated subset) re-checks a single component. As with the environment
+check, only the configured backend and engine are loaded: checking both would
+download gigabytes a run never touches, and would leave the models it *does* use
+unvalidated. To check the other engine, set the variable:
+`TRANSLATION_BACKEND=openai TTS_ENGINE=mms python scripts/validate_models.py`.
+Because every step but the runtime report downloads real weights, the script refuses
+to run on a machine where torch reports no CUDA device unless `--allow-cpu` is
+passed, so a development box cannot quietly fill its disk with checkpoints.
+
+**5. Run it.** On a small test clip first, then the film:
+
+```bash
+python scripts/test_gpu.py --video data/input/test.mp4   # per-stage report
+python -m app.pipeline.orchestrator data/input/test.mp4  # the deliverable
+python -m app.pipeline.orchestrator data/input/movie.mp4 # the film
+```
+
+`test_gpu.py` stops after speech synthesis on purpose - it validates the GPU stages
+and prints what each produced - while the orchestrator continues through timing,
+mixing and muxing and writes the dubbed MP4. The orchestrator reuses the clips the
+runner already wrote, so running both costs one round of synthesis, not two. For a
+first look at a long film, `--max-lines 5` voices only the first few lines and
+produces a partial dub. For a long film, run it under `tmux` (or `nohup` with a log
+file) so a dropped connection does not kill the run.
+
+**6. Take the result off the Pod.** The deliverable is at
+`<OUTPUT_DIR>/<source stem>/<source stem>_amharic.mp4`, which with the defaults and
+the repository on the volume is:
+
+```
+/workspace/amharic-dub/data/output/movie/movie_amharic.mp4
+```
+
+Three ways to get it, easiest first:
+
+* **JupyterLab** - on the Pods page, **Connect** → **HTTP Services** → **Jupyter
+  Lab**. Its file browser sees the whole container, so navigate to the path above
+  and download the file. No SSH setup needed.
+* **`scp`** - get the address from **Connect** → **SSH** (or
+  `runpodctl ssh info <pod-id>`) and pull the file, along with the manifest, which
+  records the per-line stretch factors, overlaps and mix peak for QA:
+
+  ```bash
+  scp -P <ssh-port> root@<pod-ip>:/workspace/amharic-dub/data/output/movie/movie_amharic.mp4 .
+  scp -P <ssh-port> root@<pod-ip>:/workspace/amharic-dub/data/output/movie/manifest.json .
+  ```
+
+* **In the browser** - serve the directory from the Pod, expose the port as HTTP,
+  and open it through the Pod's proxy:
+
+  ```bash
+  cd /workspace/amharic-dub/data/output/movie && python -m http.server 8000
+  ```
+
+Keeping the repository (and so the output) on the volume is what makes the result
+survive a stop, and findable from a later session. Anything written to the
+container disk is lost when the Pod stops.
+
+Model weights (BS-Roformer, pyannote, faster-whisper, NLLB, OmniVoice, MMS-TTS) are
+**not** part of this repository. They are downloaded at runtime into
+`MODEL_CACHE_DIR`; point that variable at the Pod's persistent volume so the weights
+survive restarts. OmniVoice and MMS-TTS fetch their own checkpoints through Hugging
+Face, which takes no cache argument, so `HF_HOME` has to be set to the same
+directory as well (step 2).
+
+The pyannote Community-1 diarization checkpoint is a **gated** Hugging Face
+model, so `HUGGINGFACE_TOKEN` is required before running that stage. The token's
+account must first accept the conditions on the
+[model page](https://huggingface.co/pyannote/speaker-diarization-community-1).
+
+Transcription uses faster-whisper `large-v3`, which is **not** gated and is
+downloaded into `MODEL_CACHE_DIR` on first run. It defaults to `float16`, which
+targets the A40 GPU; a CPU-only run needs
+`TRANSCRIPTION_COMPUTE_TYPE=int8` because CTranslate2 does not support fp16 on
+CPU. The pipeline never falls back from GPU to CPU on its own. On the GPU Pod,
+keep `DEVICE=cuda` and `TRANSCRIPTION_COMPUTE_TYPE=float16`.
+
+The `nllb` backend translates locally: NLLB is a local checkpoint, so no key and no
+network access are needed. The default `openai` backend calls out to a third party -
+Gemini, or DeepSeek if `TRANSLATION_PROVIDER=deepseek` - and only then is its key
+required. Every model that runs locally has its weights cached under
+`MODEL_CACHE_DIR`.
+
+Voice profiles are built from the **dialogue stem** produced by separation, never
+from the full movie mix, so each reference is free of music and effects. For every
+diarized speaker the stage scores that speaker's own continuous turns and keeps
+the cleanest 3-10 second window, then cuts it to mono 24 kHz PCM WAV with FFmpeg
+under `<VOICE_PROFILE_DIR>/<SPEAKER_ID>/reference.wav`. FFmpeg must therefore be
+on `PATH`. Emotion, intensity and delivery are **not** stored in a profile: they
+change per line and belong to `AdaptedDialogue`.
+
+**A reference is one voice, and its transcript describes it exactly.** Both rules
+come from a cloning failure on a real run, and neither was visible in the
+measurements the selection used:
+
+* *One voice.* The window chosen there was `20.0-30.0s`, and the diarization's own
+  crosstalk list put simultaneous speech at `26.27-26.85s` and `27.82-28.57s` -
+  inside it. The profile nevertheless reported `0.0s overlapped by other speakers`,
+  because the overlap term compares the speaker's turns against other speakers'
+  turns and those are *exclusive* by construction, so the term can never fire on a
+  region where two people are genuinely talking at once. `build_voice_profiles`
+  now takes the crosstalk regions and prefers windows free of them; a film that
+  offers nothing clean still gets a voice, and the profile says which compromise it
+  made rather than failing the run.
+* *An exact transcript.* The same window began 2.6s before the first line it
+  recorded and ended 1.9s after the last, so about 4.5s of the prompt audio had no
+  transcript. Cloning engines are handed the reference transcript and the line to
+  speak as **one text stream** - OmniVoice concatenates them under a single language
+  tag - so a transcript covering part of its own audio is an invitation to speak the
+  difference. Windows are therefore cut on the speaker's own line boundaries, and a
+  transcript is sent only when it describes the window exactly; otherwise none is
+  sent and the engine transcribes the reference itself. `preprocess_prompt` is
+  switched off whenever a transcript is supplied, because its silence-stripping edits
+  the audio after the transcript was taken from it.
+* *An acoustic end.* Exactness is not enough at the tail: a recogniser's end time is
+  not where the word ends. On the second run the transcript stopped at `12.512s`
+  while the actor's last word kept sounding to about `12.95s`, so the prompt held a
+  word cut through its release - and OmniVoice, whose prompt is a prefix that its
+  masked region is trained to continue, finished that word at the start of every
+  generated line. A window is now grown past its line to the observed acoustic
+  offset and keeps 0.3s of the silence after it, but only when that silence is
+  actually present, so a pause between syllables is never mistaken for the end of an
+  utterance.
+
+Candidate windows are ranked on duration, speech presence, dynamic range,
+loudness, overlap with other speakers and clipping, and the best window of the
+highest non-empty trust tier wins - clean and exactly described, clean and
+undescribed, containing crosstalk and described, containing crosstalk and
+undescribed - rather than a weighted score that could trade one defect for another.
+Speech presence is an energy VAD: a frame counts as speech only when it rises above
+the *local* noise floor, so a loud music bed or steady bleed - which stays close to
+its own floor whatever its level - is rejected rather than outranking quieter
+dialogue. When a transcript is available it also contributes a modest orthographic
+phonetic-variety term; without one the term is dropped instead of being guessed.
+
+Speaker ids are kept exactly as diarization reported them, but only ever used as a
+single sanitised directory component (`speaker_directory_name`), so an unusual or
+hostile label cannot write outside `VOICE_PROFILE_DIR`.
+
+**The original is measured against twice, every run, and both are reported.** The
+music and effects stems are summed back in untouched, so anything the separator
+failed to take out of them plays under the Amharic:
+
+* `separation.measure_bed_bleed` compares the **bed** with the isolated speech,
+  window by window, and reports any window where the bed is both within `-15 dB` of
+  the speech and correlated with it - two conditions, because loud music under a
+  line is not a leak. On the run that prompted this, 0 of 42 windows leaked.
+* `separation.measure_dub_bleed` compares the **dubbed dialogue** with the film's
+  original audio. The bed check cannot see the finished dub, because the dubbed
+  dialogue is not part of what it inspects, so a dub carrying the original would
+  have been reported clean. This one searches a small lag window either side of each
+  line, so a placement or resampling fault is caught as well as a straightforward
+  mix. On the same run the dub measured 18.8 dB *below* the original and
+  uncorrelated with it (`-0.019`), against a positive control - the original used as
+  its own dub - that is flagged on all 42 windows at `+0.000 dB` and correlation
+  `+1.000`.
+
+Neither check can see English that the *speech model itself* produced, because that
+is not the original audio and no amount of comparison with the original will find
+it. That is what the pronunciation round trip is for: `qc.measure_pronunciation`
+takes an injected ASR model and reports a character error rate against the text that
+was synthesized, which is the only automated way to see that the audio says
+something the text does not.
+
+Voice-clone prompts are cached next to each reference as `voice_clone.pt`. Encoding
+is the expensive step, so an existing prompt is always reused and never
+re-encoded; pass a `clone_encoder` callable to `build_voice_profiles` if your setup
+needs a serialized prompt. The TTS stage does not need one: the cloning engine takes
+reference audio directly, so `clone_prompt_path` may stay `None`.
+
+### Speech synthesis (`tts.py`)
+
+OmniVoice speaks each line in the voice cloned from that character's own reference
+recording, so there is no conversion step - see
+[Choosing a speech engine](#choosing-a-speech-engine).
+
+**One line is one sentence, and one clip.** The unit handed to the engine is the
+assembled sentence described above, so a thought is synthesized in a single call and
+keeps its intonation from beginning to end; the sub-sentence pauses the transcriber
+saw are part of the sentence's span, not clip boundaries. `TtsClip` records the
+line's `beats` when it has any - the same timestamped emotion/intensity/delivery
+metadata the dialogue model returned per part - so the performance arc survives into
+the manifest even though the current engine cannot act on it.
+
+`VoiceProfile.reference_audio` is the only reference this stage reads, and it is what
+makes a character sound like themselves across a film: the same reference for every
+line of a speaker is the whole mechanism. A `VoiceProfile` is never modified by this
+stage, and `clone_prompt_path` may stay `None` - the engine takes reference audio
+directly, so nothing needs serializing.
+
+A removed path used to cut the original actor's audio for each line out of the clean
+speech stem and hand it to the engine as a *performance prompt*, with a second engine
+converting the result to the character's voice. No engine the project supports reads
+such a prompt any more, so that machinery is gone along with the two engines.
+`TtsClip.performance_reference_path` remains in the artifact record and is now always
+`None`. This is also why
+`measure_performance_preservation` in `evaluation.py` reports that it found no
+original-performance audio rather than reporting a result: it needs an input the
+pipeline no longer produces, and saying so is better than a silent "not measured".
+
+**Lines that cannot be dubbed are skipped and reported.** A window shorter than
+`TTS_MIN_LINE_SECONDS` (0.30s by default) is a fragment, not a spoken line: there is
+no room for a word in the time it occupied, so any Amharic written for it is
+unintelligible, and a vocoder can be driven to an empty mel spectrogram by input that
+short. Such a line, and a line with
+nothing to pronounce at all (punctuation, whitespace), is skipped *before* the engine
+is called, the lines around it are unaffected, and both the line and the reason are
+recorded in the manifest under `run.tts.skipped`. This is input validation, not
+failure tolerance: an engine that actually *fails* on a line still stops the run with
+that line named, unless `TTS_CONTINUE_ON_FAILURE=true` asks for a reported hole
+instead.
+
+Note that a line written **in Roman script is attempted, not skipped**. An
+English-derived word is a word, and silently dropping the line would be worse than
+voicing it imperfectly; getting that word into Fidel is the adaptation stage's job
+(see [Borrowed words](#borrowed-words-keep-the-word-change-the-script)).
+
+`AdaptedDialogue`'s performance metadata is carried through, not discarded.
+`emotion`, `intensity` and `delivery` are recorded in `PerformanceControls` exactly as
+the adaptation stage returned them, so a manifest says what the dialogue model asked
+for; `pause_before` and `pause_after` are rendered as silence around the take, capped
+at `TTS_MAX_PAUSE_SECONDS`. Both the declared pause and the rendered one are kept in
+the clip, so a cap never hides what was asked for.
+
+Artifacts are deterministic and reusable, one file per line per step, under
+`<WORK_DIR>/tts/`:
+
+```
+tts/
+  takes/        <SPEAKER_ID>_<digest>.wav   # the engine's raw output for the line
+  clips/        <SPEAKER_ID>_<digest>.wav   # the take + its rendered pauses
+```
+
+The digest covers the line's timing, text and performance metadata (plus a recipe
+version), so the same input always produces the same paths, a changed line never
+silently reuses a stale take, and re-running a stage skips work that is already
+on disk.
+
+Durations are reported, not fitted: `TtsClip` carries `speech_duration`, the
+rendered pauses, the original window and `duration`, and never time-stretches
+anything. Making each line fit its original window is `timing.py`'s job. Engines are
+lazy and cached per process, keyed by the settings that shape one, so no model is
+loaded per dialogue line. OmniVoice's own checkpoints follow `HF_HOME` (see
+[Quickstart](#quickstart---runpod-a40-worker)).
+
+### Timing, mixing and muxing (`timing.py`, `mixing.py`, `video.py`)
+
+Alignment gives each line a **deadline**, not just a window. The room a line has runs from
+its own start to `TIMING_MIN_LINE_GAP` (default `0.12s`) before the next line begins -
+including that next line's leading pause, since that is when its audio starts and so is the
+earliest moment two lines could collide. The original actor spoke English, and Amharic does
+not express the same idea in the same number of syllables, so a faithful translation
+routinely overruns the window the English occupied. Aiming at the window alone is what made
+a real run sound broken: lines were fitted to their own window, could not fit, and simply
+overran into the next one, so two voices spoke at once.
+
+Three things happen in order, and only ever as far as needed:
+
+1. **The silence between lines is used.** It is already empty, and it costs nothing: a line
+   that needs 2.0s in a 0.8s window is delivered at its natural pace if 2.0s is free before
+   the next line. On the failing run this reclaimed **24s**.
+2. **Only then is the line speeded up**, within `TIMING_MIN_TEMPO`/`TIMING_MAX_TEMPO`, with
+   pitch-preserving `atempo`. Only the speech is stretched; the rendered pauses keep their
+   length, and a line's leading pause shifts the file rather than the line, so the speech
+   still lands on its original start.
+3. **A line that still cannot fit is not cut and is not laid over its neighbour.** Two
+   voices in the same instant is the one outcome a dub cannot have, so the next line
+   **moves later** instead, recorded per line as `drift` and reported in the run summary
+   as `placement`. Two things decide when moving is needed, and both are measured between
+   *speech* boundaries rather than file boundaries:
+
+   * **Silence over silence is free.** A clip carries its rendered pauses with it
+     (0.13s on average, up to 0.5s), so bounding the *files* would move a line to avoid
+     an overlap nobody can hear. Only speech is bounded.
+   * **A character never hands over to themselves.** Their turns do not overlap in the
+     source, and the same voice laid over itself is not heard as an interruption but as
+     a stutter - the ear has nothing to separate the two copies with. So one speaker's
+     speech is never left sounding under their own next line. Between *different*
+     speakers up to `TIMING_MAX_OVERLAP_SECONDS` (default `0.45s`) is allowed, because a
+     small hand-over is what an interruption sounds like.
+
+   On the run that prompted this, all 14 remaining speech overlaps were one character
+   over themselves, and *no* pair of different characters overlapped at all - so the
+   allowance was buying nothing legitimate while producing every artifact that was
+   audible.
+
+Cutting remains available and remains off by default: `TIMING_TRIM_TO_FIT` (default
+`false`) fades a line short instead. It is the one outcome that damages the performance
+itself, and on a real run where the text was too long it fired on 31 of 38 lines - "not a
+single good sentence without cuts and stutters".
+
+A line with no successor - the last in the film, or a clip aligned on its own - is
+**never** cut: it harms nobody by running past its own window, and cutting would be
+mangling for no benefit. `atempo` accepts 0.5-2.0, so a wider band is rejected rather than
+passed through.
+
+The placement policy that makes lines stop talking over each other is the combination of
+the speech-boundary bound, the same-speaker rule and the cascade, and it is independent
+of all of this. Measured on the shipped GPU run's own manifest: of its 22 file overlaps,
+**14 overlapped in actual speech and every one of those 14 was a character over
+themselves** - up to 0.33s, which is heard at the start of a line as an extra fragment of
+the same voice. Replaying the corrected rule on the run's own line lengths leaves **0 of
+those**, while costing *less* drift than the file-boundary rule it replaces (9.8s against
+58.8s in the same replay), because a line may now begin during the previous line's
+trailing silence.
+
+Mixing places every aligned line at its own timestamp into a continuous dialogue
+stem, then sums that with the **music and effects only**. The original English
+dialogue is never used: separation already removed it, and mixing the full
+original mix back in would reintroduce the language the pipeline exists to
+replace. Genuine overlaps - the ones the original performance had, and the small
+hand-over the timing stage allows - are summed and reported with their speaker
+pair and duration; the timing stage has already removed the accidental ones. The
+bed is ducked under the dialogue by `MIX_DUCK_DB` with a ramped reduction, so it
+never gates or clicks, and only the bed is reduced. The mix is then held under a
+-1 dBFS ceiling; if that needs a global scale-down, the reduction and the peak
+that caused it are reported.
+
+Loudness normalization (EBU R128) is deliberately **not** applied: the mix is
+placed at a defined peak with defined dialogue and bed levels so it stays
+reproducible and auditable, and a programme-loudness pass belongs with the encode
+of the deliverable rather than with the mix.
+
+Muxing copies every video stream and encodes exactly one audio track: AAC at
+48 kHz stereo, tagged `language=amh`. The source's own audio streams are **not**
+mapped, which is what removes the English dialogue. Both inputs and the result are
+inspected with `ffprobe` rather than trusted - the video codec, the audio codec,
+rate and channel count, the stream counts and the duration are all verified, and
+any mismatch is reported rather than assumed away. This is the check missing from
+an earlier attempt that muxed a 48 kHz track into a video whose audio was around
+44.1 kHz and produced decode errors.
+
+### Running the whole pipeline (`orchestrator.py`)
+
+One command runs every stage in order and writes the deliverable:
+
+```bash
+python -m app.pipeline.orchestrator data/input/movie.mp4
+python -m app.pipeline.orchestrator movie.mp4 --out runs/movie --max-lines 5
+```
+
+The extracted track and the three stems go under `<run dir>/stages/`, the manifest
+is `<run dir>/manifest.json`, the mix artifacts are under `<run dir>/mix/`, and
+the dubbed video is `<run dir>/<source stem>_amharic.mp4`. The run directory
+defaults to `<OUTPUT_DIR>/<source stem>`. Voice profiles and the TTS artifacts
+stay in their configured `WORK_DIR` locations rather than moving per run, because
+both are content-addressed and are meant to be reused: re-running re-synthesizes
+only the lines whose text, timing or performance actually changed.
+
+`--max-lines N` synthesizes only the first `N` adapted lines. It is a cost control
+for the first run of a long film, and it produces a **partial dub**: every earlier
+stage still runs in full, the manifest records `partial: true`, and the report
+says so.
+
+The manifest records what each stage produced, including per-line stretch factors
+and fit residuals, the overlaps the mix found, the peak and any scale-down, and
+what was verified about the delivered file - so a run can be audited without
+re-listening to it.
+
+`scripts/test_gpu.py` is the same chain as a reporting runner. It stops after
+speech synthesis on purpose: it exists to validate the GPU stages on a new
+machine, and the stages after it need no GPU. Run the orchestrator afterwards to
+get the MP4 - it reuses the clips the runner already wrote.
+
+### One sentence, one utterance (`transcription.py`, `translation.py`, `tts.py`)
+
+A transcriber segments on **pauses**, not on grammar. One spoken sentence routinely
+arrives as several segments - the actor breathes, and Whisper starts a new segment
+with its own full stop - and if each segment becomes a translation unit, a TTS call
+and a clip, the listener hears the thought broken into several utterances, each with
+its own final intonation. That is a delivery defect no amount of translation quality
+can hide.
+
+`assemble_sentences` therefore runs between transcription and adaptation and turns
+the pause-delimited segments into **sentences**:
+
+* segments of different speakers never join;
+* a segment with no terminal punctuation continues;
+* a segment that starts mid-sentence (lowercase) continues, which is how a
+  transcriber marks "same sentence, split at a pause";
+* otherwise the sentence ends;
+* a pause longer than `MAX_SENTENCE_GAP_SECONDS` (2 s), a span longer than
+  `MAX_SENTENCE_SECONDS` (12 s) or more than `MAX_SENTENCE_PARTS` (6) segments ends
+  it regardless, so a sparsely punctuated monologue cannot collapse into one
+  unbounded unit.
+
+The sentence - not the segment - is then the **translation unit** and the
+**synthesis unit**. Its span is the first part's start to the last part's end, so
+the original timing, including the pauses inside the sentence, is preserved exactly;
+the parts stay attached as **beats** (see below).
+
+The three boundaries are deliberately not the same thing:
+
+| Boundary | What it is | Who owns it |
+| --- | --- | --- |
+| Sentence | a complete spoken thought | `assemble_sentences` |
+| Beat | a stretch of a sentence with its own emotion/intensity/delivery | the dialogue model, per part |
+| Synthesis unit | what is handed to the voice | the sentence |
+
+Emotion is still detected *inside* a sentence, not once per sentence: the request
+carries the sentence's `parts`, and the response returns one `beats` entry per part.
+Each beat keeps that part's original timestamps, so the manifest says not only *what*
+the performance did but *when*. OmniVoice has no control that can act on emotion
+inside one call - it clones a timbre and takes no style input, and the Amharic
+checkpoint was trained without style instructions - so beats are recorded rather than
+synthesized. Synthesizing each beat separately, which is what the pipeline used to
+do, buys no expressiveness from this engine and costs the prosody of the sentence.
+
+Amharic punctuation follows the sentence, too: the model is asked for one final stop
+per line and commas for the breaths inside it, rather than a full stop at every
+pause the transcriber saw.
+
+### Cinematic dialogue adaptation (`dialogue_context.py`, `translation.py`)
+
+Adaptation is where the largest quality gain lives, so the stage is given three
+things a ten-line window cannot provide:
+
+* **Scene structure.** `segment_scenes` cuts the transcript on the silences
+  between lines (and on a maximum scene length), so the model is told which lines
+  share a situation, who is in the scene, and whether it is a conversation at all.
+  The boundaries come from the timings, so the same film always segments the same
+  way.
+* **A character bible.** `CharacterBible` is persistent state - names, aliases,
+  relationships, register, and the canonical Amharic spelling of recurring names
+  and terms - keyed by diarized speaker id and written to
+  `DIALOGUE_BIBLE_PATH`. Consistency across 90-180 minutes then rests on a file a
+  human can edit between runs rather than on an LLM's recall. A missing file is an
+  empty bible, not an error, so a first run just works.
+* **A duration budget.** Amharic words are longer than English ones, so a faithful
+  line often needs more time than the original took. Each line is given the number
+  of **syllables** its window allows - one Fidel character is one syllable, so this
+  needs no G2P model - and a line that comes back over budget is **sent back once
+  with the number of syllables to cut**. Shortening the text is the fix the
+  literature supports; `timing.py` is left to do only a small final trim.
+
+### Borrowed words: keep the word, change the script
+
+Amharic speakers say **ኮምፒውተር**, not a dictionary equivalent of "computer", and they
+say **ዋልት** for a character called Walt. So the rule is *not* "translate everything":
+a borrowed English word, a technical term and a proper noun all stay. What changes is
+the **script**.
+
+That distinction is the whole point. The output is spoken by an Amharic voice that
+reads Fidel, so `Walt` left in Roman letters is a word it cannot pronounce - while
+`ዋልት` is the same word, unchanged, in a script it can read. The system prompt now
+states this explicitly (it previously said to keep the borrowed word without saying
+in which script, which is precisely how `Walt` could come back unpronounceable), and
+because a rule in a prompt is not a guarantee it is **verified rather than trusted**:
+
+* Roman-script text is detected and reported, but never causes a second hosted request:
+  each batch is translated once to keep latency and API spend predictable.
+* The words themselves are listed in the run report and the manifest, because the
+  *same word has to be spelled the same way everywhere it appears* - otherwise a
+  character sounds like they are saying a different name each time. Pinning them in
+  the character bible's `terms` is what makes that true:
+
+```
+coverage        4/11 categories; missing ...; borrowed words to pin: Walt, iPhone
+```
+
+```json
+{"SPEAKER_03": {"name": "Walt", "terms": {"Walt": "ዋልት"}}}
+```
+
+Neither check is destructive on failure: a line that is still over budget, or still
+carries Roman text, is kept and reported rather than dropped. `TRANSLATION_ENFORCE_BUDGET`
+and `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` (both `true` by default) turn the two passes
+off, which is what a comparison run wants.
+
+```python
+# What the model receives for one line, alongside the system prompt.
+{"id": "dialogue_000042", "speaker": "SPEAKER_03", "duration": 2.5,
+ "text": "You have to listen to me.", "syllable_budget": 10}
+```
+
+The syllable rate behind the budget is `DEFAULT_SYLLABLES_PER_SECOND` (4.0), which
+is documented as an **initial prior rather than a measurement**. Calibrate it from
+a real run: read the `syllables_per_second` figures the `qc` block reports for the
+lines that *did* fit, and set the constant to their median.
+
+`enforce_budget=False` sends every line exactly once, which is cheaper and is what
+a comparison run wants.
+
+### Quality control (`qc.py`)
+
+Every run measures itself. `qc.py` builds a report from the metadata the stages
+already produced, so it needs no model, no GPU and no audio decoding, and it is
+written into the manifest as the `qc` block and printed as the run's last line:
+
+```
+qc              19/21 line(s) within 10% of their window, 2 not fitted, 1 at an
+                implausible rate, 3 crosstalk region(s) (2.41s)
+```
+
+What it reports, and why each figure is there:
+
+* **Duration fit as a distribution, not an average.** The largest human study of
+  professional dubbing found the audience complaint is an unnatural speaking rate
+  - "too slow, too fast, or too uneven" - so a mean would hide exactly the tail
+  that matters. The block carries the fitted/close/unfitted counts, the
+  close-fit ratio, the mean and worst residual, and the tempo extremes, plus a
+  per-line breakdown.
+* **Speaking rate in syllables per second.** One Fidel character is one syllable,
+  which is what the script encodes, so this needs no grapheme-to-phoneme model
+  (none exists for Amharic). A rate outside the plausible band marks a line no
+  performer could deliver, however well it "fits".
+* **Crosstalk, and the attribution it casts doubt on.** Simultaneous speech is what
+  the exclusive diarization cannot describe, so it is reported as a known
+  uncertainty - and now the *lines* it affects are named too
+  (`qc.attribution_uncertain`). Attribution is temporal: each diarized turn is
+  transcribed on its own and everything it contains is credited to that turn's
+  speaker. Clean turns of at least 1.5 seconds are also checked against Community-1's
+  own speaker embeddings; a label changes only when another speaker's cosine score
+  is at least 0.55 and beats the current label by at least 0.15. Short and overlapping
+  turns remain untouched because the audio is not reliable enough to justify a
+  correction. Corrections are recorded in `manifest.json`. Overlap-affected lines
+  remain the first place to listen when a character sounds like the wrong one. The
+  pipeline never infers a speaker from a character's *name*, so a character saying
+  another character's name cannot affect who is credited.
+* **Pronunciation, when a transcriber is supplied.** A round trip through an
+  Amharic ASR model gives a character error rate against the text that was
+  synthesized - the only automated check that the dub is *intelligible*, and the
+  only one that can see content the speech model *invented*: a stray word, a
+  fragment of the English prompt the voice was cloned from, a mispronunciation. None
+  of that is the film's original audio, so no comparison with the original can find
+  it. It needs a model, so `build_qc_report(..., transcribe=...)` takes it as an
+  argument; set `QC_PRONUNCIATION=true` and the run supplies
+  `transcription.build_amharic_transcriber()`, otherwise it stays unmeasured rather
+  than pretending. Homophone families (ሀ/ሐ/ኀ, ሰ/ሠ, አ/ዐ, ጸ/ፀ) are folded before
+  comparison, because a difference between them is a spelling choice rather than a
+  pronunciation error.
+
+Nothing in the report fails a run: it states what was measured, and deciding what
+is good enough stays a project decision.
+
+### Evaluation and baselines (`prosody.py`, `evaluation.py`)
+
+`qc.py` measures one run. Two questions decide whether the system is *getting
+better*, and `evaluation.py` answers them:
+
+**Is the evaluation material representative?** A run can score well simply because
+it was easy. Every run therefore reports coverage of the cases that break the
+pipeline in different ways - whispers, shouts, one-word lines, monologues, rapid
+turn-taking, overlapping speech, low and high intensity, English code-switching,
+recurring characters, crowded scenes - and names what is **missing**:
+
+```
+coverage        4/11 categories; missing whisper, shout, long_line, overlapping_speech, ...
+```
+
+The point is that a good score on non-representative material is not evidence.
+
+**Did a change make it worse?** A report can be saved as a baseline and later runs
+compared against it, metric by metric, with a tolerance per metric and a direction
+per metric (more `close_fit_ratio` is better; more `unfitted` is worse). Identity
+and delivery carry tighter tolerances than the rest, because they are the qualities
+least able to absorb drift:
+
+```bash
+# save a baseline, then compare a later run against it
+python -c "from app.pipeline import evaluation as e; e.save_baseline(load_json(), 'baseline.json')"
+```
+
+The two qualities the project is judged on most are measured directly, both by
+injected callables so that nothing is downloaded by a run:
+
+* **Consistent character voices** - `measure_speaker_identity` compares each
+  generated line with its character's own reference and reports the mean, the
+  *worst* line and the spread per character. The worst line matters more than the
+  mean: a character who sounds right four times and like somebody else once is the
+  failure an audience notices, and an average hides it.
+* **Preservation of the actor's performance** - `prosody.py` measures the pitch
+  centre, pitch range and periodicity of the generated take against the original
+  actor's prompt audio, with a model-free autocorrelation tracker. `range_ratio`
+  near `1.0` means the delivery survived; well below it means the take was
+  flattened toward a neutral read, which is what losing the performance sounds like
+  numerically.
+
+`prosody.py` documents its own limitations (an above-range pitch is reported as a
+sub-multiple; a *sustained musical tone* is indistinguishable from a sustained
+vowel by these means; whispers and creaky voice are reported as unvoiced rather than
+guessed at). Its numbers are meaningful as **relative** measurements - both sides of
+a comparison go through the same tracker, so systematic bias largely cancels - and
+should not be quoted as absolute pitches.
+
+### Configuration-only check (no GPU or API keys required)
+
+The configuration layer and its tests run on any machine with Python 3.12:
+
+```bash
+pip install python-dotenv pytest
+pytest tests/test_config.py
+```
+
+## Roadmap
+
+- [x] Project scaffold, configuration, health check
+- [x] `separation`: audio-separator BS-Roformer two-stem integration
+- [x] `diarization`: pyannote Community-1 integration
+- [x] `transcription`: faster-whisper large-v3 integration
+- [x] `translation`: instruction-following Amharic dialogue adaptation (Gemini by default, DeepSeek or self-hosted by configuration)
+- [x] `voice_profiles`: per-speaker voice references and clone-prompt cache
+- [x] `tts`: cloned-voice Amharic synthesis (OmniVoice by default, MMS-TTS Amharic as a single-voice alternative)
+- [x] `timing`: pitch-preserving fit to the original windows
+- [x] `mixing`: dialogue over ducked music and effects
+- [x] `video`: FFmpeg extraction and mux into a dubbed MP4
+- [x] Orchestrator: one command from a video to the deliverable
+- [x] `qc`: per-run quality measurement (fit, delivery rate, crosstalk)
+- [x] `dialogue_context`: scenes, character bible, syllable budget
+- [x] Duration-aware adaptation: lines shortened to fit before synthesis
+- [x] `diarization`: crosstalk from the overlap-aware view, speaker-count hints
+- [x] `prosody` + `evaluation`: coverage, identity consistency, performance
+      preservation, and baseline comparison
+- [x] `nllb`: local NLLB-200 translation as the default backend
+- [x] `omnivoice`: cloned-voice synthesis, one voice per character, with a per-line
+      length request instead of stretching afterwards
+- [x] Two-level delivery pacing: one film-wide rate absorbing the systematic bias,
+      with a narrow per-line correction around it
+- [x] A per-line placement deadline: lines use the silence after them, and never
+      speak over the next one (28 overlapping lines -> 0 on the real test clip)
+- [x] Re-ask NLLB for a shorter rendering when a line cannot fit its available time
+- [x] Instruction-following adaptation as the default backend, so length and the
+      Fidel-script rule can actually be checked in the first pass; targeted rewrites
+      are opt-in and bounded, and a line that still will not fit is reported rather
+      than cut
+- [x] `mms`: MMS-TTS Amharic single-voice engine
+- [ ] Removed engines: `chatterbox` + Seed-VC V2 were dropped as unused; restore only
+      if a measured comparison shows OmniVoice's Amharic is not good enough
+- [x] Peak limiting so a clip is attenuated, never silently truncated
+- [ ] Record a scored baseline on real material with the new engines
+- [ ] Per-stage resume, so a long run continues instead of restarting
+- [ ] Mix realism: ambience continuity, dialogue EQ/reverb match, EBU R128
+- [ ] Character-name reconciliation above the diarization clusters
+- [ ] Full-film soak test (separation seams, cluster drift, cost)
+- [ ] Bunny Stream upload/streaming integration
+- [ ] (Later) production API + database
+- [ ] (Optional) 5.1 output; lip regeneration for close-ups
+
+## Contributing
+
+Contributions are welcome. Each pipeline stage lives in its own module under
+`app/pipeline/` with a docstring describing its intended interface; please keep
+that structure and add tests alongside new code.
+
+## Priorities
+
+The project is judged on, in order:
+
+1. natural cinematic Amharic dialogue
+2. consistent character voices across the whole film
+3. preservation of the actor's emotion and performance
+4. high-quality speech separation
+5. realistic music and effects reconstruction
+6. natural timing and pacing
+7. robustness over 90-180+ minute films
+
+Those are qualities, not features, so they are *measured* rather than asserted:
+see [Evaluation and baselines](#evaluation-and-baselines-prosodypy-evaluationpy).
+Before lower-value infrastructure, the priority is proving those qualities on
+representative material and then on a full-length soak test.
+
+## Licensing
+
+This project is intended to remain open source for personal, non-commercial use.
+Licences of the components are therefore documented here for transparency but do
+**not** drive model selection - the best available component wins on technical
+merit. What is currently in use, so the obligations are known rather than assumed:
+
+| Component | Licence | Note |
+| --- | --- | --- |
+| audio-separator / BS-Roformer | wrapper code MIT; verify the checkpoint's current model-card terms before redistribution | checkpoint is downloaded by audio-separator into `MODEL_CACHE_DIR` |
+| pyannote Community-1 | **CC-BY-4.0**, gated | requires accepting the model card; the HF token must have read access |
+| faster-whisper `large-v3` | MIT | not gated |
+| NLLB-200 (`3.3B`) | **CC-BY-NC-4.0** | non-commercial weights; the code is MIT |
+| `african-low-resource/omnivoice-amharic` (also `Lab-et/omnivoice-amharic`) | card claims Apache-2.0, **unverifiable** | current default; trained on the OmniVoice recipe, whose released weights are CC-BY-NC; no datasets named |
+| `k2-fsa/OmniVoice` | code Apache-2.0, weights **CC-BY-NC-4.0** | available as an explicit checkpoint override; non-commercial because of its training data (Emilia) |
+| Gemini API | proprietary service | the default adaptation provider; swappable by configuration |
+| DeepSeek API | proprietary service | the alternative adaptation provider; swappable for a local OpenAI-compatible server |
+
+Two engines that were removed are listed here for completeness, since they are one
+`git revert` away from coming back: Chatterbox Multilingual v3 (MIT; does **not**
+support Amharic on its own), the `gabar-tech/chatterbox-amharic` adapter
+(**CC-BY-SA-4.0**, share-alike propagating from WaxalNLP) and Seed-VC V2
+(**GPL-3.0**, *archived* - read-only upstream since April 2025). None of the three is
+installed or used by any run today.
+
+Two of the defaults (NLLB and OmniVoice weights) are **non-commercial only**. For a
+personal, non-commercial dub that is fine, and licences here are documented rather than
+used to rank anything - but it is worth knowing that neither is usable in a product.
+
+Cloning real performers' voices carries likeness and publicity considerations that
+a software licence does not address. That is worth stating plainly for a
+voice-matched dub, and it is the one legal question here that no licence table
+answers.
+
+Two decisions taken deliberately, for now:
+
+* **Stereo 2.0 is the deliverable.** 5.1 is a possible later output format and does
+  not drive the architecture.
+* **An instruction-following model is the adaptation baseline, and the vendor is a
+  setting.** Gemini is the default (`gemini-3.8-flash`, free tier) because syllable
+  condensation and scene-aware adaptation are the binding constraints for a dub, and
+  DeepSeek (`deepseek-v4-pro`) remains supported behind one variable. Neither is
+  replaced merely for being a hosted service: the stage is improved through context,
+  prompting, timing budgets and Amharic-specific processing, and a different model
+  replaces one only if measurement shows a materially better Amharic result.
+
+## License
+
+Open source. A license file will be added before the first release.

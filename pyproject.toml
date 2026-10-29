@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Amharic movie dubbing pipeline
+#
+# Target runtime: a RunPod A40 pod built from the official RunPod PyTorch image
+# (Python 3.12, PyTorch 2.8, CUDA 12.8, torchaudio 2.8, FFmpeg).
+#
+# requirements.txt mirrors [project.dependencies] below and is what is actually
+# installed on the worker:  pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+
+[project]
+name = "amharic-dub"
+version = "0.1.0"
+description = "Open-source Amharic movie dubbing pipeline"
+readme = "README.md"
+# Matches the Python 3.12 interpreter of the RunPod PyTorch image; the
+# PyTorch 2.8 / CUDA 12.8 wheels used below are unavailable on 3.13+.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # --- Deep learning runtime -------------------------------------------------
+  # Already provided by the RunPod PyTorch image; pinned so the ABI matches the
+  # packages listed below.
+  "torch==2.8.0",
+  "torchaudio==2.8.0",
+
+  # --- Pipeline models -------------------------------------------------------
+  # GPU-enabled audio-separator; BS-Roformer inference uses PyTorch CUDA.
+  "audio-separator[gpu]>=0.47,<0.48",
+  # Imported internally by audio-separator's UVR audio helpers.
+  "audioread",
+  # pyannote Community-1 - speaker diarization.
+  "pyannote.audio==4.0.7",
+  # faster-whisper large-v3 - transcription (CTranslate2 backend).
+  "faster-whisper",
+  # huggingface_hub fetches the OmniVoice checkpoint and the Amharic fine-tune.
+  "huggingface_hub",
+  # safetensors is the weight format those checkpoints ship in.
+  "safetensors",
+  # transformers is imported directly by the NLLB backend and by the MMS engine,
+  # and OmniVoice requires it (>=5.3) regardless.
+  "transformers",
+  # scipy is imported directly by the mixing and prosody stages.
+  "scipy",
+
+  # --- Dialogue adaptation / translation client -----------------------------
+  # The instruction-following backend talks to any OpenAI-compatible endpoint; the
+  # default backend (NLLB-200) runs locally on the torch/transformers below.
+  "openai",
+  # SentencePiece: NLLB's tokenizer. The fast tokenizer ships with transformers, but
+  # the checkpoint can fall back to the slow one, which needs this.
+  "sentencepiece",
+  # uroman romanises Fidel script into the Latin alphabet that MMS-TTS Amharic takes.
+  "uroman",
+  # OmniVoice is the default speech engine: it clones a per-character voice from a
+  # short reference and accepts a per-line length, which is what the timing stage
+  # relies on. Published as a package, so it needs no checkout of its own.
+  "omnivoice",
+
+  # --- Audio I/O and numerics ----------------------------------------------
+  "soundfile",
+  # NumPy 2.x is the verified baseline (the pyannote stack requires it); the
+  # upper bound only stops a transitive resolver from pulling a 3.x release.
+  "numpy>=2,<3",
+
+  # --- Configuration --------------------------------------------------------
+  "python-dotenv",
+
+  # --- Transitive pins needed for a working install -------------------------
+  # TorchCodec 0.7.x is the release line built against torch 2.8 (0.8+ targets
+  # torch 2.9). pyannote.audio only requires torchcodec>=0.7.0, so cap the upper
+  # bound to keep the ABI matched to torch 2.8.
+  "torchcodec>=0.7,<0.8",
+  # PyAV 19 removed the metadata_errors keyword that faster-whisper still passes
+  # to av.open(..., metadata_errors="ignore"), which raises at runtime. Hold
+  # PyAV on the 18.x line.
+  "av>=18.0,<19.0",
+]
+
+[dependency-groups]
+# Development / testing only.
+dev = [
+  "pytest>=8.0",
+]
