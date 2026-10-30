@@ -170,6 +170,8 @@ class Stages:
         lines: list[TranscriptSegment] | None = None,
         dialogue: list[AdaptedDialogue] | None = None,
         profiles: dict[str, VoiceProfile] | None = None,
+        unusable: list[object] | None = None,
+        designed: list[object] | None = None,
         failures: dict[str, Exception] | None = None,
     ) -> None:
         self.root = root
@@ -179,6 +181,8 @@ class Stages:
         self.lines = [_line()] if lines is None else lines
         self.dialogue = [_dialogue()] if dialogue is None else dialogue
         self.profiles = {SPEAKER: _profile(root)} if profiles is None else profiles
+        self.unusable = [] if unusable is None else unusable
+        self.designed = [] if designed is None else designed
         self.failures = failures or {}
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
@@ -239,7 +243,7 @@ class Stages:
         self._record("translation", lines, settings, bible)
         return list(self.dialogue)
 
-    def build_voice_profiles(
+    def build_voice_profiles_detailed(
         self,
         turns: object,
         speech: Path,
@@ -248,7 +252,9 @@ class Stages:
         crosstalk: object = (),
         settings: Settings,
         require_reference_transcript: bool = False,
-    ) -> dict[str, VoiceProfile]:
+    ) -> object:
+        from app.pipeline.voice_profiles import VoiceProfileBuild
+
         self._record(
             "voice_profiles",
             turns,
@@ -258,7 +264,10 @@ class Stages:
             require_reference_transcript,
         )
         self.seen_crosstalk = crosstalk
-        return dict(self.profiles)
+        return VoiceProfileBuild(
+            profiles=dict(self.profiles),
+            unusable=tuple(self.unusable),  # type: ignore[arg-type]
+        )
 
     def synthesize_dialogue_detailed(
         self,
@@ -273,7 +282,11 @@ class Stages:
         self._record("tts", dialogue, speech, profiles, settings)
         spoken = list(dialogue)  # type: ignore[arg-type]
         clips = [_clip(self.root, index, line) for index, line in enumerate(spoken, start=1)]
-        return SynthesisResult(clips=tuple(clips), skipped=tuple(self.skipped))
+        return SynthesisResult(
+            clips=tuple(clips),
+            skipped=tuple(self.skipped),
+            designed=tuple(self.designed),  # type: ignore[arg-type]
+        )
 
     def align_dialogue(
         self, clips: object, *, output_dir: Path, settings: Settings
@@ -316,7 +329,9 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fake: Stages) -> None:
     monkeypatch.setattr(orchestrator.transcription, "transcribe", fake.transcribe)
     monkeypatch.setattr(orchestrator.translation, "adapt_dialogue", fake.adapt_dialogue)
     monkeypatch.setattr(
-        orchestrator.voice_profiles, "build_voice_profiles", fake.build_voice_profiles
+        orchestrator.voice_profiles,
+        "build_voice_profiles_detailed",
+        fake.build_voice_profiles_detailed,
     )
     monkeypatch.setattr(
         orchestrator.tts, "synthesize_dialogue_detailed", fake.synthesize_dialogue_detailed
@@ -902,6 +917,32 @@ def test_no_voice_profiles_stops_the_run(tmp_path: Path, stages: Stages) -> None
 
     assert "voice profile" in str(info.value)
     assert "tts" not in stages.order
+
+
+def test_a_character_the_film_cannot_describe_is_still_voiced(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """One character with no usable reference must not end a run that can voice the rest."""
+
+    from app.pipeline.tts import DesignedVoice
+    from app.pipeline.voice_profiles import UnusableVoiceProfile
+
+    stages.unusable = [
+        UnusableVoiceProfile(
+            speaker_id="SPEAKER_09",
+            reason="the longest continuous stretch of speech is 1.20s",
+        )
+    ]
+    stages.designed = [DesignedVoice("SPEAKER_09", "female, elderly")]
+
+    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+
+    assert "tts" in stages.order
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert payload["run"]["tts"]["designed_voices"] == [
+        {"speaker_id": "SPEAKER_09", "instruct": "female, elderly"}
+    ]
+    assert "designed from a description" in result.report()
 
 
 def test_negative_max_lines_is_rejected(tmp_path: Path, stages: Stages) -> None:

@@ -253,6 +253,44 @@ def test_cloning_sends_no_voice_design_instruct(
     assert "instruct" not in FakeOmniVoice.instances[0].calls[0]
 
 
+def test_a_designed_voice_is_sent_as_instruct_with_no_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Voice design is the third mode: no prompt, one closed-vocabulary instruction."""
+
+    _patch(monkeypatch)
+    engine = _engine()
+    destination = tmp_path / "designed.wav"
+
+    engine.synthesize_designed(
+        text="ሰላም", instruct="Female, Young Adult, High Pitch", destination=destination
+    )
+
+    call = FakeOmniVoice.instances[0].calls[0]
+    assert call["instruct"] == "female, young adult, high pitch"
+    assert "voice_clone_prompt" not in call
+    assert "ref_audio" not in call
+    assert call["language"] == "Amharic"
+    assert destination.exists()
+
+
+def test_a_free_form_design_is_refused_before_the_model_is_called(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OmniVoice raises on anything outside its vocabulary; failing first names why."""
+
+    _patch(monkeypatch)
+
+    with pytest.raises(tts.ConfigurationError, match="not a voice-design word"):
+        _engine().synthesize_designed(
+            text="ሰላም",
+            instruct="sounds like a tired detective",
+            destination=tmp_path / "designed.wav",
+        )
+
+    assert FakeOmniVoice.instances == []
+
+
 def test_position_sampling_uses_omnivoice_default_but_tokens_remain_greedy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -110,6 +110,12 @@ DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 DEFAULT_DIARIZATION_MIN_SPEAKERS: Optional[int] = None
 DEFAULT_DIARIZATION_MAX_SPEAKERS: Optional[int] = None
 
+#: Whether a cluster whose own turns hold two voices is split apart. On by default: a
+#: character merged into a neighbour's cluster is cloned with that neighbour's voice for
+#: the whole film, which is audible everywhere they speak. The pass is conservative and
+#: reports every split it makes; turn it off to keep exactly the model's own clustering.
+DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS = True
+
 #: faster-whisper model used to transcribe the dialogue stem.
 DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
 
@@ -300,6 +306,14 @@ DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
 
 #: Legacy sample mapping, currently unused by the production pipeline.
 DEFAULT_VOICE_SAMPLE_MAP = ""
+
+#: Voice designs for characters the film gives no usable reference, e.g.
+#: ``SPEAKER_02=female,young adult,high pitch``. Empty by default: every such character
+#: is then given a distinct design from
+#: :data:`app.pipeline.tts.DESIGNED_VOICE_POOL`, derived from its speaker id so a re-run
+#: of the same film produces the same voices. Entries here override that for the
+#: speakers they name.
+DEFAULT_DESIGNED_VOICE_MAP = ""
 
 #: Amharic speech engine consumed by :mod:`app.pipeline.tts`.
 #:
@@ -768,6 +782,9 @@ class Settings:
     #: Optional speaker-count bounds for diarization; ``None`` lets it decide.
     diarization_min_speakers: Optional[int] = DEFAULT_DIARIZATION_MIN_SPEAKERS
     diarization_max_speakers: Optional[int] = DEFAULT_DIARIZATION_MAX_SPEAKERS
+    #: Whether a cluster holding two voices is split, so the second one is not cloned
+    #: with the first one's reference.
+    diarization_split_mixed_speakers: bool = DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -813,6 +830,9 @@ class Settings:
     #: an optional ``SPEAKER=file`` list saying which voice each speaker gets.
     voice_sample_dir: Path = DEFAULT_VOICE_SAMPLE_DIR
     voice_sample_map: str = DEFAULT_VOICE_SAMPLE_MAP
+    #: Optional ``SPEAKER=design`` list giving a character the film cannot describe a
+    #: designed voice explicitly, e.g. ``SPEAKER_02=female,young adult,high pitch``.
+    designed_voice_map: str = DEFAULT_DESIGNED_VOICE_MAP
     #: Persistent character/consistency state handed to dialogue adaptation.
     dialogue_bible_path: Path = DEFAULT_DIALOGUE_BIBLE_PATH
     #: TTS settings for :mod:`app.pipeline.tts`: the Amharic speech adapter and the
@@ -875,6 +895,10 @@ class Settings:
             ),
             diarization_max_speakers=_read_optional_int(
                 "DIARIZATION_MAX_SPEAKERS", DEFAULT_DIARIZATION_MAX_SPEAKERS
+            ),
+            diarization_split_mixed_speakers=_read_bool(
+                "DIARIZATION_SPLIT_MIXED_SPEAKERS",
+                DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS,
             ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
@@ -959,6 +983,10 @@ class Settings:
             voice_sample_map=(
                 _read_env("VOICE_SAMPLE_MAP", DEFAULT_VOICE_SAMPLE_MAP)
                 or DEFAULT_VOICE_SAMPLE_MAP
+            ),
+            designed_voice_map=(
+                _read_env("DESIGNED_VOICE_MAP", DEFAULT_DESIGNED_VOICE_MAP)
+                or DEFAULT_DESIGNED_VOICE_MAP
             ),
             dialogue_bible_path=_read_path(
                 "DIALOGUE_BIBLE_PATH", work_dir / DEFAULT_DIALOGUE_BIBLE_FILENAME
@@ -1125,6 +1153,7 @@ class Settings:
             "diarization_model": self.diarization_model,
             "diarization_min_speakers": self.diarization_min_speakers,
             "diarization_max_speakers": self.diarization_max_speakers,
+            "diarization_split_mixed_speakers": self.diarization_split_mixed_speakers,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
@@ -1155,6 +1184,7 @@ class Settings:
             "voice_reference_max_duration": self.voice_reference_max_duration,
             "voice_sample_dir": str(self.voice_sample_dir),
             "voice_sample_map": self.voice_sample_map,
+            "designed_voice_map": self.designed_voice_map,
             "dialogue_bible_path": str(self.dialogue_bible_path),
             "tts_model": self.tts_model,
             "tts_engine": self.tts_engine,
@@ -1196,6 +1226,7 @@ __all__ = [
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
+    "DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
     "DEFAULT_MMS_SAMPLE_RATE",
@@ -1242,6 +1273,7 @@ __all__ = [
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",
     "DEFAULT_VOICE_SAMPLE_DIR",
     "DEFAULT_VOICE_SAMPLE_MAP",
+    "DEFAULT_DESIGNED_VOICE_MAP",
     "DEFAULT_VOICE_REFERENCE_MIN_DURATION",
     "DEFAULT_VOICE_REFERENCE_TARGET_DURATION",
     "PROJECT_ROOT",

@@ -73,7 +73,7 @@ import inspect
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -966,6 +966,153 @@ def _terminate_reference_text(text: str) -> str:
     return text
 
 
+#: The closed vocabulary OmniVoice's voice design accepts, one set per category. A
+#: design is assembled from these words and nothing else: the model rejects free-form
+#: prose, and a rejected design would turn "this character has no reference" into a
+#: failed line rather than a different voice. Mirrors
+#: ``omnivoice/utils/voice_design.py``, which is also consulted when importable.
+DESIGNED_VOICE_CATEGORIES: tuple[tuple[str, ...], ...] = (
+    ("male", "female"),
+    ("child", "teenager", "young adult", "middle-aged", "elderly"),
+    ("very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"),
+    ("whisper",),
+)
+
+#: Designs handed to characters the film gives no usable reference, in a fixed order so
+#: a film always receives the same voices. One word per category is required, and the
+#: gender/age/pitch combinations are deliberately distinct from one another.
+DESIGNED_VOICE_POOL: tuple[str, ...] = (
+    "male, young adult, low pitch",
+    "female, young adult, high pitch",
+    "male, middle-aged, moderate pitch",
+    "female, middle-aged, moderate pitch",
+    "male, elderly, low pitch",
+    "female, elderly, moderate pitch",
+    "male, teenager, high pitch",
+    "female, teenager, low pitch",
+)
+
+#: Separator between the speakers of a ``DESIGNED_VOICE_MAP`` entry, which reads
+#: ``SPEAKER_02=female,young adult,high pitch``.
+_DESIGNED_VOICE_MAP_SEPARATORS = (";", "\n")
+
+
+def normalize_voice_design(design: str) -> str:
+    """Return ``design`` in the canonical form the model accepts, or say why it does not.
+
+    A design is a comma-separated list with at most one word per category - two genders,
+    or two ages, describe no voice at all - and every word has to come from
+    :data:`DESIGNED_VOICE_CATEGORIES`.
+    """
+
+    if not isinstance(design, str) or not design.strip():
+        raise ConfigurationError("a voice design must be a non-empty string")
+
+    words: list[str] = []
+    seen: set[int] = set()
+    for part in design.split(","):
+        word = " ".join(part.split()).lower()
+        if not word:
+            continue
+        for index, category in enumerate(DESIGNED_VOICE_CATEGORIES):
+            if word in category:
+                if index in seen:
+                    raise ConfigurationError(
+                        f"a voice design may say only one of {'/'.join(category)}, "
+                        f"got {design!r}"
+                    )
+                seen.add(index)
+                words.append(word)
+                break
+        else:
+            valid = ", ".join(word for category in DESIGNED_VOICE_CATEGORIES for word in category)
+            raise ConfigurationError(
+                f"{word!r} is not a voice-design word OmniVoice accepts; use any of: {valid}"
+            )
+
+    if not words:
+        raise ConfigurationError(f"a voice design must describe something, got {design!r}")
+    return ", ".join(words)
+
+
+def parse_designed_voice_map(spec: str | None) -> dict[str, str]:
+    """Read ``SPEAKER=female,young adult,high pitch`` entries into a mapping."""
+
+    mapping: dict[str, str] = {}
+    if not spec or not spec.strip():
+        return mapping
+
+    entries = [spec]
+    for separator in _DESIGNED_VOICE_MAP_SEPARATORS:
+        entries = [piece for entry in entries for piece in entry.split(separator)]
+
+    for entry in entries:
+        text = entry.strip()
+        if not text:
+            continue
+        speaker_id, _, design = text.partition("=")
+        speaker_id = speaker_id.strip()
+        if not speaker_id or not design.strip():
+            raise ConfigurationError(
+                f"DESIGNED_VOICE_MAP entries are SPEAKER=design, got {text!r}"
+            )
+        mapping[speaker_id] = normalize_voice_design(design)
+    return mapping
+
+
+def assign_designed_voices(
+    speaker_ids: Iterable[str], *, settings: Settings | None = None
+) -> dict[str, str]:
+    """Return the voice design each reference-less speaker should be spoken in.
+
+    ``DESIGNED_VOICE_MAP`` wins when it names a speaker. Everyone else is given a pool
+    entry derived from the speaker id, probing forward when that entry is already taken,
+    so two characters without references never end up with the same voice and a re-run
+    of the same film produces the same ones.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    overrides = parse_designed_voice_map(resolved.designed_voice_map)
+    speakers = sorted(dict.fromkeys(speaker_ids))
+
+    assigned: dict[str, str] = {}
+    taken: set[str] = set()
+    for speaker_id in speakers:
+        design = overrides.get(speaker_id)
+        if design is not None and design not in taken:
+            assigned[speaker_id] = design
+            taken.add(design)
+
+    for speaker_id in speakers:
+        if speaker_id in assigned:
+            continue
+        chosen = _pool_design_for(speaker_id, taken)
+        assigned[speaker_id] = chosen
+        taken.add(chosen)
+
+    return {speaker_id: assigned[speaker_id] for speaker_id in speakers}
+
+
+def _pool_design_for(speaker_id: str, taken: Collection[str]) -> str:
+    """Pick a pool design for ``speaker_id``, avoiding the ones already in ``taken``."""
+
+    offset = int(hashlib.sha256(speaker_id.encode("utf-8")).hexdigest(), 16) % len(
+        DESIGNED_VOICE_POOL
+    )
+    for step in range(len(DESIGNED_VOICE_POOL)):
+        design = DESIGNED_VOICE_POOL[(offset + step) % len(DESIGNED_VOICE_POOL)]
+        if design not in taken:
+            return design
+    # More reference-less characters than pool entries: reuse, newest last.
+    return DESIGNED_VOICE_POOL[offset]
+
+
+def designed_voice_identity(instruct: str) -> str:
+    """Return the artifact identity of a designed voice, stable across runs."""
+
+    return "design:" + normalize_voice_design(instruct)
+
+
 def _require_omnivoice() -> tuple[Any, Any, Any]:
     """Return ``(torch, OmniVoice, OmniVoiceGenerationConfig)``, or say what is missing."""
 
@@ -1031,6 +1178,34 @@ class VoiceCloningEngine(ABC):
         reference_text: str | None = None,
     ) -> Path:
         """Speak ``text`` as the voice heard in ``voice_reference``."""
+
+    @property
+    def supports_voice_design(self) -> bool:
+        """``True`` when the engine can speak in a voice described, not recorded.
+
+        A character the film never gives four clean seconds has no reference to clone.
+        An engine that can design a voice still speaks them as *someone*; one that
+        cannot would have to borrow another character's reference, which is exactly the
+        substitution this contract exists to avoid.
+        """
+
+        return False
+
+    def synthesize_designed(
+        self,
+        *,
+        text: str,
+        instruct: str,
+        destination: Path,
+        speaking_rate: float | None = None,
+    ) -> Path:
+        """Speak ``text`` in a voice designed from ``instruct``, with no reference."""
+
+        raise ConfigurationError(
+            f"the {self.name} engine cannot design a voice from an instruction, so a "
+            "speaker with no usable reference cannot be voiced; a reference from "
+            "another character is never substituted"
+        )
 
 
 class OmniVoiceEngine(VoiceCloningEngine):
@@ -1123,6 +1298,12 @@ class OmniVoiceEngine(VoiceCloningEngine):
 
         return True
 
+    @property
+    def supports_voice_design(self) -> bool:
+        """``True``: OmniVoice has a design mode for a speaker with no reference."""
+
+        return True
+
     def _load(self) -> tuple[Any, Any, Any]:
         """Load the model once and return it with torch and the config class."""
 
@@ -1201,14 +1382,53 @@ class OmniVoiceEngine(VoiceCloningEngine):
     ) -> Path:
         """Speak ``text`` as the voice in ``voice_reference``, at ``speaking_rate``."""
 
+        reference = _validate_audio_file(
+            Path(voice_reference), label="the voice reference"
+        )
+        return self._speak(
+            text=text,
+            destination=destination,
+            speaking_rate=speaking_rate,
+            prompt=self._prompt_for(reference, reference_text),
+        )
+
+    def synthesize_designed(
+        self,
+        *,
+        text: str,
+        instruct: str,
+        destination: Path,
+        speaking_rate: float | None = None,
+    ) -> Path:
+        """Speak ``text`` in the voice ``instruct`` describes, with no reference.
+
+        This is OmniVoice's third mode, and it is what a character the film never gives
+        a usable reference is voiced in. The design is validated against the closed
+        vocabulary first, because the model raises on anything it does not recognise.
+        """
+
+        return self._speak(
+            text=text,
+            destination=destination,
+            speaking_rate=speaking_rate,
+            instruct=normalize_voice_design(instruct),
+        )
+
+    def _speak(
+        self,
+        *,
+        text: str,
+        destination: Path,
+        speaking_rate: float | None,
+        prompt: Any | None = None,
+        instruct: str | None = None,
+    ) -> Path:
+        """Generate one take, either continued from ``prompt`` or designed by ``instruct``."""
+
         if not isinstance(text, str) or not text.strip():
             raise InvalidInputError("there is nothing to synthesize")
 
         target = Path(destination)
-        reference = _validate_audio_file(
-            Path(voice_reference), label="the voice reference"
-        )
-
         rate: float | None = None
         if speaking_rate is not None:
             candidate = float(speaking_rate)
@@ -1219,7 +1439,6 @@ class OmniVoiceEngine(VoiceCloningEngine):
             rate = candidate
 
         _torch, network, config_class = self._load()
-        prompt = self._prompt_for(reference, reference_text)
 
         # Keep token selection greedy, but leave position selection at OmniVoice's
         # recommended default. Greedy position selection can produce unnatural,
@@ -1230,15 +1449,18 @@ class OmniVoiceEngine(VoiceCloningEngine):
             position_temperature=5.0,
             class_temperature=0.0,
         )
-        # ``instruct`` is OmniVoice's *voice-design* control: it accepts only a closed
-        # vocabulary of accent/age/style words and rejects free-form instructions.
-        # Cloning takes the voice from ``voice_clone_prompt``, so it stays unset.
+        # The two modes are alternatives: cloning takes the voice from
+        # ``voice_clone_prompt``, design from ``instruct``, and sending both would
+        # describe one voice while recording another.
         request: dict[str, Any] = {
             "text": text,
             "language": OMNIVOICE_AMHARIC,
-            "voice_clone_prompt": prompt,
             "generation_config": config,
         }
+        if prompt is not None:
+            request["voice_clone_prompt"] = prompt
+        if instruct is not None:
+            request["instruct"] = instruct
         if rate is not None:
             request["speed"] = rate
 
@@ -1506,6 +1728,18 @@ def _voice_profile_identity(profile: VoiceProfile) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class DesignedVoice:
+    """A character spoken in a designed voice because the film had no reference.
+
+    Recorded so a run can say which characters are not the actor's voice, which is the
+    difference between a deliberate fallback and a silent substitution.
+    """
+
+    speaker_id: str
+    instruct: str
+
+
+@dataclass(frozen=True, slots=True)
 class SkippedLine:
     """A dialogue line that was deliberately not synthesized, and why.
 
@@ -1557,6 +1791,8 @@ class SynthesisResult:
     #: Anything the stage wants the run to know without treating it as a failure: lines
     #: voiced despite a window shorter than the engine minimum, for instance.
     notes: tuple[str, ...] = ()
+    #: Characters spoken in a designed voice rather than cloned from the film.
+    designed: tuple[DesignedVoice, ...] = ()
 
     @property
     def attempted(self) -> int:
@@ -1643,8 +1879,14 @@ def _validate_profiles(
     voice_profiles: Mapping[str, VoiceProfile],
     *,
     speakers: Iterable[str],
+    allow_missing: bool = False,
 ) -> dict[str, VoiceProfile]:
-    """Return the profiles as a validated ``{speaker_id: VoiceProfile}`` mapping."""
+    """Return the profiles as a validated ``{speaker_id: VoiceProfile}`` mapping.
+
+    ``allow_missing`` lets a speaker go without a profile, which is what a character
+    the film never gave a usable reference looks like; the caller then decides how to
+    speak their lines rather than treating the absence as an input error.
+    """
 
     if not isinstance(voice_profiles, Mapping):
         raise InvalidVoiceProfileError(
@@ -1662,6 +1904,9 @@ def _validate_profiles(
                 f"voice profile {profile.speaker_id!r} is stored under the key {key!r}"
             )
         profiles[profile.speaker_id] = profile
+
+    if allow_missing:
+        return profiles
 
     for speaker_id in dict.fromkeys(speakers):
         if speaker_id not in profiles:
@@ -1854,6 +2099,78 @@ def _synthesize_line_cloned(
         engine.synthesize(**request)
         _require_output(take, what="take", engine=engine.name)
 
+    return _clip_from_take(
+        index,
+        dialogue,
+        name=name,
+        take=take,
+        directories=directories,
+        engine=engine,
+        voice_reference=profile.resolve_reference_audio(),
+        settings=settings,
+    )
+
+
+def _synthesize_line_designed(
+    index: int,
+    dialogue: AdaptedDialogue,
+    *,
+    name: str,
+    directories: _TtsDirectories,
+    engine: VoiceCloningEngine,
+    instruct: str,
+    settings: Settings,
+    pacing: PacingPlan,
+) -> TtsClip:
+    """Speak one line in the voice ``instruct`` describes, for a speaker with no reference.
+
+    A character the film never gave four clean seconds - a walk-on who says one line, or
+    a voice heard only under music - has nothing to clone. Borrowing another character's
+    reference would make two people sound like one, which is worse than a voice the film
+    never had: the dub stays intelligible, and the run records which characters are
+    designed rather than cloned.
+    """
+
+    take = directories.takes / f"{name}.wav"
+    if not _usable_audio(take):
+        request: dict[str, Any] = {
+            "text": dialogue.amharic,
+            "instruct": instruct,
+            "destination": take,
+        }
+        if settings.tts_request_rate and engine.supports_speaking_rate:
+            rate = requested_speaking_rate(dialogue, plan=pacing)
+            if rate is not None:
+                request["speaking_rate"] = rate
+
+        engine.synthesize_designed(**request)
+        _require_output(take, what="take", engine=engine.name)
+
+    return _clip_from_take(
+        index,
+        dialogue,
+        name=name,
+        take=take,
+        directories=directories,
+        engine=engine,
+        voice_reference=None,
+        settings=settings,
+    )
+
+
+def _clip_from_take(
+    index: int,
+    dialogue: AdaptedDialogue,
+    *,
+    name: str,
+    take: Path,
+    directories: _TtsDirectories,
+    engine: VoiceCloningEngine,
+    voice_reference: Path | None,
+    settings: Settings,
+) -> TtsClip:
+    """Render a take's pauses into its clip and record what the line was spoken as."""
+
     clip_path = directories.clips / f"{name}.wav"
     speech_duration, lead, trail = _render_clip(
         take,
@@ -1873,7 +2190,7 @@ def _synthesize_line_cloned(
         audio_path=clip_path,
         take_path=take,
         performance_reference_path=None,
-        voice_reference_path=profile.resolve_reference_audio(),
+        voice_reference_path=voice_reference,
         sample_rate=clip_rate,
         speech_duration=speech_duration,
         rendered_pause_before=lead,
@@ -1993,21 +2310,40 @@ def synthesize_dialogue_detailed(
             f"{resolved.tts_engine!r}"
         )
 
+    designed: dict[str, str] = {}
     if single_voice:
         # A single-voice engine has no use for voice profiles, and requiring them
         # would mean building identities the engine cannot honour.
         profiles: Mapping[str, VoiceProfile] = {}
         voice_identities: Mapping[str, str] = {}
     else:
+        speakers = list(dict.fromkeys(line.speaker_id for line in lines))
         profiles = _validate_profiles(
-            voice_profiles, speakers=[line.speaker_id for line in lines]
+            voice_profiles, speakers=speakers, allow_missing=True
         )
+
+        # A character the film gave no usable reference is spoken in a designed voice,
+        # never in another character's. An engine that cannot design one would have to
+        # borrow a reference, so this is where that run has to stop instead.
+        unprofiled = [speaker_id for speaker_id in speakers if speaker_id not in profiles]
+        if unprofiled and not (
+            cloning_engine is not None and cloning_engine.supports_voice_design
+        ):
+            raise MissingVoiceProfileError(
+                f"speaker {unprofiled[0]!r} has no voice profile; build one with "
+                "app.pipeline.voice_profiles.build_voice_profiles first, or use an "
+                "engine that can design a voice for a speaker the film cannot describe"
+            )
+        designed = assign_designed_voices(unprofiled, settings=resolved)
 
         # Validate the reference audio of every speaker that is about to be used
         # before any model runs: a missing reference should fail the run the same way
         # whether or not earlier lines could already be synthesized.
         identities: dict[str, str] = {}
-        for speaker_id in dict.fromkeys(line.speaker_id for line in lines):
+        for speaker_id in speakers:
+            if speaker_id in designed:
+                identities[speaker_id] = designed_voice_identity(designed[speaker_id])
+                continue
             profile = profiles[speaker_id]
             reference = profile.resolve_reference_audio()
             _validate_audio_file(
@@ -2086,6 +2422,25 @@ def synthesize_dialogue_detailed(
                 )
                 continue
 
+            if line.speaker_id in designed:
+                clips.append(
+                    _synthesize_line_designed(
+                        index,
+                        line,
+                        name=_line_artifact_name(
+                            line,
+                            model=artifact_model,
+                            voice_identity=voice_identities[line.speaker_id],
+                        ),
+                        directories=directories,
+                        engine=cloning_engine,
+                        instruct=designed[line.speaker_id],
+                        settings=resolved,
+                        pacing=pacing,
+                    )
+                )
+                continue
+
             clips.append(
                 _synthesize_line_cloned(
                     index,
@@ -2134,8 +2489,25 @@ def synthesize_dialogue_detailed(
             "dropping them would leave real dialogue unsaid"
         )
 
+    if designed:
+        notes.append(
+            "designed voice(s): "
+            + ", ".join(
+                f"{speaker_id} ({instruct})" for speaker_id, instruct in designed.items()
+            )
+            + " - the film had no usable reference for them, so they are spoken in a "
+            "voice described to the model rather than cloned from an actor"
+        )
+
     return SynthesisResult(
-        clips=tuple(clips), skipped=tuple(skipped), pacing=pacing, notes=tuple(notes)
+        clips=tuple(clips),
+        skipped=tuple(skipped),
+        pacing=pacing,
+        notes=tuple(notes),
+        designed=tuple(
+            DesignedVoice(speaker_id=speaker_id, instruct=instruct)
+            for speaker_id, instruct in designed.items()
+        ),
     )
 
 
@@ -2187,6 +2559,8 @@ __all__ = [
     "InvalidVoiceProfileError",
     "MissingInputError",
     "MissingOutputError",
+    "DESIGNED_VOICE_POOL",
+    "DesignedVoice",
     "MissingVoiceProfileError",
     "MmsAmharicEngine",
     "OmniVoiceEngine",
@@ -2197,7 +2571,11 @@ __all__ = [
     "TtsClip",
     "TtsError",
     "TextToSpeechEngine",
+    "assign_designed_voices",
+    "designed_voice_identity",
     "engine_needs_profiles",
+    "normalize_voice_design",
+    "parse_designed_voice_map",
     "artifact_model_name",
     "load_mms_engine",
     "load_omnivoice_engine",

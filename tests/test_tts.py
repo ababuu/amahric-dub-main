@@ -205,6 +205,35 @@ class FakeOmnivoice(VoiceCloningEngine):
         return _write_wav(Path(destination), data.astype(np.float32), self.rate)
 
 
+class FakeDesigningEngine(FakeOmnivoice):
+    """A cloning engine that can also design a voice, as OmniVoice can."""
+
+    @property
+    def supports_voice_design(self) -> bool:
+        return True
+
+    def synthesize_designed(
+        self,
+        *,
+        text: str,
+        instruct: str,
+        destination: Path,
+        speaking_rate: float | None = None,
+    ) -> Path:
+        self.calls.append(
+            {
+                "text": text,
+                "instruct": instruct,
+                "destination": Path(destination),
+                "speaking_rate": speaking_rate,
+            }
+        )
+        self.events.append(("designed", Path(destination).name))
+        times = np.arange(int(self.seconds * self.rate), dtype=np.float64) / self.rate
+        data = 0.3 * np.sin(2.0 * np.pi * 180.0 * times)
+        return _write_wav(Path(destination), data.astype(np.float32), self.rate)
+
+
 @dataclass
 class Rig:
     """A synthetic stem, one voice profile and a fake cloning engine."""
@@ -410,6 +439,8 @@ def test_unordered_dialogue_is_rejected(rig: Rig) -> None:
 
 
 def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
+    """An engine that cannot design a voice must not borrow another character's."""
+
     with pytest.raises(MissingVoiceProfileError, match="SPEAKER_09"):
         synthesize_dialogue(
             [_line(speaker_id="SPEAKER_09")],
@@ -417,6 +448,78 @@ def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
             {rig.profile.speaker_id: rig.profile},
             settings=rig.settings(),
         )
+
+
+# ---------------------------------------------------------------------------
+# designed voices: a character the film gave no usable reference
+# ---------------------------------------------------------------------------
+
+
+def test_a_speaker_without_a_profile_is_spoken_in_a_designed_voice(rig: Rig) -> None:
+    rig.engine = FakeDesigningEngine(events=rig.events)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
+    )
+
+    assert len(result.clips) == 1
+    call = rig.engine.calls[0]
+    assert "voice_reference" not in call
+    assert "reference_text" not in call
+    assert call["instruct"] == tts.assign_designed_voices(
+        ["SPEAKER_09"], settings=rig.settings()
+    )["SPEAKER_09"]
+    assert result.clips[0].voice_reference_path is None
+    assert [voice.speaker_id for voice in result.designed] == ["SPEAKER_09"]
+    assert any("designed voice" in note for note in result.notes)
+
+
+def test_a_cloned_and_a_designed_character_are_kept_apart(rig: Rig) -> None:
+    """One reference-less speaker must not disturb the cloned one's artifacts."""
+
+    rig.engine = FakeDesigningEngine(events=rig.events)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(), _line(speaker_id="SPEAKER_09", start=10.0, end=12.0)],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+    )
+
+    cloned, designed = rig.engine.calls
+    assert cloned["voice_reference"] == rig.profile.resolve_reference_audio()
+    assert "instruct" not in cloned
+    assert "voice_reference" not in designed
+    assert len({clip.audio_path for clip in result.clips}) == 2
+
+
+def test_designed_voices_are_distinct_and_stable() -> None:
+    speakers = ["SPEAKER_02", "SPEAKER_03", "SPEAKER_04"]
+
+    first = tts.assign_designed_voices(speakers)
+
+    assert list(first) == speakers
+    assert len(set(first.values())) == len(speakers)
+    assert tts.assign_designed_voices(speakers) == first
+
+
+def test_a_designed_voice_map_names_the_voice_explicitly(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, designed_voice_map="SPEAKER_02=Female, Elderly")
+
+    assigned = tts.assign_designed_voices(["SPEAKER_02", "SPEAKER_03"], settings=settings)
+
+    assert assigned["SPEAKER_02"] == "female, elderly"
+    assert assigned["SPEAKER_03"] != assigned["SPEAKER_02"]
+
+
+def test_a_free_form_voice_design_is_rejected() -> None:
+    """OmniVoice validates ``instruct`` against a closed vocabulary and would raise."""
+
+    with pytest.raises(tts.ConfigurationError, match="not a voice-design word"):
+        tts.normalize_voice_design("speak like a tired detective")
+
+    with pytest.raises(tts.ConfigurationError, match="only one of"):
+        tts.normalize_voice_design("male, female")
 
 
 def test_a_profile_stored_under_the_wrong_key_is_rejected(rig: Rig) -> None:

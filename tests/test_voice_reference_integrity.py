@@ -166,11 +166,23 @@ def test_the_transcript_sent_matches_the_audio_sent(tmp_path: Path) -> None:
     """The invariant, over a speaker whose lines are ragged.
 
     Whatever window is chosen, ``reference_text`` is either absent or the exact words
-    of that window - never a partial description of it.
+    of that window - never a partial description of it. The window may run past its
+    last line into the silence after it, which carries no words; speech after the last
+    line is followed as well, and then the window has no transcript to send.
     """
 
-    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 60.0, 0.1)])
-    segments = [SpeakerSegment("SPEAKER_00", 10.0, 60.0)]
+    # Speech with pauses, so at least one window can be described exactly: a take in
+    # which the speaker never stops has no line end to cut on.
+    stem = _write_stem(
+        tmp_path / "speech.wav",
+        [
+            (10.0, 12.95, 0.1),
+            (13.4, 15.1, 0.1),
+            (20.0, 21.0, 0.1),
+            (40.0, 48.0, 0.1),
+        ],
+    )
+    segments = [SpeakerSegment("SPEAKER_00", 10.0, 48.0)]
     transcript = [
         TranscriptSegment("SPEAKER_00", 10.3, 12.9, "first thing said"),
         TranscriptSegment("SPEAKER_00", 13.4, 15.1, "second thing said"),
@@ -184,9 +196,7 @@ def test_the_transcript_sent_matches_the_audio_sent(tmp_path: Path) -> None:
 
     assert profile.reference_text is not None
     starts = {line.start for line in transcript}
-    ends = {line.end for line in transcript}
     assert profile.reference_start in starts
-    assert profile.reference_end in ends
     words = profile.reference_text.split()
     covered = " ".join(
         line.text
@@ -202,8 +212,10 @@ def test_a_reference_is_never_cut_on_an_arbitrary_grid_when_lines_exist(
 ) -> None:
     """The stride grid is for speakers with no transcript, not for everyone."""
 
-    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 40.0, 0.1)])
-    segments = [SpeakerSegment("SPEAKER_00", 10.0, 40.0)]
+    # The speaker stops where the last line ends, so the window has a real edge to
+    # cut on rather than speech that carries on past its transcript.
+    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 19.03, 0.1)])
+    segments = [SpeakerSegment("SPEAKER_00", 10.0, 19.03)]
     # Lines that happen not to start on the 2.0s stride the old code used.
     transcript = [
         TranscriptSegment("SPEAKER_00", 11.37, 15.11, "alpha beta gamma"),

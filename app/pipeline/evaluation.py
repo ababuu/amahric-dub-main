@@ -431,6 +431,12 @@ def measure_speaker_identity(
                 continue
             reference = profile.reference_audio
 
+        if reference is None:
+            # A designed voice has no reference to be similar to: it is not the
+            # actor's, so there is nothing to measure identity against.
+            unmeasured += 1
+            continue
+
         try:
             generated = embed(Path(clip.audio_path))
             target = embed(Path(reference))

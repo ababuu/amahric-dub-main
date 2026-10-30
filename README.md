@@ -226,11 +226,16 @@ inside a word asks the model to finish that word before it speaks the line. On t
 that exposed this, the transcript ended at 12.512s while the word "room" kept sounding
 to about 12.95s, and the prompt therefore ended mid-word. Each reference is now grown
 past its transcript line to the real acoustic offset - found with the same energy VAD
-used to score windows - and keeps 0.3s of the silence after it. The window never
-reaches into another character's speech, never exceeds
-`VOICE_REFERENCE_MAX_DURATION`, and is left exactly as cut when the tail is steady
-material with no offset to find. This is what OmniVoice's author recommends for the
-mirror-image defect as well: a reference "with appropriate silences".
+used to score windows - and keeps 0.3s of the silence after it, appending digital
+silence when the next line follows too closely for that much to be there. When the VAD
+finds speech right up to the far edge of the window - the recogniser stopped short of
+the last word, or the actor runs straight into the next line - the window follows that
+speech to the far edge and gives up its transcript, so the engine transcribes the
+reference rather than being handed text that covers only part of it. The window never
+reaches into another line and never exceeds `VOICE_REFERENCE_MAX_DURATION`; a tail of
+steady material (a bed or bleed) has no word to follow and is left as cut. This is what
+OmniVoice's author recommends for the mirror-image defect as well: a reference "with
+appropriate silences".
 
 The pipeline reports a tentative pitch-based vocal-presentation estimate, but preserves
 the actor's voice by cloning the reference rather than treating that estimate as a
@@ -387,6 +392,7 @@ environment, so values configured on the RunPod pod always win.
 | `DIARIZATION_MODEL` | Hugging Face pipeline id for diarization            | `pyannote/speaker-diarization-community-1` |
 | `DIARIZATION_MIN_SPEAKERS` | Fewest speakers diarization may report; unset lets it decide | *(unset)* |
 | `DIARIZATION_MAX_SPEAKERS` | Most speakers diarization may report; unset lets it decide | *(unset)* |
+| `DIARIZATION_SPLIT_MIXED_SPEAKERS` | Split a cluster whose own turns hold two voices, so the second is not cloned in the first one's voice | `true` |
 | `DEVICE` | Device for local model stages. Separation refuses anything but `cuda`/`cuda:N` | `cuda` |
 | `ALLOW_TORCH_COMPILE` | Set to `1` to re-enable TorchInductor. It is off by default because a pod whose PyTorch CUDA build predates its GPU aborts with `nvrtc: error: invalid value for --gpu-architecture`; no stage needs compilation | *(unset)* |
 | `TRANSCRIPTION_MODEL` | faster-whisper model for transcription            | `large-v3`         |
@@ -415,6 +421,7 @@ environment, so values configured on the RunPod pod always win.
 | `TRANSLATION_ENFORCE_BUDGET` | Send a line that is over its syllable budget back once to be shortened | `true` |
 | `TRANSLATION_ENFORCE_FIDEL_LOANWORDS` | Send a line that still carries Roman-script text back once to be written in Fidel | `true` |
 | `VOICE_PROFILE_DIR` | Per-speaker voice profiles directory                | `$WORK_DIR/voices` |
+| `DESIGNED_VOICE_MAP` | `SPEAKER=design` entries giving a character the film cannot describe an explicit OmniVoice voice design; unset assigns each one a distinct design from a fixed pool | *(unset)* |
 | `VOICE_REFERENCE_MIN_DURATION` | Shortest usable voice-cloning reference  | `4.0`              |
 | `VOICE_REFERENCE_TARGET_DURATION` | Preferred reference length            | `5.0`              |
 | `VOICE_REFERENCE_MAX_DURATION` | Longest reference kept (a longer continuous turn is scanned with a sliding window) | `10.0` |
@@ -785,6 +792,26 @@ phonetic-variety term; without one the term is dropped instead of being guessed.
 Speaker ids are kept exactly as diarization reported them, but only ever used as a
 single sanitised directory component (`speaker_directory_name`), so an unusual or
 hostile label cannot write outside `VOICE_PROFILE_DIR`.
+
+**A character the film cannot describe gets a designed voice, never another's.** Two
+things can leave a character without a reference of their own. The first is that they
+never speak four clean seconds - a walk-on with one line, or a voice heard only under
+music. Those characters are spoken in a voice *described* to OmniVoice (`instruct`, its
+voice-design mode) and the run records which they are, in the report and in the
+manifest's `tts.designed_voices`. Borrowing a neighbour's reference was the old
+behaviour, and it makes two people sound like one; an engine without a design mode
+still refuses rather than doing that.
+
+The second is a clustering error: a character who speaks little, quietly, or mostly
+under someone else's turn can be clustered with that neighbour, and then has a very
+good reference - of the wrong person. `DIARIZATION_SPLIT_MIXED_SPEAKERS` looks for
+exactly that, using the pipeline's own speaker embeddings: a cluster with at least five
+clean turns is embedded turn by turn, and if those turns fall into two groups that each
+agree with themselves and clearly disagree across, and the smaller group has at least
+three turns and four seconds of speech, it is split into a new speaker. The thresholds
+are deliberately strict, because inventing a
+character is worse than missing one - a missed character still has a real voice, just
+the wrong one. Every split is reported with the similarities that justified it.
 
 **The original is measured against twice, every run, and both are reported.** The
 music and effects stems are summed back in untouched, so anything the separator

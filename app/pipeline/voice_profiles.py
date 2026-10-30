@@ -237,9 +237,22 @@ REFERENCE_EDGE_SEARCH_SECONDS = 0.60
 #: reach into a neighbouring character's first syllable.
 REFERENCE_EDGE_GUARD_SECONDS = 0.05
 
-#: A search region this share active has no acoustic offset to find - it is steady
-#: material such as a music bed or bleed - so the window is left exactly as cut.
-REFERENCE_EDGE_ACTIVE_RATIO_LIMIT = 0.95
+#: Spread between the 90th and 10th percentile frame level below which a search
+#: region still sounding at its far edge is treated as steady material rather than
+#: speech. Speech is bursty - syllables sit well above the gaps between them - while
+#: a music bed, a tone or bleed holds a nearly constant level.
+REFERENCE_EDGE_STEADY_SPREAD_DB = 6.0
+
+#: Seconds of the window before its end that the noise floor of the search region is
+#: measured against. Estimating it from the search region alone is what made a
+#: decaying final word look like silence: every frame there is the same word getting
+#: quieter, so the quietest of them becomes the floor and the rest sit below the
+#: threshold that floor implies.
+REFERENCE_EDGE_FLOOR_SECONDS = 1.0
+
+#: Appended silence shorter than this is floating-point dust rather than a pad, and
+#: is dropped so it can neither reach the filter chain nor a profile's description.
+REFERENCE_MIN_PAD_SECONDS = 0.005
 
 #: Orthographic targets of the phonetic-variety proxy: distinct symbols and
 #: distinct words a reference should exercise, and the number of words below
@@ -751,12 +764,17 @@ class _ReferenceCandidate:
     #: ``True`` when the window shares time with simultaneous speech, so the
     #: recording contains more than one voice.
     contaminated: bool = False
-    #: The transcript-exact span this window was grown from. ``start``..``end``
-    #: add the silence after it, which carries no words, so the transcript still
-    #: describes the audio; these two keep the *speech* length available to the
-    #: scoring and selection rules that care about it.
+    #: The transcript-exact span this window was grown from. ``start``..``end`` add
+    #: the silence after it - which carries no words, so the transcript still
+    #: describes the audio - or the tail of a word the recogniser stopped short of,
+    #: which costs the window its transcript. These two keep the *speech* length
+    #: available to the scoring and selection rules that care about it.
     speech_start: float | None = None
     speech_end: float | None = None
+    #: Digital silence appended to the extracted reference, in seconds, when the
+    #: source offered less than :data:`REFERENCE_TRAIL_SILENCE_SECONDS` after the
+    #: last word. It carries no words, so the transcript still describes the audio.
+    trailing_pad: float = 0.0
 
     @property
     def duration(self) -> float:
@@ -849,6 +867,11 @@ class _ReferenceCandidate:
                 f", {self.edge_silence:.1f}s of silence after the speech so the "
                 "prompt ends where the speaker stopped rather than inside a word"
             )
+        if self.trailing_pad > 0.0:
+            reason += (
+                f", {self.trailing_pad:.2f}s of silence appended so the prompt ends "
+                "in silence rather than inside a word"
+            )
         if self.variety is not None:
             reason += f", phonetic variety {self.variety:.2f}"
         if self.text is None:
@@ -872,6 +895,7 @@ class _StemReader:
         self._path = path
         self._handle: Any | None = None
         self._sample_rate = 0
+        self._frames = 0
 
     def __enter__(self) -> "_StemReader":
         try:
@@ -886,6 +910,7 @@ class _StemReader:
             raise AudioAnalysisError(
                 f"the dialogue stem {self._path} reports an unusable sample rate"
             )
+        self._frames = int(self._handle.frames)
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -905,8 +930,12 @@ class _StemReader:
         if self._handle is None:  # pragma: no cover - guarded by the context manager
             raise AudioAnalysisError("the dialogue stem is not open")
 
-        first = max(0, int(round(start * self._sample_rate)))
-        last = max(first, int(round(end * self._sample_rate)))
+        # A window may reach the end of the stem - or past it, when a timestamp
+        # rounds beyond the last sample - so clamp to what is actually there.
+        first = min(max(0, int(round(start * self._sample_rate))), self._frames)
+        last = min(max(first, int(round(end * self._sample_rate))), self._frames)
+        if last <= first:
+            return np.zeros(0, dtype=np.float64)
 
         try:
             self._handle.seek(first)
@@ -1195,6 +1224,22 @@ def _speech_limit_after(end: float, occupied: Sequence[tuple[float, float]]) -> 
     return limit
 
 
+@dataclass(frozen=True, slots=True)
+class _ReferenceEdge:
+    """Where a reference window ends, and how its trailing silence is completed.
+
+    ``end`` is the source timestamp the window stops at. ``pad_seconds`` is digital
+    silence appended to the extracted file, which carries no words and therefore
+    leaves the transcript still describing the audio. ``includes_untranscribed_speech``
+    is set when the window had to be grown over speech the transcript does not cover,
+    which makes that transcript unusable.
+    """
+
+    end: float
+    pad_seconds: float = 0.0
+    includes_untranscribed_speech: bool = False
+
+
 def _trailing_silence_window(
     reader: _StemReader,
     start: float,
@@ -1202,8 +1247,8 @@ def _trailing_silence_window(
     occupied: Sequence[tuple[float, float]],
     *,
     maximum: float,
-) -> tuple[float, float]:
-    """Grow a window's end past its transcript line, into the silence that follows.
+) -> _ReferenceEdge:
+    """Finish a window's end where the speaker has stopped, not inside a word.
 
     A transcript's end time is not an acoustic offset. On the film that prompted
     this, the selected reference ended *inside* a word: its last 40 ms sat at
@@ -1213,13 +1258,19 @@ def _trailing_silence_window(
     fragment of the reference at the start of every take.
 
     The real offset is located with the same energy VAD used to measure windows, and
-    :data:`REFERENCE_TRAIL_SILENCE_SECONDS` of the silence after it is kept. An offset
-    is accepted only when that much silence is actually observed after it; otherwise
-    the speech may simply be pausing between syllables, and guessing would pull the
-    next, untranscribed words into the prompt. The window never grows into another
-    line and never past ``maximum``, and a tail that is still active at the end of the
-    search range (a music bed, or speech carrying on too far to trust) is left exactly
-    as cut.
+    :data:`REFERENCE_TRAIL_SILENCE_SECONDS` of the silence after it is kept. When the
+    gap to the next line is shorter than that, whatever silence is there is kept and
+    the rest is appended as digital silence, so the prompt always ends in silence
+    rather than at an arbitrary sample.
+
+    Speech that is still sounding at the far edge of the search range means the line's
+    end time sits inside its last word - the recogniser stopped short of it, or the
+    next line follows with no pause at all. The window then follows the speech to the
+    far edge of what may be taken (never into another line, never past ``maximum``),
+    which costs its transcript: no line describes that audio any more, so the cloning
+    engine transcribes the reference itself instead of being handed text that stops
+    short of it. Steady material - a music bed or bleed - holds a nearly constant
+    level and carries no word to follow, so it leaves the window as cut.
 
     The head is deliberately untouched: the model continues the *end* of a prompt,
     never its beginning, and pulling a window backwards would risk swallowing the
@@ -1230,44 +1281,60 @@ def _trailing_silence_window(
     search = REFERENCE_EDGE_SEARCH_SECONDS + REFERENCE_TRAIL_SILENCE_SECONDS
     room = search if math.isinf(limit) else limit - end - REFERENCE_EDGE_GUARD_SECONDS
     if room <= 0.0:
-        return start, end
+        return _ReferenceEdge(end)
 
     read_end = end + min(room, search)
     samples = reader.read(end, read_end)
     if samples.size == 0:
-        return start, end
+        return _ReferenceEdge(end)
 
     levels = _frame_levels(samples, reader.sample_rate)
     if levels.size < 3:
-        return start, end
+        return _ReferenceEdge(end)
 
-    noise_floor = float(np.percentile(levels, NOISE_FLOOR_PERCENTILE))
+    # The floor is taken from the search region *and* the second of window before
+    # it, so a decaying last word cannot pass for the silence it is decaying into.
+    context = reader.read(max(start, end - REFERENCE_EDGE_FLOOR_SECONDS), end)
+    context_levels = _frame_levels(context, reader.sample_rate)
+    noise_floor = float(
+        np.percentile(np.concatenate((context_levels, levels)), NOISE_FLOOR_PERCENTILE)
+    )
     threshold = max(noise_floor + ACTIVITY_MARGIN_DB, SILENCE_FLOOR_DBFS)
     active = levels >= threshold
 
     sounded = np.flatnonzero(active)
     if sounded.size == 0:
         # The window already ends in silence; there is nothing to add.
-        return start, end
+        return _ReferenceEdge(end)
+
     if int(sounded[-1]) >= active.size - 1:
-        # Speech runs to the edge of what may be taken: no offset to trust.
-        return start, end
-    if float(active.mean()) >= REFERENCE_EDGE_ACTIVE_RATIO_LIMIT:
-        return start, end
+        # Speech runs to the edge of what may be taken, so the line's end time is
+        # inside the last word it was transcribed from.
+        spread = float(np.percentile(levels, 90) - np.percentile(levels, 10))
+        if spread < REFERENCE_EDGE_STEADY_SPREAD_DB:
+            # Steady material: a bed or bleed, with no word to follow.
+            return _ReferenceEdge(end)
+        extended = min(end + REFERENCE_EDGE_SEARCH_SECONDS, read_end, start + maximum)
+        if extended <= end:
+            return _ReferenceEdge(end)
+        return _ReferenceEdge(
+            extended,
+            REFERENCE_TRAIL_SILENCE_SECONDS,
+            includes_untranscribed_speech=True,
+        )
 
     acoustic_end = end + (int(sounded[-1]) + 1) * ANALYSIS_FRAME_SECONDS
-    padded_end = acoustic_end + REFERENCE_TRAIL_SILENCE_SECONDS
-    if padded_end > read_end:
-        # The silence after the last frame is shorter than the reference needs, so
-        # the speech may simply be pausing between syllables. Without seeing the
-        # silence itself there is no offset to trust, and guessing would pull the
-        # next, untranscribed words into the prompt.
-        return start, end
-    if padded_end - start > maximum:
-        padded_end = start + maximum
+    padded_end = min(
+        acoustic_end + REFERENCE_TRAIL_SILENCE_SECONDS, read_end, start + maximum
+    )
     if padded_end <= end:
-        return start, end
-    return start, padded_end
+        return _ReferenceEdge(end)
+    # Silence this short happens when the next line follows closely; appending the
+    # remainder keeps the prompt's last moments silent without reaching into it.
+    pad = max(0.0, REFERENCE_TRAIL_SILENCE_SECONDS - (padded_end - acoustic_end))
+    if pad < REFERENCE_MIN_PAD_SECONDS:
+        pad = 0.0
+    return _ReferenceEdge(padded_end, pad)
 
 
 def _candidates_for(
@@ -1323,32 +1390,39 @@ def _candidates_for(
     candidates: list[_ReferenceCandidate] = []
     seen: set[tuple[float, float]] = set()
     for start, end in spans:
-        # The transcript describes this span exactly, so it is read before the
-        # window grows: the added silence carries no words.
-        text = _window_text(speaker_id, start, end, transcript)
-        covered = _covered_text(speaker_id, start, end, transcript)
-        padded_start, padded_end = _trailing_silence_window(
-            reader, start, end, occupied, maximum=maximum
-        )
-        key = (round(padded_start, 4), round(padded_end, 4))
+        edge = _trailing_silence_window(reader, start, end, occupied, maximum=maximum)
+        key = (round(start, 4), round(edge.end, 4))
         if key in seen:
             continue
         seen.add(key)
-        samples = reader.read(padded_start, padded_end)
+        samples = reader.read(start, edge.end)
         if samples.size == 0:
             continue
+
+        # The transcript describes the span the window was cut on. Silence added
+        # after it carries no words, so the text still describes the audio; speech
+        # added after it does not, and the engine is left to transcribe instead.
+        if edge.includes_untranscribed_speech:
+            text = None
+            spoken_end = edge.end
+        else:
+            text = _window_text(speaker_id, start, end, transcript)
+            spoken_end = end
+        covered = _covered_text(speaker_id, start, end, transcript)
+
         candidates.append(
             _ReferenceCandidate(
                 speaker_id=speaker_id,
-                start=padded_start,
-                end=padded_end,
+                start=start,
+                end=edge.end,
                 stats=_measure_window(samples, reader.sample_rate),
-                overlap_seconds=_overlap_seconds(padded_start, padded_end, others),
+                overlap_seconds=_overlap_seconds(start, edge.end, others),
                 text=text,
                 variety=_phonetic_variety(covered or text),
-                contaminated=_contaminated(padded_start, padded_end, contaminated),
+                contaminated=_contaminated(start, edge.end, contaminated),
                 speech_start=start,
-                speech_end=end,
+                speech_end=spoken_end,
+                trailing_pad=edge.pad_seconds,
             )
         )
     return candidates
@@ -1570,13 +1644,21 @@ def _extract_reference(
         "-ar",
         str(REFERENCE_SAMPLE_RATE),
     ]
+
+    filters: list[str] = []
     if gain_db < -0.01:
-        arguments += ["-af", f"volume={gain_db:.2f}dB"]
+        filters.append(f"volume={gain_db:.2f}dB")
+    if candidate.trailing_pad > 0.0:
+        filters.append(f"apad=pad_dur={candidate.trailing_pad:.3f}")
+    if filters:
+        arguments += ["-af", ",".join(filters)]
     arguments += ["-c:a", "pcm_s16le", "-f", "wav", str(destination)]
 
     _run_ffmpeg(arguments)
     _verify_reference(
-        destination, expected_duration=candidate.duration, speaker_id=candidate.speaker_id
+        destination,
+        expected_duration=candidate.duration + candidate.trailing_pad,
+        speaker_id=candidate.speaker_id,
     )
 
 
@@ -1725,6 +1807,28 @@ def _build_profile(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class UnusableVoiceProfile:
+    """A speaker the film could not give a usable reference, and why.
+
+    Reported rather than raised by :func:`build_voice_profiles_detailed`: a character
+    who never speaks long enough to clone still has lines to dub, and the TTS stage
+    can speak those in a designed voice instead of failing the run or cloning somebody
+    else's.
+    """
+
+    speaker_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceProfileBuild:
+    """What a film allowed the profile stage to build, and what it did not."""
+
+    profiles: dict[str, VoiceProfile]
+    unusable: tuple[UnusableVoiceProfile, ...] = ()
+
+
 def build_voice_profiles(
     speaker_segments: Iterable[SpeakerSegment],
     audio_path: str | Path,
@@ -1735,7 +1839,11 @@ def build_voice_profiles(
     clone_encoder: ClonePromptEncoder | None = None,
     require_reference_transcript: bool = False,
 ) -> dict[str, VoiceProfile]:
-    """Build one voice identity per diarized speaker.
+    """Build one voice identity per diarized speaker, or raise on the first one it cannot.
+
+    :func:`build_voice_profiles_detailed` is the same work without the all-or-nothing
+    ending; the orchestrator uses it so a character with too little clean speech gets a
+    designed voice instead of ending the run.
 
     Parameters
     ----------
@@ -1800,10 +1908,78 @@ def build_voice_profiles(
         The injected encoder failed.
     """
 
+    profiles, failures = _build_profiles(
+        speaker_segments,
+        audio_path,
+        transcript=transcript,
+        crosstalk=crosstalk,
+        settings=settings,
+        clone_encoder=clone_encoder,
+        require_reference_transcript=require_reference_transcript,
+    )
+    if failures:
+        raise failures[0][1]
+    return profiles
+
+
+def build_voice_profiles_detailed(
+    speaker_segments: Iterable[SpeakerSegment],
+    audio_path: str | Path,
+    *,
+    transcript: Iterable[TranscriptSegment] | None = None,
+    crosstalk: Iterable[CrosstalkRegion] | None = None,
+    settings: Settings | None = None,
+    clone_encoder: ClonePromptEncoder | None = None,
+    require_reference_transcript: bool = False,
+) -> VoiceProfileBuild:
+    """Build every profile the film allows, and report the speakers it could not.
+
+    A character who never speaks four clean seconds, or whose every turn is shared with
+    another voice, has no reference a cloning engine could use. Raising for them ends a
+    run that could still dub the rest of the film, so they are named here instead and
+    the TTS stage speaks their lines in a designed voice - never in another character's
+    cloned one, which is what a missing profile used to mean.
+
+    The parameters are those of :func:`build_voice_profiles`; so are the errors, except
+    that a speaker without a usable reference is reported in ``unusable`` rather than
+    raised. A run that must not substitute a designed voice should call
+    :func:`build_voice_profiles` and keep the all-or-nothing behaviour.
+    """
+
+    profiles, failures = _build_profiles(
+        speaker_segments,
+        audio_path,
+        transcript=transcript,
+        crosstalk=crosstalk,
+        settings=settings,
+        clone_encoder=clone_encoder,
+        require_reference_transcript=require_reference_transcript,
+    )
+    return VoiceProfileBuild(
+        profiles=profiles,
+        unusable=tuple(
+            UnusableVoiceProfile(speaker_id=speaker_id, reason=str(error))
+            for speaker_id, error in failures
+        ),
+    )
+
+
+def _build_profiles(
+    speaker_segments: Iterable[SpeakerSegment],
+    audio_path: str | Path,
+    *,
+    transcript: Iterable[TranscriptSegment] | None = None,
+    crosstalk: Iterable[CrosstalkRegion] | None = None,
+    settings: Settings | None = None,
+    clone_encoder: ClonePromptEncoder | None = None,
+    require_reference_transcript: bool = False,
+) -> tuple[dict[str, VoiceProfile], list[tuple[str, NoUsableReferenceError]]]:
+    """Build every profile it can, returning the speakers it could not and why."""
+
     segments = _validate_segments(speaker_segments)
     lines = _validate_transcript(transcript)
     if not segments:
-        return {}
+        return {}, []
 
     resolved = settings if settings is not None else get_settings()
     source = _validate_audio_path(audio_path)
@@ -1829,105 +2005,28 @@ def build_voice_profiles(
     ]
 
     profiles: dict[str, VoiceProfile] = {}
+    failures: list[tuple[str, NoUsableReferenceError]] = []
     with _StemReader(source) as reader:
         for speaker_id, own in _group_by_speaker(segments).items():
             others = [segment for segment in segments if segment.speaker_id != speaker_id]
-            candidates = _candidates_for(
-                speaker_id,
-                own,
-                others,
-                reader=reader,
-                minimum=minimum,
-                target=target,
-                maximum=maximum,
-                transcript=lines,
-                contaminated=regions,
-            )
-            usable = [
-                item
-                for item in candidates
-                if item.is_usable(minimum)
-                and (
-                    not require_reference_transcript
-                    or (
-                        item.text is not None
-                        and not item.contaminated
-                        and item.overlap_seconds <= TIMESTAMP_TOLERANCE
-                    )
+            try:
+                best = _select_candidate(
+                    speaker_id,
+                    own,
+                    others,
+                    reader=reader,
+                    minimum=minimum,
+                    target=target,
+                    maximum=maximum,
+                    lines=lines,
+                    contaminated=regions,
+                    require_reference_transcript=require_reference_transcript,
                 )
-            ]
-            if not usable:
-                if require_reference_transcript and any(
-                    item.is_usable(minimum) for item in candidates
-                ):
-                    raise NoUsableReferenceError(
-                        f"no clean, transcript-matched voice reference for speaker "
-                        f"{speaker_id!r}: the Amharic voice-cloning path requires at "
-                        f"least {minimum:.2f}s of speech with an exact transcript and "
-                        "no overlapping speaker"
-                    )
-                raise _no_usable_reference(speaker_id, candidates, minimum=minimum)
-
-            # Reference quality is a matter of what the window *is*, not of a weighted
-            # score that can trade one defect for another. Four kinds of window exist,
-            # in descending order of trust:
-            #
-            #   1. clean, and described exactly by a transcript - what we want;
-            #   2. clean, but undescribed - safe, because the engine transcribes the
-            #      audio itself rather than being handed a transcript that only covers
-            #      part of it;
-            #   3. containing simultaneous speech, described - safe to send, but the
-            #      recording holds two voices;
-            #   4. containing simultaneous speech, undescribed.
-            #
-            # The best window of the highest non-empty tier wins. A film that offers
-            # nothing clean still gets a voice, and the profile says which compromise
-            # was made.
-            def tier(item: "_ReferenceCandidate") -> int:
-                described = item.text is not None
-                if not item.contaminated:
-                    return 0 if described else 1
-                return 2 if described else 3
-
-            chosen_tier = min(tier(item) for item in usable)
-            pool = [item for item in usable if tier(item) == chosen_tier]
-
-            # Prefer the shortest clean prompt that still provides enough voice
-            # identity. Longer reference transcripts give the generator more source
-            # dialogue to echo; keep a one-fifth margin for natural line boundaries,
-            # but retain longer references as a fallback for sparse speakers.
-            preferred_maximum = min(maximum, target * 1.2)
-            shorter = [item for item in pool if item.speech_duration <= preferred_maximum]
-            if shorter:
-                pool = shorter
-
-            # A tiny final utterance can become a salient prompt ending (and be
-            # repeated at the start of generated lines). Avoid it when another
-            # transcript-matched window is available.
-            without_short_ending = [
-                item
-                for item in pool
-                if not any(
-                    line.speaker_id == item.speaker_id
-                    and abs(
-                        line.end - (
-                            item.speech_end if item.speech_end is not None else item.end
-                        )
-                    )
-                    <= TIMESTAMP_TOLERANCE
-                    and line.duration < 1.0
-                    for line in lines
-                )
-            ]
-            if without_short_ending:
-                pool = without_short_ending
-
-            # Earliest window wins an exact tie, so the same input always selects
-            # the same reference.
-            best = max(
-                pool,
-                key=lambda item: (item.quality_score(target), -item.start, -item.end),
-            )
+            except NoUsableReferenceError as error:
+                # One character the film cannot describe is not a reason to abandon the
+                # ones it can; the caller decides whether that is fatal.
+                failures.append((speaker_id, error))
+                continue
             profiles[speaker_id] = _build_profile(
                 best,
                 source=source,
@@ -1936,7 +2035,119 @@ def build_voice_profiles(
                 clone_encoder=clone_encoder,
             )
 
-    return profiles
+    return profiles, failures
+
+
+def _select_candidate(
+    speaker_id: str,
+    own: list[SpeakerSegment],
+    others: list[SpeakerSegment],
+    *,
+    reader: _StemReader,
+    minimum: float,
+    target: float,
+    maximum: float,
+    lines: list[TranscriptSegment],
+    contaminated: list[tuple[float, float]],
+    require_reference_transcript: bool,
+) -> _ReferenceCandidate:
+    """Return the window this speaker's reference should be cut from."""
+    candidates = _candidates_for(
+        speaker_id,
+        own,
+        others,
+        reader=reader,
+        minimum=minimum,
+        target=target,
+        maximum=maximum,
+        transcript=lines,
+        contaminated=contaminated,
+    )
+    usable = [
+        item
+        for item in candidates
+        if item.is_usable(minimum)
+        and (
+            not require_reference_transcript
+            or (
+                item.text is not None
+                and not item.contaminated
+                and item.overlap_seconds <= TIMESTAMP_TOLERANCE
+            )
+        )
+    ]
+    if not usable:
+        if require_reference_transcript and any(
+            item.is_usable(minimum) for item in candidates
+        ):
+            raise NoUsableReferenceError(
+                f"no clean, transcript-matched voice reference for speaker "
+                f"{speaker_id!r}: the Amharic voice-cloning path requires at "
+                f"least {minimum:.2f}s of speech with an exact transcript and "
+                "no overlapping speaker"
+            )
+        raise _no_usable_reference(speaker_id, candidates, minimum=minimum)
+
+    # Reference quality is a matter of what the window *is*, not of a weighted
+    # score that can trade one defect for another. Four kinds of window exist,
+    # in descending order of trust:
+    #
+    #   1. clean, and described exactly by a transcript - what we want;
+    #   2. clean, but undescribed - safe, because the engine transcribes the
+    #      audio itself rather than being handed a transcript that only covers
+    #      part of it;
+    #   3. containing simultaneous speech, described - safe to send, but the
+    #      recording holds two voices;
+    #   4. containing simultaneous speech, undescribed.
+    #
+    # The best window of the highest non-empty tier wins. A film that offers
+    # nothing clean still gets a voice, and the profile says which compromise
+    # was made.
+    def tier(item: "_ReferenceCandidate") -> int:
+        described = item.text is not None
+        if not item.contaminated:
+            return 0 if described else 1
+        return 2 if described else 3
+
+    chosen_tier = min(tier(item) for item in usable)
+    pool = [item for item in usable if tier(item) == chosen_tier]
+
+    # Prefer the shortest clean prompt that still provides enough voice
+    # identity. Longer reference transcripts give the generator more source
+    # dialogue to echo; keep a one-fifth margin for natural line boundaries,
+    # but retain longer references as a fallback for sparse speakers.
+    preferred_maximum = min(maximum, target * 1.2)
+    shorter = [item for item in pool if item.speech_duration <= preferred_maximum]
+    if shorter:
+        pool = shorter
+
+    # A tiny final utterance can become a salient prompt ending (and be
+    # repeated at the start of generated lines). Avoid it when another
+    # transcript-matched window is available.
+    without_short_ending = [
+        item
+        for item in pool
+        if not any(
+            line.speaker_id == item.speaker_id
+            and abs(
+                line.end - (
+                    item.speech_end if item.speech_end is not None else item.end
+                )
+            )
+            <= TIMESTAMP_TOLERANCE
+            and line.duration < 1.0
+            for line in lines
+        )
+    ]
+    if without_short_ending:
+        pool = without_short_ending
+
+    # Earliest window wins an exact tie, so the same input always selects
+    # the same reference.
+    return max(
+        pool,
+        key=lambda item: (item.quality_score(target), -item.start, -item.end),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2242,9 +2453,12 @@ __all__ = [
     "ReferencePreprocessingError",
     "SpeakerSegment",
     "TranscriptSegment",
+    "UnusableVoiceProfile",
     "VoiceProfile",
+    "VoiceProfileBuild",
     "VoiceProfileError",
     "build_voice_profiles",
+    "build_voice_profiles_detailed",
     "load_voice_profiles",
     "portable_path",
     "resolve_project_path",

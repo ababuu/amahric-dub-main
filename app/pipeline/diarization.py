@@ -87,6 +87,21 @@ _MIN_REASSIGNMENT_SIMILARITY = 0.55
 _MIN_REASSIGNMENT_MARGIN = 0.15
 _LOGGER = logging.getLogger(__name__)
 
+# Splitting a cluster that holds two voices. Clustering separates speakers on one
+# film well enough for the count to be right most of the time, but a character who
+# speaks little, quietly, or mostly under another's turn ends up in a neighbour's
+# cluster - and is then cloned in that neighbour's voice. The pass below looks for
+# exactly that: a cluster whose own turns fall into two groups that are each
+# consistent and clearly unlike the other. The thresholds are deliberately strict,
+# because a false split invents a character who is not in the film, which is a worse
+# outcome than a missed one (the missed character at least keeps a real voice).
+_SPLIT_CLUSTER_SIMILARITY = 0.62
+_SPLIT_MAX_ACROSS_SIMILARITY = 0.45
+_SPLIT_MIN_WITHIN_SIMILARITY = 0.62
+_SPLIT_MIN_TURNS = 3
+_SPLIT_MIN_SECONDS = 4.0
+_SPLIT_MIN_CLUSTER_TURNS = 5
+
 
 class DiarizationError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -235,6 +250,8 @@ class DiarizationResult:
     turns: tuple[SpeakerSegment, ...]
     crosstalk: tuple[CrosstalkRegion, ...] = ()
     corrections: tuple["SpeakerAttributionCorrection", ...] = ()
+    #: Clusters that were found to hold two voices and were split apart.
+    splits: tuple["SpeakerClusterSplit", ...] = ()
 
     @property
     def speaker_ids(self) -> tuple[str, ...]:
@@ -259,6 +276,22 @@ class SpeakerAttributionCorrection:
     corrected_speaker_id: str
     corrected_similarity: float
     similarity_margin: float
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerClusterSplit:
+    """One cluster that held two voices, and the one that was split off it.
+
+    Reported rather than silent: a run that invents a character has to be able to say
+    it did, which speaker it came from, and how sure the embeddings were.
+    """
+
+    speaker_id: str
+    new_speaker_id: str
+    turns: int
+    seconds: float
+    within_similarity: float
+    across_similarity: float
 
 
 def _validate_audio_path(path: str | Path) -> Path:
@@ -714,6 +747,239 @@ def _verify_speaker_attributions(
     return verified, tuple(corrections)
 
 
+def _embed_turn(
+    audio: Any,
+    embedder: Any,
+    audio_path: Path,
+    segment: SpeakerSegment,
+    *,
+    pyannote_segment: Any,
+) -> tuple[float, ...] | None:
+    """Return one turn's speaker embedding, or ``None`` when it cannot be taken."""
+
+    try:
+        waveform, _ = audio.crop(
+            {"audio": str(audio_path)},
+            pyannote_segment(segment.start, segment.end),
+            mode="pad",
+        )
+        with torch.inference_mode():
+            raw_embedding = embedder(waveform.unsqueeze(0))
+    except Exception as exc:  # pragma: no cover - model-specific failure
+        _LOGGER.warning(
+            "Could not embed %.3f-%.3fs of %s (%s: %s); leaving the cluster unsplit",
+            segment.start,
+            segment.end,
+            segment.speaker_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+    rows = raw_embedding.tolist() if hasattr(raw_embedding, "tolist") else raw_embedding
+    try:
+        return _as_embedding(rows[0])
+    except (IndexError, TypeError):
+        return None
+
+
+def _agglomerate(
+    vectors: list[tuple[float, ...]], *, threshold: float
+) -> list[list[int]]:
+    """Group ``vectors`` by average-linkage similarity, stopping below ``threshold``.
+
+    Deterministic: the most similar pair is merged first, and a tie is broken by the
+    lowest indices, so the same film always yields the same groups.
+    """
+
+    groups: list[list[int]] = [[index] for index in range(len(vectors))]
+
+    while len(groups) > 1:
+        best_similarity = -1.0
+        best_pair: tuple[int, int] | None = None
+        for left in range(len(groups)):
+            for right in range(left + 1, len(groups)):
+                total = 0.0
+                for first in groups[left]:
+                    for second in groups[right]:
+                        total += _cosine_similarity(vectors[first], vectors[second])
+                similarity = total / (len(groups[left]) * len(groups[right]))
+                if similarity > best_similarity + 1e-12:
+                    best_similarity = similarity
+                    best_pair = (left, right)
+        if best_pair is None or best_similarity < threshold:
+            break
+        left, right = best_pair
+        groups[left] = groups[left] + groups[right]
+        del groups[right]
+
+    return groups
+
+
+def _mean_pairwise_similarity(
+    vectors: list[tuple[float, ...]], indices: list[int]
+) -> float:
+    """Return the mean similarity between every pair of ``indices``."""
+
+    if len(indices) < 2:
+        return 1.0
+    total = 0.0
+    pairs = 0
+    for position, first in enumerate(indices):
+        for second in indices[position + 1 :]:
+            total += _cosine_similarity(vectors[first], vectors[second])
+            pairs += 1
+    return total / pairs if pairs else 0.0
+
+
+def _cross_similarity(
+    vectors: list[tuple[float, ...]], left: list[int], right: list[int]
+) -> float:
+    """Return the mean similarity between the two groups."""
+
+    total = 0.0
+    for first in left:
+        for second in right:
+            total += _cosine_similarity(vectors[first], vectors[second])
+    return total / (len(left) * len(right))
+
+
+def _next_speaker_id(existing: set[str]) -> str:
+    """Return an unused ``SPEAKER_NN`` label after the highest one in use."""
+
+    highest = -1
+    for label in existing:
+        prefix, _, index = label.rpartition("_")
+        if prefix == "SPEAKER" and index.isdigit():
+            highest = max(highest, int(index))
+    candidate = highest + 1
+    while f"SPEAKER_{candidate:02d}" in existing:
+        candidate += 1
+    return f"SPEAKER_{candidate:02d}"
+
+
+def _split_mixed_clusters(
+    pipeline: Any,
+    audio_path: Path,
+    segments: list[SpeakerSegment],
+    crosstalk: tuple[CrosstalkRegion, ...],
+) -> tuple[list[SpeakerSegment], tuple[SpeakerClusterSplit, ...]]:
+    """Split a speaker cluster whose own turns hold two voices.
+
+    Community-1 clusters the film's speech once. A character who speaks little, quietly
+    or mostly under someone else's turn can land inside that neighbour's cluster, and is
+    then cloned with the neighbour's voice for the whole film - two people sounding like
+    one. This looks for that case with the pipeline's own embedding model: a cluster
+    whose clean turns fall into two groups that are each internally consistent
+    (:data:`_SPLIT_MIN_WITHIN_SIMILARITY`) and clearly unlike each other
+    (:data:`_SPLIT_MAX_ACROSS_SIMILARITY`), with enough of the smaller voice to be worth
+    a character of its own.
+
+    A mis-split invents a character, so every test is conservative and the smaller
+    group also has to be able to stand alone: at least :data:`_SPLIT_MIN_TURNS` turns
+    and :data:`_SPLIT_MIN_SECONDS` seconds. Anything less is left as it is, where the
+    character is still heard - just in the wrong voice - and the run reports nothing it
+    cannot support.
+    """
+
+    if not segments:
+        return segments, ()
+
+    audio = getattr(pipeline, "_audio", None)
+    embedder = getattr(pipeline, "_embedding", None)
+    if audio is None or embedder is None or torch is None:
+        return segments, ()
+    try:
+        from pyannote.core import Segment as PyannoteSegment
+    except ImportError:  # pragma: no cover - pyannote always ships this
+        return segments, ()
+
+    by_speaker: dict[str, list[int]] = {}
+    for index, segment in enumerate(segments):
+        if (
+            segment.duration >= _MIN_VERIFICATION_TURN_SECONDS
+            and not _is_crosstalk_turn(segment, crosstalk)
+        ):
+            by_speaker.setdefault(segment.speaker_id, []).append(index)
+
+    splittable = {
+        speaker_id: indices
+        for speaker_id, indices in by_speaker.items()
+        if len(indices) >= _SPLIT_MIN_CLUSTER_TURNS
+    }
+    if not splittable:
+        return segments, ()
+
+    splits: list[SpeakerClusterSplit] = []
+    updated = list(segments)
+    taken = {segment.speaker_id for segment in segments}
+
+    for speaker_id in sorted(splittable):
+        indices = splittable[speaker_id]
+        vectors: list[tuple[float, ...]] = []
+        embedded: list[int] = []
+        for index in indices:
+            vector = _embed_turn(
+                audio,
+                embedder,
+                audio_path,
+                segments[index],
+                pyannote_segment=PyannoteSegment,
+            )
+            if vector is not None:
+                vectors.append(vector)
+                embedded.append(index)
+        if len(vectors) < _SPLIT_MIN_CLUSTER_TURNS:
+            continue
+
+        groups = _agglomerate(vectors, threshold=_SPLIT_CLUSTER_SIMILARITY)
+        if len(groups) != 2:
+            continue
+
+        groups.sort(
+            key=lambda group: -sum(
+                segments[embedded[position]].duration for position in group
+            )
+        )
+        bigger, smaller = groups
+        if len(smaller) < _SPLIT_MIN_TURNS:
+            continue
+        seconds = sum(segments[embedded[position]].duration for position in smaller)
+        if seconds < _SPLIT_MIN_SECONDS:
+            continue
+
+        within = min(
+            _mean_pairwise_similarity(vectors, bigger),
+            _mean_pairwise_similarity(vectors, smaller),
+        )
+        if within < _SPLIT_MIN_WITHIN_SIMILARITY:
+            continue
+        across = _cross_similarity(vectors, bigger, smaller)
+        if across > _SPLIT_MAX_ACROSS_SIMILARITY:
+            continue
+
+        new_speaker_id = _next_speaker_id(taken)
+        taken.add(new_speaker_id)
+        for position in smaller:
+            index = embedded[position]
+            segment = updated[index]
+            updated[index] = SpeakerSegment(
+                new_speaker_id, segment.start, segment.end
+            )
+        splits.append(
+            SpeakerClusterSplit(
+                speaker_id=speaker_id,
+                new_speaker_id=new_speaker_id,
+                turns=len(smaller),
+                seconds=seconds,
+                within_similarity=within,
+                across_similarity=across,
+            )
+        )
+
+    return updated, tuple(splits)
+
+
 def _resolve_speaker_counts(
     settings: Settings,
     num_speakers: int | None,
@@ -782,10 +1048,24 @@ def diarize_detailed(
         _to_segments(result),
         crosstalk,
     )
+    splits: tuple[SpeakerClusterSplit, ...] = ()
+    if resolved.diarization_split_mixed_speakers:
+        turns, splits = _split_mixed_clusters(pipeline, source, turns, crosstalk)
+        for split in splits:
+            _LOGGER.info(
+                "Split %d turn(s) / %.2fs out of %s into %s (within %.2f, across %.2f)",
+                split.turns,
+                split.seconds,
+                split.speaker_id,
+                split.new_speaker_id,
+                split.within_similarity,
+                split.across_similarity,
+            )
     return DiarizationResult(
         turns=tuple(turns),
         crosstalk=crosstalk,
         corrections=corrections,
+        splits=splits,
     )
 
 
@@ -859,6 +1139,7 @@ __all__ = [
     "MissingInputError",
     "ModelInitializationError",
     "SpeakerAttributionCorrection",
+    "SpeakerClusterSplit",
     "SpeakerSegment",
     "UnsupportedOutputError",
     "diarize",

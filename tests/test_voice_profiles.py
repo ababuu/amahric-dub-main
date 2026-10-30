@@ -197,6 +197,13 @@ class FakeFfmpeg:
         self.calls.append(list(arguments))
         destination = Path(arguments[-1])
         duration = float(arguments[arguments.index("-t") + 1]) * self.duration_scale
+        # ``apad`` appends silence after the input, so the written file is longer
+        # than the ``-t`` window. Honour it, or the extraction tests cannot tell an
+        # appended pad from a window that was simply cut.
+        if "-af" in arguments:
+            for link in arguments[arguments.index("-af") + 1].split(","):
+                if link.startswith("apad=pad_dur="):
+                    duration += float(link.split("=", 2)[2])
         frames = max(1, int(round(duration * self.rate)))
         data = np.full((frames, self.channels), 0.25, dtype=np.float32)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1794,10 +1801,16 @@ def test_the_reference_keeps_silence_after_its_last_word(
     assert profile.reference_text == line.text
 
 
-def test_a_tail_still_speaking_at_the_search_limit_is_left_as_cut(
+def test_a_line_ending_inside_speech_keeps_the_word_it_stopped_in(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:
-    """Without an acoustic offset there is nothing to pad to, so nothing changes."""
+    """A transcript end inside a word is followed, and the prompt ends in silence.
+
+    The recogniser stops short of the release, so the window has no acoustic offset
+    to pad to inside the search range. Following the speech to the far edge keeps the
+    last word whole; the transcript no longer describes that audio, so it is dropped
+    and the engine transcribes the reference itself.
+    """
 
     stem = _write_stem(tmp_path / "speech.wav", [(1.0, 8.0, LOUD)])
 
@@ -1808,7 +1821,31 @@ def test_a_tail_still_speaking_at_the_search_limit_is_left_as_cut(
         settings=_settings(tmp_path, voice_reference_target_duration=5.0),
     )["SPEAKER_00"]
 
+    assert profile.reference_end == pytest.approx(6.6, abs=0.05)
+    assert profile.reference_text is None
+    assert "of silence appended" in profile.selection_reason
+    # The appended silence is in the file, not only in the timestamps.
+    assert sf.info(str(profile.reference_audio)).duration == pytest.approx(
+        profile.reference_duration + 0.30, abs=0.02
+    )
+
+
+def test_steady_material_after_the_line_is_not_followed(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A bed or bleed carries no word to finish, so it does not move the window."""
+
+    stem = _write_stem(tmp_path / "speech.wav", [(1.0, 6.0, LOUD), (6.0, 9.0, STEADY)])
+
+    profile = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 1.0, 6.0)],
+        stem,
+        transcript=[TranscriptSegment("SPEAKER_00", 1.0, 6.0, "a complete line")],
+        settings=_settings(tmp_path, voice_reference_target_duration=5.0),
+    )["SPEAKER_00"]
+
     assert profile.reference_end == pytest.approx(6.0)
+    assert profile.reference_text == "a complete line"
 
 
 def test_padding_cannot_reach_into_the_next_line() -> None:

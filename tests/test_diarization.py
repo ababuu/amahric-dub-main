@@ -883,3 +883,173 @@ def test_configured_counts_are_validated_before_the_model_is_touched(monkeypatch
         diarize(_audio(tmp_path), settings=_settings(tmp_path, min_speakers=9, max_speakers=4))
 
     assert FakePipeline.requests == []
+
+
+# ---------------------------------------------------------------------------
+# a cluster that holds two voices
+# ---------------------------------------------------------------------------
+
+
+def _embedding_output(turns: list[tuple[float, float, str]], vectors: dict[float, list[float]]):
+    """Script the pipeline so each turn is embedded as ``vectors[start]``."""
+
+    class FakeWaveform:
+        def __init__(self, vector: list[float]) -> None:
+            self.vector = vector
+
+        def unsqueeze(self, _dimension):
+            return self
+
+    class FakeAudio:
+        def __init__(self) -> None:
+            self.crops: list[tuple[float, float]] = []
+
+        def crop(self, _audio_file, segment, *, mode):
+            assert mode == "pad"
+            self.crops.append((segment.start, segment.end))
+            return FakeWaveform(vectors[segment.start]), 16000
+
+    FakePipeline.audio = FakeAudio()
+    FakePipeline.embedding = lambda waveform: [waveform.vector]
+    FakePipeline.result = _pipeline_output(turns)
+    return FakePipeline.audio
+
+
+def _install_fake_pyannote_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    core_module = types.ModuleType("pyannote.core")
+    core_module.Segment = FakeTurn
+    monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
+
+
+def test_a_cluster_holding_two_voices_is_split(monkeypatch, tmp_path):
+    """The third character in a scene keeps their own voice instead of a neighbour's.
+
+    Six clean turns under one label fall into two groups of three that agree with each
+    other and not across: that is two people the clustering put together.
+    """
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 2.0, "SPEAKER_00"),
+        (3.0, 5.0, "SPEAKER_00"),
+        (6.0, 8.0, "SPEAKER_00"),
+        (9.0, 10.6, "SPEAKER_00"),
+        (11.0, 12.6, "SPEAKER_00"),
+        (13.0, 14.6, "SPEAKER_00"),
+    ]
+    vectors = {
+        0.0: [1.0, 0.0, 0.0],
+        3.0: [0.98, 0.1, 0.0],
+        6.0: [1.0, 0.05, 0.05],
+        9.0: [0.0, 1.0, 0.0],
+        11.0: [0.1, 0.98, 0.0],
+        13.0: [0.05, 1.0, 0.1],
+    }
+    crops = _embedding_output(turns, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert len(result.splits) == 1
+    split = result.splits[0]
+    assert split.speaker_id == "SPEAKER_00"
+    assert split.new_speaker_id == "SPEAKER_01"
+    assert split.turns == 3
+    assert split.seconds == pytest.approx(4.8)
+    assert split.within_similarity > 0.9
+    assert split.across_similarity < 0.2
+    # The three later turns - the quieter voice - are the ones that moved.
+    assert result.turns == (
+        SpeakerSegment("SPEAKER_00", 0.0, 2.0),
+        SpeakerSegment("SPEAKER_00", 3.0, 5.0),
+        SpeakerSegment("SPEAKER_00", 6.0, 8.0),
+        SpeakerSegment("SPEAKER_01", 9.0, 10.6),
+        SpeakerSegment("SPEAKER_01", 11.0, 12.6),
+        SpeakerSegment("SPEAKER_01", 13.0, 14.6),
+    )
+    assert len(crops.crops) == 6
+
+
+def test_one_voice_in_a_cluster_is_left_alone(monkeypatch, tmp_path):
+    """A single speaker is not split just because the pass ran."""
+
+    _patch(monkeypatch)
+    turns = [(float(start), float(start) + 2.0, "SPEAKER_00") for start in (0, 3, 6, 9, 12, 15)]
+    vectors = {float(start): [1.0, 0.05 * index, 0.0] for index, start in enumerate((0, 3, 6, 9, 12, 15))}
+    _embedding_output(turns, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.splits == ()
+    assert {segment.speaker_id for segment in result.turns} == {"SPEAKER_00"}
+
+
+def test_too_little_of_the_second_voice_is_not_a_character(monkeypatch, tmp_path):
+    """Two turns are not a character: they stay where the clustering put them."""
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 2.0, "SPEAKER_00"),
+        (3.0, 5.0, "SPEAKER_00"),
+        (6.0, 8.0, "SPEAKER_00"),
+        (9.0, 10.0, "SPEAKER_00"),
+        (11.0, 12.0, "SPEAKER_00"),
+    ]
+    vectors = {
+        0.0: [1.0, 0.0, 0.0],
+        3.0: [0.98, 0.1, 0.0],
+        6.0: [1.0, 0.05, 0.05],
+        9.0: [0.0, 1.0, 0.0],
+        11.0: [0.0, 0.98, 0.1],
+    }
+    _embedding_output(turns, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.splits == ()
+    assert {segment.speaker_id for segment in result.turns} == {"SPEAKER_00"}
+
+
+def test_the_split_can_be_switched_off(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 2.0, "SPEAKER_00"),
+        (3.0, 5.0, "SPEAKER_00"),
+        (6.0, 8.0, "SPEAKER_00"),
+        (9.0, 10.6, "SPEAKER_00"),
+        (11.0, 12.6, "SPEAKER_00"),
+        (13.0, 14.6, "SPEAKER_00"),
+    ]
+    vectors = {
+        0.0: [1.0, 0.0, 0.0],
+        3.0: [0.98, 0.1, 0.0],
+        6.0: [1.0, 0.05, 0.05],
+        9.0: [0.0, 1.0, 0.0],
+        11.0: [0.1, 0.98, 0.0],
+        13.0: [0.05, 1.0, 0.1],
+    }
+    crops = _embedding_output(turns, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = _settings(tmp_path)
+    settings = dataclasses.replace(settings, diarization_split_mixed_speakers=False)
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert result.splits == ()
+    assert crops.crops == []
+
+
+def test_a_cluster_with_too_few_clean_turns_is_not_embedded(monkeypatch, tmp_path):
+    """No embedding is spent on a cluster that could not be split anyway."""
+
+    _patch(monkeypatch)
+    turns = [(0.0, 2.0, "SPEAKER_00"), (3.0, 5.0, "SPEAKER_00")]
+    crops = _embedding_output(turns, {0.0: [1.0, 0.0], 3.0: [1.0, 0.0]})
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.splits == ()
+    assert crops.crops == []

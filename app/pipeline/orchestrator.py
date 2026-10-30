@@ -70,7 +70,7 @@ from app.pipeline.mixing import MixResult
 from app.pipeline.timing import AlignedClip
 from app.pipeline.transcription import TranscriptSegment
 from app.pipeline.translation import AdaptedDialogue
-from app.pipeline.tts import SkippedLine, TtsClip
+from app.pipeline.tts import DesignedVoice, SkippedLine, TtsClip
 from app.pipeline.video import MuxResult
 from app.pipeline.voice_profiles import VoiceProfile, portable_path
 
@@ -141,6 +141,10 @@ class PipelineResult:
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
+    #: Clusters the diarization held two voices in, and the character split off each.
+    speaker_splits: tuple[diarization.SpeakerClusterSplit, ...] = ()
+    #: Characters the film gave no usable reference, spoken in a designed voice.
+    designed_voices: tuple[DesignedVoice, ...] = ()
 
     @property
     def final_video(self) -> Path:
@@ -190,6 +194,19 @@ class PipelineResult:
                         "margin": round(correction.similarity_margin, 4),
                     }
                     for correction in self.speaker_corrections
+                ],
+                # A cluster that held two voices, split so the second one is not
+                # cloned in the first one's voice.
+                "speaker_splits": [
+                    {
+                        "from": split.speaker_id,
+                        "to": split.new_speaker_id,
+                        "turns": split.turns,
+                        "seconds": round(split.seconds, 3),
+                        "within_similarity": round(split.within_similarity, 4),
+                        "across_similarity": round(split.across_similarity, 4),
+                    }
+                    for split in self.speaker_splits
                 ],
                 # Simultaneous speech the exclusive attribution could not carry.
                 # Reported so a run can be audited for it without re-listening.
@@ -241,6 +258,12 @@ class PipelineResult:
                 # from the dub is audible, so a run has to be able to say which
                 # ones and why without re-listening to the film.
                 "skipped": [line.as_dict() for line in self.skipped],
+                # Characters spoken in a designed voice: not the actor's voice, and
+                # the manifest is where that has to be visible.
+                "designed_voices": [
+                    {"speaker_id": voice.speaker_id, "instruct": voice.instruct}
+                    for voice in self.designed_voices
+                ],
             },
             "timing": {
                 "lines": len(self.alignment),
@@ -266,7 +289,8 @@ class PipelineResult:
             f"diarization     {len(self.turns)} turn(s), {len(speakers)} speaker(s)",
             f"transcription   {len(self.lines)} line(s)",
             f"adaptation      {len(self.dialogue)} Amharic line(s)",
-            f"voice profiles  {len(self.profiles)} profile(s)",
+            f"voice profiles  {len(self.profiles)} cloned, "
+            f"{len(self.designed_voices)} designed from a description",
             f"tts             {len(self.clips)} clip(s)",
             f"timing          {len(self.alignment)} aligned, {stretched} stretched, "
             f"{len(self.unfitted_lines)} not fitted",
@@ -519,6 +543,13 @@ def run_pipeline(
             f"  speaker verification: corrected {len(speaker_corrections)} "
             "high-confidence turn attribution(s)"
         )
+    speaker_splits = tuple(diarized.splits)
+    for split in speaker_splits:
+        report(
+            f"  speaker split: {split.new_speaker_id} separated from {split.speaker_id} "
+            f"({split.turns} turn(s), {split.seconds:.1f}s; within-similarity "
+            f"{split.within_similarity:.2f}, across {split.across_similarity:.2f})"
+        )
     if crosstalk:
         report(
             f"  crosstalk: {len(crosstalk)} region(s), "
@@ -619,11 +650,11 @@ def run_pipeline(
     else:
         # Built from every transcribed line, not from a shortened run: a profile is a
         # character's identity and is reused across runs, so it is never truncated.
-        profiles = _stage(
+        build = _stage(
             "voice_profiles",
             seconds,
             report,
-            voice_profiles.build_voice_profiles,
+            voice_profiles.build_voice_profiles_detailed,
             turns,
             stems.speech,
             # Simultaneous speech is passed in because it is the one thing the
@@ -634,7 +665,15 @@ def run_pipeline(
             settings=resolved,
             require_reference_transcript=True,
         )
-        if not profiles:
+        profiles = build.profiles
+        for unusable in build.unusable:
+            # A character the film never gave four clean seconds is still in the dub;
+            # saying so is what keeps a designed voice from looking like a bug.
+            report(
+                f"  {unusable.speaker_id}: designed voice, no actor reference "
+                f"({unusable.reason})"
+            )
+        if not profiles and not build.unusable:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
@@ -779,11 +818,13 @@ def run_pipeline(
         lines=lines,
         crosstalk=crosstalk,
         speaker_corrections=speaker_corrections,
+        speaker_splits=speaker_splits,
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,
         skipped=skipped,
         notes=tuple(synthesized.notes),
+        designed_voices=tuple(synthesized.designed),
         bleed=bleed,
         dub_bleed=dub_bleed,
         alignment=alignment,
