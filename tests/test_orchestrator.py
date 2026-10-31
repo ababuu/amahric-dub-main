@@ -521,15 +521,20 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     # Nothing about character identity is decided quietly: an empty QC block means the
     # run had nothing to report, not that the checks were skipped.
     assert diarization_block["speaker_corrections"] == []
-    assert diarization_block["speaker_splits"] == []
-    assert diarization_block["split_candidates"] == []
     assert diarization_block["uncertain_speakers"] == []
     assert diarization_block["merge_suspects"] == []
     assert diarization_block["merges"] == []
-    assert diarization_block["scenes"] == {
+    # The model's own answer, the film's similarity scale, and the partition chosen from
+    # it are all recorded, so a merge can be argued with without re-running the film.
+    assert diarization_block["original"] == {"speakers": [], "identity_count": 0}
+    assert diarization_block["calibration"] is None
+    assert diarization_block["reclustering"] is None
+    assert diarization_block["evidence"] == {"units": 0, "seconds": 0.0}
+    assert diarization_block["reassignments"] == []
+    assert diarization_block["windows"] == {
         "total": 0,
         "diarized": 0,
-        "global": 0,
+        "kept": 0,
         "failed": 0,
         "detail": [],
     }

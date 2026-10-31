@@ -17,13 +17,15 @@ Three passes, each covering something the one before it cannot see:
    whose lines are all short still has evidence to be judged on. Attributions are
    verified against Community-1's speaker prototypes, and a cluster whose turns hold
    two voices is split - with every near-miss reported as a candidate.
-3. **Scenes**, where short dialogue is actually rescued. The film is cut into scenes at
-   its silences, each scene is diarized on its own, and the voices found in it are named
-   against a :class:`~app.pipeline.speaker_identity.SpeakerRegistry`. A voice that
-   matches an identity reuses its id and updates its voiceprint, so one character keeps
-   one id and one cloned voice across the film; a voice that matches nothing keeps its
-   own id; a voice too close to two identities to separate is given its own id and
-   reported as uncertain rather than folded into either.
+3. **Suspect windows**, where the film-wide evidence was too thin to decide. Short
+   windows around ambiguous or overlapping dialogue are diarized on their own, and may
+   name a character the film-wide pass missed or move one of its turns to another
+   identity. Only the turns a window was opened for can be changed by it.
+
+The identities themselves come from the final partition, are rebuilt once, and are
+persisted, so one character keeps one id and one cloned voice for the whole film. A
+voice too close to two identities to separate is given its own id and reported as
+uncertain rather than folded into either.
 
 Transcript text, emotions, character names, and voice-cloning embeddings belong
 to :mod:`app.pipeline.transcription`, :mod:`app.pipeline.voice_profiles`, and
@@ -59,12 +61,13 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.pipeline import speaker_partition as partition
 from app.pipeline import speaker_identity as identity
 
 try:  # Heavy runtime dependencies. They are guarded so that this module stays
@@ -111,40 +114,46 @@ _MIN_REASSIGNMENT_SIMILARITY = 0.55
 _MIN_REASSIGNMENT_MARGIN = 0.15
 _LOGGER = logging.getLogger(__name__)
 
-# Splitting a cluster that holds two voices. Clustering separates speakers on one
-# film well enough for the count to be right most of the time, but a character who
-# speaks little, quietly, or mostly under another's turn ends up in a neighbour's
-# cluster - and is then cloned in that neighbour's voice. The pass below looks for
-# exactly that: a cluster whose own turns fall into two groups that are each
-# consistent and clearly unlike the other.
-#
-# Thresholds reviewed against pyannote's speaker embeddings, where a voice agrees with
-# itself well above 0.6 and with a different voice below 0.5: group at 0.55, require
-# each group to sit at least 0.55 from its own centroid, require the groups to be no
-# more than 0.50 alike, and require a 0.10 separation between the two. The evidence a
-# turn can carry is no longer the gate - every turn of at least half a second counts,
-# which is what lets a character who only ever says one short line be recovered - and
-# every rejection is reported as a candidate instead of being passed over, because a
-# merge that was *nearly* caught is the one worth seeing in a manifest.
-_SPLIT_CLUSTER_SIMILARITY = 0.55
-_SPLIT_MAX_ACROSS_SIMILARITY = 0.50
-_SPLIT_MIN_WITHIN_SIMILARITY = 0.55
-_SPLIT_MIN_SEPARATION = 0.10
-_SPLIT_MIN_TURNS = 3
-_SPLIT_MIN_SECONDS = 4.0
-_SPLIT_MIN_CLUSTER_TURNS = 5
+#: Shortest turn that joins the global re-partitioning as evidence. Half a second is
+#: pyannote's own embedding floor (the crop is widened to a padded window first), so this
+#: is "anything the embedder can hear", not a tuned value: a character whose whole part
+#: is five short lines must still contribute five voiceprints.
+_UNIT_MIN_SECONDS = 0.5
 
-#: A scene needs at least this much speech in a cluster before a new identity may be
-#: minted from it. A shorter cluster keeps the label the global pass gave it: inventing
-#: a character from a clipped word is worse than leaving one character in the wrong
-#: voice, and the run says which clusters it left alone.
-_SCENE_MIN_CLUSTER_SECONDS = 1.0
+#: A turn shorter than this is embedded inside a wider window, so a 0.6 s line still
+#: produces a usable voiceprint. The window never reaches into another speaker's turn.
+_EMBED_MIN_WINDOW_SECONDS = 1.5
 
-#: Shortest scene worth a diarization call of its own.
-_SCENE_MIN_SPAN_SECONDS = 3.0
+#: A cluster keeps a pyannote speaker's name only when that speaker provides this much
+#: of its speech; otherwise it is a voice the model did not have and gets a new id.
+_CLUSTER_DOMINANCE = 0.6
 
-#: The scene modes the pipeline understands.
-_SCENE_MODES = ("all", "suspect", "off")
+#: How far a turn without evidence of its own may sit from a moved performance and
+#: still follow it. Beyond this it keeps the label pyannote gave it.
+_UNMEASURED_INHERIT_SECONDS = 2.0
+
+#: Most new characters one suspect window may introduce: a few seconds of audio that
+#: yields a cast is a mistake, not a discovery.
+_WINDOW_MAX_NEW_IDENTITIES = 1
+
+#: A window needs at least this much speech in a cluster before it may name a character
+#: a new character from it.
+_WINDOW_MIN_CLUSTER_SECONDS = 1.0
+
+#: Shortest suspect window worth a diarization call, and the longest one allowed: these
+#: are windows around ambiguous dialogue, not scenes.
+_WINDOW_MIN_SPAN_SECONDS = 2.0
+_WINDOW_MAX_SPAN_SECONDS = 15.0
+
+#: How much audio either side of an ambiguous performance a suspect window covers.
+_WINDOW_PAD_SECONDS = 0.75
+
+#: Silence between two suspect performances that still belongs to the same window.
+_WINDOW_JOIN_GAP_SECONDS = 1.0
+
+#: The window modes the pipeline understands.
+_WINDOW_MODES = ("all", "suspect", "off")
+
 
 
 
@@ -286,37 +295,42 @@ class CrosstalkRegion:
 class DiarizationResult:
     """Everything diarization found: attributed turns plus what it could not settle.
 
-    ``turns`` is the exclusive, non-overlapping attribution with high-confidence
-    speaker-embedding corrections applied. ``crosstalk`` is additive information
-    about where speakers overlapped, and is never used to attribute a line.
-    ``corrections`` records every changed turn and the scores that justified it.
+    ``turns`` is the final attribution: pyannote's exclusive view, verified against its
+    own speaker prototypes, then re-partitioned by :mod:`app.pipeline.speaker_partition`
+    so that a voice scattered over several clusters becomes one identity.
+    ``raw_turns`` is pyannote's answer untouched, kept so the two can be compared.
 
-    The remaining fields exist so that nothing about a character's identity is decided
-    silently: ``splits`` and ``merges`` say which identities changed, ``scenes`` what
-    each scene's own diarization found, ``split_candidates`` the clusters that looked
-    like two voices and were left alone anyway, ``uncertain_speakers`` the voices that
-    could not be told apart from another one, and ``merge_suspects`` the pairs that are
-    suspiciously alike without being merged.
+    Nothing about a character's identity is decided silently: ``reclustering`` reports
+    the partition chosen and every one refused, ``reassignments`` every performance that
+    moved, ``windows`` what each suspect window found, ``uncertain_speakers`` the voices
+    that could not be told apart, and ``merges`` the identities that were one person.
     """
 
     turns: tuple[SpeakerSegment, ...]
     crosstalk: tuple[CrosstalkRegion, ...] = ()
     corrections: tuple["SpeakerAttributionCorrection", ...] = ()
-    #: Clusters that were found to hold two voices and were split apart.
-    splits: tuple["SpeakerClusterSplit", ...] = ()
-    #: Clusters that looked like two voices and were *not* split, with the reason.
-    split_candidates: tuple["SpeakerSplitCandidate", ...] = ()
-    #: What each scene's own diarization produced, and what was kept from the global
-    #: pass instead.
-    scenes: tuple["SceneDiarization", ...] = ()
-    #: Voices that could not be tied to an identity with confidence. They were given an
-    #: id of their own rather than being folded into somebody else's.
+    #: pyannote's own exclusive attribution, exactly as it came back. Kept so the final
+    #: partition can always be compared with the model's.
+    raw_turns: tuple[SpeakerSegment, ...] = ()
+    #: The film's own similarity scale, measured from its embeddings.
+    calibration: partition.Calibration | None = None
+    #: The global re-partitioning: the chosen number of speakers, the score it reached,
+    #: and every number of speakers that was tried and refused.
+    reclustering: partition.Partition | None = None
+    #: Performances that carried evidence into the re-partitioning.
+    units: int = 0
+    unit_seconds: float = 0.0
+    #: Every performance the re-partitioning moved to a different identity.
+    reassignments: tuple["SpeakerReassignment", ...] = ()
+    #: Suspect windows diarized on their own, and what each one produced.
+    windows: tuple["DiarizationWindow", ...] = ()
+    #: Voices that could not be tied to an identity with confidence.
     uncertain_speakers: tuple["UncertainSpeaker", ...] = ()
     #: Identity pairs that are suspiciously alike but were not merged.
     merge_suspects: tuple["SpeakerMergeSuspect", ...] = ()
     #: Identity pairs that were merged as one person discovered twice.
     merges: tuple["SpeakerIdentityMerge", ...] = ()
-    #: Identities that only scene-level diarization found.
+    #: Identities that only the re-partitioning found.
     discovered_speakers: tuple[str, ...] = ()
     #: Turns too short, too overlapped, or too noisy to carry speaker evidence.
     unmeasured_turns: int = 0
@@ -330,6 +344,12 @@ class DiarizationResult:
         """Every speaker id that appears in ``turns``, sorted."""
 
         return tuple(sorted({segment.speaker_id for segment in self.turns}))
+
+    @property
+    def raw_speaker_ids(self) -> tuple[str, ...]:
+        """Every speaker id pyannote itself produced, sorted."""
+
+        return tuple(sorted({segment.speaker_id for segment in self.raw_turns}))
 
     @property
     def crosstalk_seconds(self) -> float:
@@ -352,48 +372,35 @@ class SpeakerAttributionCorrection:
 
 
 @dataclass(frozen=True, slots=True)
-class SpeakerClusterSplit:
-    """One cluster that held two voices, and the one that was split off it.
+class SpeakerReassignment:
+    """One performance moved from pyannote's cluster to the identity the evidence supports.
 
-    Reported rather than silent: a run that invents a character has to be able to say
-    it did, which speaker it came from, and how sure the embeddings were.
+    Reported rather than silent: this is the operation that fixes a character whose
+    dialogue was scattered over two clusters, and it has to be auditable - which
+    performance moved, from where to where, and how sure the embedding was.
     """
 
-    speaker_id: str
-    new_speaker_id: str
-    turns: int
+    start: float
+    end: float
     seconds: float
-    within_similarity: float
-    across_similarity: float
-
-
-@dataclass(frozen=True, slots=True)
-class SpeakerSplitCandidate:
-    """A cluster whose turns looked like two voices, and why it was left alone.
-
-    The split pass is deliberately conservative, so the interesting case is not the
-    split it made but the one it declined: ``reason`` says whether the groups were too
-    alike, too small, or too inconsistent to act on, and the similarities are reported
-    so the decision can be argued with without re-running the film.
-    """
-
-    speaker_id: str
-    turns: int
-    seconds: float
-    within_similarity: float
-    across_similarity: float
-    reason: str
+    original_speaker_id: str
+    corrected_speaker_id: str
+    #: Similarity to the voiceprint of the cluster it was moved to.
+    similarity: float
+    #: How far that beat the cluster it came from.
+    margin: float
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-safe view of the candidate."""
+        """Return a JSON-safe view of the reassignment."""
 
         return {
-            "speaker_id": self.speaker_id,
-            "turns": self.turns,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
             "seconds": round(self.seconds, 3),
-            "within_similarity": round(self.within_similarity, 4),
-            "across_similarity": round(self.across_similarity, 4),
-            "reason": self.reason,
+            "from": self.original_speaker_id,
+            "to": self.corrected_speaker_id,
+            "similarity": round(self.similarity, 4),
+            "margin": round(self.margin, 4),
         }
 
 
@@ -425,21 +432,21 @@ class UncertainSpeaker:
 
 
 @dataclass(frozen=True, slots=True)
-class SceneDiarization:
-    """What one scene's own diarization produced, and what was done with it."""
+class DiarizationWindow:
+    """What one suspect window's own diarization produced, and what was done with it."""
 
     index: int
     start: float
     end: float
     turns: int
     speakers: tuple[str, ...]
-    #: ``scene`` when the scene's own labels were kept, ``global`` when the global pass
-    #: was kept, ``failed`` when the scene could not be diarized at all.
+    #: ``window`` when the window's own labels were kept, ``kept`` when the current
+    #: attribution was kept, ``failed`` when the window could not be diarized at all.
     mode: str
     detail: str = ""
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-safe view of the scene."""
+        """Return a JSON-safe view of the window."""
 
         return {
             "index": self.index,
@@ -788,12 +795,6 @@ def _as_embedding(value: Any) -> tuple[float, ...] | None:
     return vector
 
 
-def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
-    """Return cosine similarity, or -1 for incompatible embedding dimensions."""
-
-    return identity.cosine_similarity(left, right)
-
-
 def _speaker_centroids(result: Any) -> dict[str, tuple[float, ...]]:
     """Read Community-1's documented label-ordered speaker embeddings."""
 
@@ -874,6 +875,41 @@ def _weighted_mean(
         return None
 
 
+def _padded_span(
+    segments: Sequence[SpeakerSegment],
+    index: int,
+    *,
+    minimum: float,
+    total_duration: float | None = None,
+) -> tuple[float, float]:
+    """Return a window around one short turn that is wide enough to embed.
+
+    The window grows into the silence before and after the turn, never into another
+    speaker's turn: the neighbours' edges are the hard limits. A 0.6 s line inside a
+    two-second pause therefore yields 1.5 s of that speaker and silence, which is a
+    usable voiceprint, while a line butted against another speaker keeps its own edges
+    and stays marked as short evidence.
+    """
+
+    segment = segments[index]
+    if segment.duration >= minimum:
+        return segment.start, segment.end
+
+    need = minimum - segment.duration
+    before = segments[index - 1].end if index > 0 else 0.0
+    after = (
+        segments[index + 1].start
+        if index + 1 < len(segments)
+        else (total_duration if total_duration is not None else segment.end + minimum)
+    )
+    left_room = max(0.0, segment.start - before)
+    right_room = max(0.0, after - segment.end)
+    left = min(left_room, need / 2.0)
+    right = min(right_room, need - left)
+    left = min(left_room, need - right)
+    return segment.start - left, segment.end + right
+
+
 def _evidence_vectors(
     pipeline: Any,
     audio_path: Path,
@@ -881,35 +917,47 @@ def _evidence_vectors(
     crosstalk: tuple[CrosstalkRegion, ...],
     *,
     minimum_seconds: float = _MIN_EMBEDDED_TURN_SECONDS,
-) -> tuple[dict[int, tuple[float, ...]], int]:
+    pad_short: bool = True,
+) -> tuple[dict[int, tuple[float, ...]], int, int]:
     """Embed every turn that can carry speaker evidence.
 
-    Returns the embeddings keyed by the segment's position in ``segments``, and the
-    number of turns that could not carry any - too short to embed, or overlapping
-    another speaker, or a turn the embedder refused. Those are *counted*, never
-    guessed at: a decision is only ever made from real evidence.
+    Returns the embeddings keyed by the segment's position in ``segments``, the number
+    of turns that could not carry any, and how many were embedded inside a padded
+    window. Short turns are padded rather than dropped, because a character built out of
+    short lines is exactly the one this stage exists to find - but a turn that cannot be
+    padded safely is left unmeasured rather than measured badly.
     """
 
     audio = getattr(pipeline, "_audio", None)
     embedder = getattr(pipeline, "_embedding", None)
     if audio is None or embedder is None or torch is None:
-        return {}, len(segments)
+        return {}, len(segments), 0
     try:
         from pyannote.core import Segment as PyannoteSegment
     except ImportError:  # pragma: no cover - pyannote always ships this
-        return {}, len(segments)
+        return {}, len(segments), 0
 
     vectors: dict[int, tuple[float, ...]] = {}
     unmeasured = 0
+    padded = 0
     for index, segment in enumerate(segments):
         if segment.duration < minimum_seconds or _is_crosstalk_turn(segment, crosstalk):
             unmeasured += 1
             continue
+        span = segment
+        if pad_short and segment.duration < _EMBED_MIN_WINDOW_SECONDS:
+            start, end = _padded_span(
+                segments, index, minimum=_EMBED_MIN_WINDOW_SECONDS
+            )
+            if end > start:
+                span = SpeakerSegment(segment.speaker_id, start, end)
+                if span.duration > segment.duration:
+                    padded += 1
         vector = _embed_turn(
             audio,
             embedder,
             audio_path,
-            segment,
+            span,
             pyannote_segment=PyannoteSegment,
         )
         if vector is None:
@@ -919,7 +967,7 @@ def _evidence_vectors(
             vectors[index] = identity.normalise(vector)
         except identity.InvalidVoiceprintError:
             unmeasured += 1
-    return vectors, unmeasured
+    return vectors, unmeasured, padded
 
 
 def _evidence_groups(
@@ -976,6 +1024,49 @@ def _evidence_groups(
             current.append(index)
     flush()
     return groups
+
+
+def _evidence_units(
+    turns: Sequence[SpeakerSegment],
+    vectors: Mapping[int, tuple[float, ...]],
+    *,
+    minimum_seconds: float = _UNIT_MIN_SECONDS,
+) -> tuple[list[partition.Unit], list["_EvidenceGroup"]]:
+    """Return one evidence unit per turn that can carry a voiceprint.
+
+    A unit is a single turn, not a run of them: pooling two turns that share a *label*
+    would average two voices whenever the label is the thing that is wrong - the case
+    this stage exists to fix. Short turns are still usable because they were embedded
+    inside a padded window; their movement is what the clustering does with all the
+    short performances of one voice together.
+    """
+
+    units: list[partition.Unit] = []
+    groups: list[_EvidenceGroup] = []
+    for index in sorted(vectors):
+        segment = turns[index]
+        if segment.duration < minimum_seconds:
+            continue
+        units.append(
+            partition.Unit(
+                provisional_id=segment.speaker_id,
+                seconds=segment.duration,
+                vector=vectors[index],
+                tag=index,
+            )
+        )
+        groups.append(
+            _EvidenceGroup(
+                speaker_id=segment.speaker_id,
+                indexes=(index,),
+                embeddable=(index,),
+                start=segment.start,
+                end=segment.end,
+                speech_seconds=segment.duration,
+                vector=vectors[index],
+            )
+        )
+    return units, groups
 
 
 def _verify_speaker_attributions(
@@ -1077,51 +1168,6 @@ def _embed_turn(
         return None
 
 
-def _agglomerate(
-    vectors: list[tuple[float, ...]], *, threshold: float
-) -> list[list[int]]:
-    """Group ``vectors`` by average-linkage similarity, stopping below ``threshold``.
-
-    Deterministic: the most similar pair is merged first, and a tie is broken by the
-    lowest indices, so the same film always yields the same groups.
-    """
-
-    groups: list[list[int]] = [[index] for index in range(len(vectors))]
-
-    while len(groups) > 1:
-        best_similarity = -1.0
-        best_pair: tuple[int, int] | None = None
-        for left in range(len(groups)):
-            for right in range(left + 1, len(groups)):
-                total = 0.0
-                for first in groups[left]:
-                    for second in groups[right]:
-                        total += _cosine_similarity(vectors[first], vectors[second])
-                similarity = total / (len(groups[left]) * len(groups[right]))
-                if similarity > best_similarity + 1e-12:
-                    best_similarity = similarity
-                    best_pair = (left, right)
-        if best_pair is None or best_similarity < threshold:
-            break
-        left, right = best_pair
-        groups[left] = groups[left] + groups[right]
-        del groups[right]
-
-    return groups
-
-
-def _cross_similarity(
-    vectors: list[tuple[float, ...]], left: list[int], right: list[int]
-) -> float:
-    """Return the mean similarity between the two groups."""
-
-    total = 0.0
-    for first in left:
-        for second in right:
-            total += _cosine_similarity(vectors[first], vectors[second])
-    return total / (len(left) * len(right))
-
-
 def _next_speaker_id(existing: set[str]) -> str:
     """Return an unused ``SPEAKER_NN`` label after the highest one in use."""
 
@@ -1136,186 +1182,194 @@ def _next_speaker_id(existing: set[str]) -> str:
     return f"SPEAKER_{candidate:02d}"
 
 
-def _mean_similarity_to_centroid(
-    vectors: Sequence[tuple[float, ...]], indices: Sequence[int]
-) -> float:
-    """Return how tightly ``indices`` agree with their own centroid.
+def _name_clusters(
+    units: Sequence["_EvidenceGroup"],
+    labels: Sequence[int],
+    k: int,
+    existing_ids: Collection[str],
+) -> dict[int, str]:
+    """Give each cluster the name of the speaker it mostly is, or a new one.
 
-    Cohesion, not the worst pair: one clipped turn would otherwise decide that a group
-    of six clean turns is inconsistent.
+    A cluster that mostly holds one pyannote speaker keeps that speaker's id, which is
+    what makes the result readable next to the original run. A cluster separated out of
+    a speaker's turns by the audio - the scattered character - has no majority to
+    inherit and gets an id of its own. Two clusters can never share an id.
     """
 
-    if len(indices) < 2:
-        return 1.0
-    centroid = _weighted_mean(
-        [vectors[index] for index in indices], [1.0] * len(indices)
-    )
-    if centroid is None:
-        return -1.0
-    return sum(
-        identity.cosine_similarity(vectors[index], centroid) for index in indices
-    ) / len(indices)
+    totals: dict[int, float] = {cluster: 0.0 for cluster in range(k)}
+    counts: dict[int, int] = {cluster: 0 for cluster in range(k)}
+    weighted: dict[int, dict[str, float]] = {cluster: {} for cluster in range(k)}
+    for unit, label in zip(units, labels):
+        totals[label] += unit.speech_seconds
+        counts[label] += 1
+        weighted[label][unit.speaker_id] = (
+            weighted[label].get(unit.speaker_id, 0.0) + unit.speech_seconds
+        )
+
+    def dominance(cluster: int) -> float:
+        shares = weighted[cluster]
+        if not shares or not totals[cluster]:
+            return 0.0
+        return max(shares.values()) / totals[cluster]
+
+    # Purest clusters claim their speaker's name first: a cluster that is *entirely*
+    # one speaker must not lose that name to a mixed cluster that merely leans towards
+    # it, whichever speaks longer.
+    ordered = sorted(range(k), key=lambda cluster: (-dominance(cluster), -totals[cluster], cluster))
+    assignment: dict[int, str] = {}
+    for cluster in ordered:
+        shares = weighted[cluster]
+        if not shares or not totals[cluster]:
+            continue
+        dominant, dominant_seconds = max(shares.items(), key=lambda item: item[1])
+        if (
+            dominant_seconds / totals[cluster] >= _CLUSTER_DOMINANCE
+            and dominant not in assignment.values()
+        ):
+            assignment[cluster] = dominant
+    provisional = set(existing_ids)
+    for cluster in ordered:
+        if cluster in assignment:
+            continue
+        new_id = _next_speaker_id(provisional | set(assignment.values()))
+        assignment[cluster] = new_id
+
+    return assignment
+    return assignment, plans
 
 
-def _split_mixed_clusters(
-    segments: Sequence[SpeakerSegment],
-    vectors: Mapping[int, tuple[float, ...]],
+def _cluster_scores(
+    unit: "_EvidenceGroup", voiceprints: Mapping[int, tuple[float, ...]]
+) -> list[tuple[int, float]]:
+    """Rank the clusters by how well they explain one performance."""
+
+    if unit.vector is None:
+        return []
+    scored = [
+        (cluster, identity.cosine_similarity(unit.vector, voiceprint))
+        for cluster, voiceprint in voiceprints.items()
+    ]
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return scored
+
+
+def _apply_partition(
+    turns: Sequence[SpeakerSegment],
+    units: Sequence["_EvidenceGroup"],
+    labels: Sequence[int],
+    assignment: Mapping[int, str],
+    voiceprints: Mapping[int, tuple[float, ...]],
+    calibration: partition.Calibration,
 ) -> tuple[
     list[SpeakerSegment],
-    tuple[SpeakerClusterSplit, ...],
-    tuple[SpeakerSplitCandidate, ...],
+    list[str],
+    tuple[SpeakerReassignment, ...],
+    tuple[UncertainSpeaker, ...],
 ]:
-    """Split a speaker cluster whose own turns hold two voices.
+    """Move each performance to the identity the evidence supports, or leave it alone.
 
-    Community-1 clusters the film's speech once. A character who speaks little, quietly
-    or mostly under someone else's turn can land inside that neighbour's cluster, and is
-    then cloned with the neighbour's voice for the whole film. This looks for that case
-    with the pipeline's own embedding model: a cluster whose turns fall into two groups
-    that are each internally consistent and clearly unlike each other, with enough of
-    the smaller voice to be worth a character of its own.
-
-    Every turn of at least half a second contributes, so a character made only of short
-    lines can be recovered; the evidence is aggregated into groups rather than judged
-    turn by turn. A mis-split invents a character, so the tests stay conservative - and
-    a cluster that *nearly* qualified is returned as a
-    :class:`SpeakerSplitCandidate` with the numbers that stopped it, instead of being
-    passed over in silence.
+    A performance only moves when the cluster it was put in beats the next best by
+    ``calibration.margin``. That is the rule that stops a 0.6 s fragment being handed to
+    a character on the strength of one embedding: the ambiguity is reported and the turn
+    keeps the identity pyannote gave it.
     """
 
-    if not segments:
-        return list(segments), (), ()
+    assignments: list[str] = []
+    reassignments: list[SpeakerReassignment] = []
+    uncertain_seconds: dict[str, float] = {}
+    uncertain_worst: dict[str, tuple[float, float]] = {}
+    updated = list(turns)
 
-    by_speaker: dict[str, list[int]] = {}
-    for index, segment in enumerate(segments):
-        if index in vectors:
-            by_speaker.setdefault(segment.speaker_id, []).append(index)
-
-    splittable = {
-        speaker_id: indices
-        for speaker_id, indices in by_speaker.items()
-        if len(indices) >= _SPLIT_MIN_CLUSTER_TURNS
-    }
-    if not splittable:
-        return list(segments), (), ()
-
-    splits: list[SpeakerClusterSplit] = []
-    candidates: list[SpeakerSplitCandidate] = []
-    updated = list(segments)
-    taken = {segment.speaker_id for segment in segments}
-
-    for speaker_id in sorted(splittable):
-        indices = splittable[speaker_id]
-        cluster_vectors = [vectors[index] for index in indices]
-        groups = _agglomerate(cluster_vectors, threshold=_SPLIT_CLUSTER_SIMILARITY)
-        if len(groups) < 2:
-            # One voice: the silence here is the answer, and a "candidate" for every
-            # correctly clustered speaker would drown the real ones.
+    for unit, label in zip(units, labels):
+        target = assignment[label]
+        scores = _cluster_scores(unit, voiceprints)
+        best_score = scores[0][1] if scores else -1.0
+        rival = max((score for cluster, score in scores if cluster != label), default=-1.0)
+        margin = best_score - rival
+        if target != unit.speaker_id and margin < calibration.margin:
+            assignments.append(unit.speaker_id)
+            uncertain_seconds[unit.speaker_id] = (
+                uncertain_seconds.get(unit.speaker_id, 0.0) + unit.speech_seconds
+            )
+            previous = uncertain_worst.get(unit.speaker_id)
+            if previous is None or margin < previous[1]:
+                uncertain_worst[unit.speaker_id] = (best_score, margin)
             continue
-
-        groups.sort(
-            key=lambda group: -sum(
-                segments[indices[position]].duration for position in group
-            )
-        )
-        bigger, smaller = groups[0], groups[1]
-        smaller_seconds = sum(
-            segments[indices[position]].duration for position in smaller
-        )
-        total_seconds = sum(segments[index].duration for index in indices)
-        within = min(
-            _mean_similarity_to_centroid(cluster_vectors, bigger),
-            _mean_similarity_to_centroid(cluster_vectors, smaller),
-        )
-        across = _cross_similarity(cluster_vectors, bigger, smaller)
-
-        reason = ""
-        if len(groups) > 2:
-            reason = (
-                f"the cluster's turns fall into {len(groups)} groups, not two; "
-                "left as one speaker rather than guessing which are characters"
-            )
-        elif len(smaller) < _SPLIT_MIN_TURNS:
-            reason = (
-                f"the smaller voice has {len(smaller)} turn(s); "
-                f"{_SPLIT_MIN_TURNS} are needed to stand alone"
-            )
-        elif smaller_seconds < _SPLIT_MIN_SECONDS:
-            reason = (
-                f"the smaller voice has {smaller_seconds:.2f}s of speech; "
-                f"{_SPLIT_MIN_SECONDS:.1f}s are needed to stand alone"
-            )
-        elif within < _SPLIT_MIN_WITHIN_SIMILARITY:
-            reason = (
-                f"a group agrees with its own centroid only {within:.2f} of the "
-                f"{_SPLIT_MIN_WITHIN_SIMILARITY:.2f} needed; not one voice"
-            )
-        elif across > _SPLIT_MAX_ACROSS_SIMILARITY:
-            reason = (
-                f"the two groups are {across:.2f} alike, above the "
-                f"{_SPLIT_MAX_ACROSS_SIMILARITY:.2f} that makes them different voices"
-            )
-        elif within - across < _SPLIT_MIN_SEPARATION:
-            reason = (
-                f"the groups differ by only {within - across:.2f}, below the "
-                f"{_SPLIT_MIN_SEPARATION:.2f} separation needed to be sure"
-            )
-
-        if reason:
-            candidates.append(
-                SpeakerSplitCandidate(
-                    speaker_id=speaker_id,
-                    turns=len(smaller),
-                    seconds=smaller_seconds,
-                    within_similarity=within,
-                    across_similarity=across,
-                    reason=reason,
-                )
-            )
-            _LOGGER.info(
-                "Kept %s as one speaker: %s (turns %d, %.2fs, within %.2f, across %.2f)",
-                speaker_id,
-                reason,
-                len(smaller),
-                smaller_seconds,
-                within,
-                across,
-            )
+        assignments.append(target)
+        if target == unit.speaker_id:
             continue
-
-        new_speaker_id = _next_speaker_id(taken)
-        taken.add(new_speaker_id)
-        for position in smaller:
-            index = indices[position]
+        for index in unit.indexes:
             segment = updated[index]
-            updated[index] = SpeakerSegment(new_speaker_id, segment.start, segment.end)
-        splits.append(
-            SpeakerClusterSplit(
-                speaker_id=speaker_id,
-                new_speaker_id=new_speaker_id,
-                turns=len(smaller),
-                seconds=smaller_seconds,
-                within_similarity=within,
-                across_similarity=across,
+            updated[index] = SpeakerSegment(target, segment.start, segment.end)
+        reassignments.append(
+            SpeakerReassignment(
+                start=unit.start,
+                end=unit.end,
+                seconds=unit.speech_seconds,
+                original_speaker_id=unit.speaker_id,
+                corrected_speaker_id=target,
+                similarity=best_score,
+                margin=margin,
             )
         )
 
-    return updated, tuple(splits), tuple(candidates)
+    # Turns without evidence of their own follow the nearest moved performance of the
+    # same pyannote speaker, so a short fragment inside a moved performance is not left
+    # behind; anything further away keeps the label the model gave it.
+    measured = {index for unit in units for index in unit.indexes}
+    movers = [
+        (unit, unit_id)
+        for unit, unit_id in zip(units, assignments)
+        if unit_id != unit.speaker_id
+    ]
+    for index, segment in enumerate(updated):
+        if index in measured:
+            continue
+        nearest: tuple[float, str] | None = None
+        for unit, unit_id in movers:
+            if unit.speaker_id != segment.speaker_id:
+                continue
+            distance = min(abs(segment.start - unit.start), abs(segment.end - unit.end))
+            if distance <= _UNMEASURED_INHERIT_SECONDS and (
+                nearest is None or distance < nearest[0]
+            ):
+                nearest = (distance, unit_id)
+        if nearest is not None:
+            updated[index] = SpeakerSegment(nearest[1], segment.start, segment.end)
 
+    uncertain = tuple(
+        UncertainSpeaker(
+            speaker_id=speaker_id,
+            reason=(
+                "the evidence did not separate this voice from another one; the "
+                "performance keeps pyannote's identity rather than being moved on a "
+                "guess"
+            ),
+            similarity=uncertain_worst[speaker_id][0],
+            margin=uncertain_worst[speaker_id][1],
+            seconds=seconds,
+        )
+        for speaker_id, seconds in sorted(uncertain_seconds.items())
+    )
+    return updated, assignments, tuple(reassignments), uncertain
 
 
 @dataclass(frozen=True, slots=True)
-class _Scene:
-    """One stretch of the film that is heard as a scene, and the turns inside it."""
+class _Window:
+    """A short stretch of film around dialogue the evidence cannot settle."""
 
     index: int
     start: float
     end: float
+    #: Every turn inside the window, used as context.
     turn_indexes: tuple[int, ...]
+    #: The turns the window was opened for. Only these may be changed by it.
+    suspect_indexes: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _LocalCluster:
-    """One speaker as a scene's own diarization heard them."""
+    """One speaker as a window's own diarization heard them."""
 
     speaker_id: str
     indexes: tuple[int, ...]
@@ -1323,70 +1377,102 @@ class _LocalCluster:
     vector: tuple[float, ...] | None
 
 
-def _scene_mode(value: str) -> str:
-    """Return the validated scene mode, or raise for a value that is not one."""
+def _window_mode(value: str) -> str:
+    """Return the validated window mode, or raise for a value that is not one."""
 
     mode = (value or "").strip().lower()
-    if mode not in _SCENE_MODES:
+    if mode not in _WINDOW_MODES:
         raise InvalidInputError(
-            f"DIARIZATION_SCENE_MODE must be one of {', '.join(_SCENE_MODES)}, got {value!r}"
+            f"DIARIZATION_SCENE_MODE must be one of {', '.join(_WINDOW_MODES)}, "
+            f"got {value!r}"
         )
     return mode
 
 
-def _segment_scenes(
-    turns: Sequence[SpeakerSegment], *, gap: float, max_seconds: float
-) -> list[_Scene]:
-    """Cut the film into scenes at the silences between its turns.
+def _suspect_windows(
+    turns: Sequence[SpeakerSegment],
+    units: Sequence["_EvidenceGroup"],
+    labels: Sequence[int],
+    voiceprints: Mapping[int, tuple[float, ...]],
+    calibration: partition.Calibration,
+    crosstalk: tuple[CrosstalkRegion, ...],
+) -> list[_Window]:
+    """Return short windows around the dialogue the evidence could not settle.
 
-    A film's dialogue already carries its own scene boundaries: people stop talking when
-    a scene ends. A gap of ``gap`` seconds, or a stretch longer than ``max_seconds``,
-    starts a new scene. The boundaries fall between turns, so a scene always holds whole
-    turns and its diarization result can be spliced back without re-timing anything.
+    Two things make a performance worth a second look: its two best clusters are too
+    close to call, or it overlaps another speaker - the one case where the exclusive
+    annotation necessarily drops a voice. The windows cover only those performances plus
+    a little context, never a whole scene: diarizing a minute of film again asks the same
+    question that already failed.
     """
 
-    if not turns:
-        return []
-    scenes: list[_Scene] = []
-    current: list[int] = [0]
-    start = turns[0].start
-    for index in range(1, len(turns)):
-        previous = turns[index - 1]
-        segment = turns[index]
-        if segment.start - previous.end >= gap or segment.end - start > max_seconds:
-            scenes.append(
-                _Scene(
-                    index=len(scenes),
-                    start=start,
-                    end=previous.end,
-                    turn_indexes=tuple(current),
-                )
-            )
-            current = [index]
-            start = segment.start
-        else:
-            current.append(index)
-    scenes.append(
-        _Scene(
-            index=len(scenes),
-            start=start,
-            end=turns[-1].end,
-            turn_indexes=tuple(current),
+    suspect_indexes: set[int] = set()
+    for unit, label in zip(units, labels):
+        scores = _cluster_scores(unit, voiceprints)
+        if not scores:
+            continue
+        rival = max(
+            (score for cluster, score in scores if cluster != label), default=-1.0
         )
+        if scores[0][1] - rival < calibration.margin:
+            suspect_indexes.update(unit.indexes)
+    for index, segment in enumerate(turns):
+        if _is_crosstalk_turn(segment, crosstalk):
+            suspect_indexes.add(index)
+    if not suspect_indexes:
+        return []
+
+    spans = sorted(
+        (max(0.0, turns[index].start - _WINDOW_PAD_SECONDS),
+         turns[index].end + _WINDOW_PAD_SECONDS)
+        for index in suspect_indexes
     )
-    return scenes
+    merged: list[list[float]] = []
+    for start, end in spans:
+        if (
+            merged
+            and start - merged[-1][1] <= _WINDOW_JOIN_GAP_SECONDS
+            and end - merged[-1][0] <= _WINDOW_MAX_SPAN_SECONDS
+        ):
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    windows: list[_Window] = []
+    for start, end in merged:
+        if end - start < _WINDOW_MIN_SPAN_SECONDS:
+            continue
+        inside = tuple(
+            index
+            for index, segment in enumerate(turns)
+            if segment.start < end and segment.end > start
+        )
+        if not inside:
+            continue
+        windows.append(
+            _Window(
+                index=len(windows),
+                start=start,
+                end=end,
+                turn_indexes=inside,
+                suspect_indexes=tuple(
+                    index for index in inside if index in suspect_indexes
+                ),
+            )
+        )
+    return windows
 
 
-def _scene_argument(
-    pipeline: Any, audio_path: Path, scene: _Scene
+def _window_argument(
+    pipeline: Any, audio_path: Path, window: _Window
 ) -> tuple[Any, float, str] | None:
-    """Return the argument that hands pyannote exactly this scene, the time base of the
-    times it will return, and which kind of argument it is.
+    """Return the argument that hands pyannote exactly this window, its time base, and
+    which kind of argument it is.
 
     The waveform is preferred because the model's times are then relative to a slice
-    this module cut, so the base is simply the scene's own start. If the loaded pipeline
-    exposes no audio reader, a file mapping with ``offset``/``duration`` is used and the
-    model's times are checked before they are trusted.
+    this module cut, so the base is simply the window's own start. If the loaded
+    pipeline exposes no audio reader, a file mapping with ``offset``/``duration`` is
+    used and the model's times are checked before they are trusted.
     """
 
     try:
@@ -1399,48 +1485,47 @@ def _scene_argument(
         try:
             waveform, sample_rate = audio.crop(
                 {"audio": str(audio_path)},
-                PyannoteSegment(scene.start, scene.end),
+                PyannoteSegment(window.start, window.end),
                 mode="pad",
             )
         except Exception as exc:  # pragma: no cover - model-specific failure
             _LOGGER.warning(
-                "Scene %d (%.2f-%.2fs) could not be cut from the dialogue stem "
+                "Window %d (%.2f-%.2fs) could not be cut from the dialogue stem "
                 "(%s: %s); falling back to a file slice",
-                scene.index,
-                scene.start,
-                scene.end,
+                window.index,
+                window.start,
+                window.end,
                 type(exc).__name__,
                 exc,
             )
         else:
             return (
                 {"waveform": waveform, "sample_rate": sample_rate},
-                scene.start,
+                window.start,
                 "waveform",
             )
 
     return (
         {
             "audio": str(audio_path),
-            "offset": scene.start,
-            "duration": scene.end - scene.start,
+            "offset": window.start,
+            "duration": window.end - window.start,
         },
         0.0,
         "offset",
     )
 
 
-def _diarize_scene(
-    pipeline: Any, audio_path: Path, scene: _Scene
+def _diarize_window(
+    pipeline: Any, audio_path: Path, window: _Window
 ) -> list[SpeakerSegment] | None:
-    """Diarize one scene on its own, or return ``None`` when that is not usable.
+    """Diarize one suspect window on its own, or return ``None`` when that is unusable.
 
-    No speaker-count hint is passed: the whole point of the scene pass is to discover
-    who is in the scene without being told, including a character the global pass never
-    separated. A scene the model cannot handle is reported, never guessed at.
+    No speaker-count hint is passed: the point of a window is to discover who is in it
+    without being told. A window the model cannot handle is reported, never guessed at.
     """
 
-    prepared = _scene_argument(pipeline, audio_path, scene)
+    prepared = _window_argument(pipeline, audio_path, window)
     if prepared is None:
         return None
     argument, base, kind = prepared
@@ -1449,11 +1534,11 @@ def _diarize_scene(
         result = pipeline(argument)
     except Exception as exc:
         _LOGGER.warning(
-            "Scene %d (%.2f-%.2fs) could not be diarized on its own (%s: %s); "
-            "keeping the global attribution for it",
-            scene.index,
-            scene.start,
-            scene.end,
+            "Window %d (%.2f-%.2fs) could not be diarized on its own (%s: %s); "
+            "keeping the current attribution for it",
+            window.index,
+            window.start,
+            window.end,
             type(exc).__name__,
             exc,
         )
@@ -1463,24 +1548,24 @@ def _diarize_scene(
         local = _to_segments(result)
     except (UnsupportedOutputError, InvalidSegmentError) as exc:
         _LOGGER.warning(
-            "Scene %d (%.2f-%.2fs) returned a result this module cannot read (%s); "
-            "keeping the global attribution for it",
-            scene.index,
-            scene.start,
-            scene.end,
+            "Window %d (%.2f-%.2fs) returned a result this module cannot read (%s); "
+            "keeping the current attribution for it",
+            window.index,
+            window.start,
+            window.end,
             exc,
         )
         return None
     if not local:
         return None
 
-    duration = scene.end - scene.start
+    duration = window.end - window.start
     shift = base
     if kind == "offset" and max(segment.end for segment in local) <= duration + 1e-6:
         # A file slice given an offset should come back on the film's timeline, but if
-        # the model returned scene-relative times anyway, place them back here rather
+        # the model returned window-relative times anyway, place them back here rather
         # than trusting the offset to have been honoured.
-        shift = scene.start
+        shift = window.start
     if shift:
         local = [
             SpeakerSegment(
@@ -1490,15 +1575,15 @@ def _diarize_scene(
         ]
 
     if any(
-        segment.end <= scene.start - 0.5 or segment.start >= scene.end + 0.5
+        segment.end <= window.start - 0.5 or segment.start >= window.end + 0.5
         for segment in local
     ):
         _LOGGER.warning(
-            "Scene %d (%.2f-%.2fs) came back with turns outside the scene; "
-            "keeping the global attribution for it",
-            scene.index,
-            scene.start,
-            scene.end,
+            "Window %d (%.2f-%.2fs) came back with turns outside the window; "
+            "keeping the current attribution for it",
+            window.index,
+            window.start,
+            window.end,
         )
         return None
     return local
@@ -1575,186 +1660,210 @@ def _local_clusters(
     return clusters
 
 
-def _reconcile_scenes(
+def _reconcile_windows(
     pipeline: Any,
     audio_path: Path,
     turns: Sequence[SpeakerSegment],
-    scenes: Sequence[_Scene],
-    registry: identity.SpeakerRegistry,
+    windows: Sequence[_Window],
+    voiceprints: Mapping[str, tuple[float, ...]],
+    calibration: partition.Calibration,
     *,
-    mode: str,
-    suspect_speakers: frozenset[str],
-    min_similarity: float,
-    min_margin: float,
+    short_turn: float,
 ) -> tuple[
     list[SpeakerSegment],
-    tuple[SceneDiarization, ...],
+    tuple[DiarizationWindow, ...],
     tuple[UncertainSpeaker, ...],
     tuple[str, ...],
     dict[tuple[float, float], tuple[float, ...]],
 ]:
-    """Diarize each scene on its own and name the characters it finds.
+    """Diarize each suspect window on its own and let it correct the attribution.
 
-    A scene's own result is only kept when it names a character the global pass missed
-    for that scene. Anything else would re-litigate a decision the global pass already
-    made on far more audio, and scene-sized diarization is noisier than a film-sized
-    one - so it is allowed to *add* identities, never to shuffle the ones already named.
+    A window may change only the turns it was opened for - the ambiguous ones, and the
+    ones under crosstalk - so a noisy few seconds cannot rewrite a scene it merely
+    borders. Within that remit it can do both things the film-wide pass can do: name a
+    character the current attribution lacks, and *move* dialogue from one existing
+    identity to another when its own diarization separates them.
 
-    A scene voice that matches an existing identity reuses its id, which is how a
-    character heard in three different scenes ends up with one name and one voice. A
-    voice that matches nothing is given a new id. A voice that is too close to two
-    identities to separate is given a new id too, and reported as uncertain: assigning
-    it to either one would clone a character in another character's voice.
+    A local cluster that matches no identity closely enough becomes a new one, reported
+    as uncertain rather than folded into whichever identity it most resembles.
     """
 
-    reports: list[SceneDiarization] = []
+    reports: list[DiarizationWindow] = []
     uncertain: list[UncertainSpeaker] = []
     replacements: dict[int, list[SpeakerSegment]] = {}
-    known = set(registry)
-    discovered: list[str] = []
+    replaced: set[int] = set()
     accepted_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
+    discovered: list[str] = []
+    catalogue: dict[str, tuple[float, ...]] = dict(voiceprints)
 
-    for scene in scenes:
-        scene_turns = [turns[index] for index in scene.turn_indexes]
-        before = {segment.speaker_id for segment in scene_turns}
-        span = scene.end - scene.start
-        if span < _SCENE_MIN_SPAN_SECONDS:
-            reports.append(
-                SceneDiarization(
-                    index=scene.index,
-                    start=scene.start,
-                    end=scene.end,
-                    turns=len(scene_turns),
-                    speakers=tuple(sorted(before)),
-                    mode="global",
-                    detail=f"only {span:.1f}s of film; too short to diarize on its own",
-                )
-            )
-            continue
-        if mode == "suspect" and not (before & suspect_speakers):
-            reports.append(
-                SceneDiarization(
-                    index=scene.index,
-                    start=scene.start,
-                    end=scene.end,
-                    turns=len(scene_turns),
-                    speakers=tuple(sorted(before)),
-                    mode="global",
-                    detail="no suspected merge in this scene",
-                )
-            )
-            continue
-
-        local = _diarize_scene(pipeline, audio_path, scene)
+    for window in windows:
+        window_turns = [turns[index] for index in window.turn_indexes]
+        current = {segment.speaker_id for segment in window_turns}
+        local = _diarize_window(pipeline, audio_path, window)
         if local is None:
             reports.append(
-                SceneDiarization(
-                    index=scene.index,
-                    start=scene.start,
-                    end=scene.end,
-                    turns=len(scene_turns),
-                    speakers=tuple(sorted(before)),
+                DiarizationWindow(
+                    index=window.index,
+                    start=window.start,
+                    end=window.end,
+                    turns=len(window_turns),
+                    speakers=tuple(sorted(current)),
                     mode="failed",
-                    detail="the scene could not be diarized on its own",
+                    detail="the window could not be diarized on its own",
                 )
             )
             continue
 
-        local_vectors, _ = _evidence_vectors(pipeline, audio_path, local, ())
-        clusters = _local_clusters(local, local_vectors)
-        mapping: dict[str, str] = {}
-        for label, cluster in sorted(clusters.items()):
-            if cluster.vector is None or cluster.seconds < _SCENE_MIN_CLUSTER_SECONDS:
-                continue
-            decision = registry.identify(
-                cluster.vector,
-                min_similarity=min_similarity,
-                min_margin=min_margin,
-            )
-            if decision.matched and decision.speaker_id is not None:
-                mapping[label] = decision.speaker_id
-                registry.observe(
-                    decision.speaker_id,
-                    cluster.vector,
-                    cluster.seconds,
-                    turns=len(cluster.indexes),
-                    scenes=1,
-                )
-                continue
-            ambiguous = decision.outcome == identity.AMBIGUOUS
-            minted = registry.mint(
-                cluster.vector,
-                cluster.seconds,
-                turns=len(cluster.indexes),
-                scenes=1,
-                uncertain=ambiguous,
-            )
-            mapping[label] = minted.speaker_id
-            if minted.speaker_id not in known:
-                known.add(minted.speaker_id)
-                discovered.append(minted.speaker_id)
-            if ambiguous:
-                uncertain.append(
-                    UncertainSpeaker(
-                        speaker_id=minted.speaker_id,
-                        reason=(
-                            "too close to an existing identity to separate; given its own "
-                            "id rather than reusing either"
-                        ),
-                        similarity=decision.similarity,
-                        margin=decision.margin,
-                        seconds=cluster.seconds,
-                    )
-                )
-
-        resolved = {mapping[label] for label in mapping}
-        new_characters = resolved - before
-        if not new_characters:
+        local_vectors, _, _ = _evidence_vectors(
+            pipeline, audio_path, local, (), minimum_seconds=short_turn
+        )
+        if not local_vectors:
             reports.append(
-                SceneDiarization(
-                    index=scene.index,
-                    start=scene.start,
-                    end=scene.end,
-                    turns=len(scene_turns),
-                    speakers=tuple(sorted(before)),
-                    mode="global",
-                    detail="the scene's own diarization found no character the global "
-                    "pass missed",
+                DiarizationWindow(
+                    index=window.index,
+                    start=window.start,
+                    end=window.end,
+                    turns=len(window_turns),
+                    speakers=tuple(sorted(current)),
+                    mode="kept",
+                    detail="the window's turns were too short to embed",
                 )
             )
             continue
 
-        def _global_label_for(segment: SpeakerSegment) -> str | None:
-            for candidate in scene_turns:
-                if candidate.start < segment.end and candidate.end > segment.start:
-                    return candidate.speaker_id
-            return None
+        mapping: dict[str, str] = {}
+        ambiguous_labels: set[str] = set()
+        minted = 0
+        for label, cluster in sorted(_local_clusters(local, local_vectors).items()):
+            if cluster.vector is None or cluster.seconds < _WINDOW_MIN_CLUSTER_SECONDS:
+                continue
+            ranked = sorted(
+                (
+                    (speaker_id, identity.cosine_similarity(cluster.vector, voiceprint))
+                    for speaker_id, voiceprint in catalogue.items()
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if not ranked:
+                continue
+            best_id, best_score = ranked[0]
+            rival = max((score for _, score in ranked[1:]), default=-1.0)
+            margin = best_score - rival
+            if best_score >= calibration.same_similarity and margin >= calibration.margin:
+                mapping[label] = best_id
+                continue
+            if minted >= _WINDOW_MAX_NEW_IDENTITIES:
+                ambiguous_labels.add(label)
+                continue
+            new_id = _next_speaker_id(set(catalogue) | set(mapping.values()))
+            catalogue[new_id] = cluster.vector
+            mapping[label] = new_id
+            minted += 1
+            discovered.append(new_id)
+            uncertain.append(
+                UncertainSpeaker(
+                    speaker_id=new_id,
+                    reason=(
+                        "a suspect window separates this voice but no identity in the "
+                        "film matches it closely enough; it keeps its own id rather "
+                        "than being assigned to one it merely resembles"
+                    ),
+                    similarity=best_score,
+                    margin=margin,
+                    seconds=cluster.seconds,
+                )
+            )
 
+        affected = [
+            index
+            for index in window.suspect_indexes
+            if any(
+                segment.start < turns[index].end and segment.end > turns[index].start
+                for segment in local
+            )
+        ]
+        if not affected:
+            reports.append(
+                DiarizationWindow(
+                    index=window.index,
+                    start=window.start,
+                    end=window.end,
+                    turns=len(window_turns),
+                    speakers=tuple(sorted(current)),
+                    mode="kept",
+                    detail="the window's own diarization did not cover the suspect turns",
+                )
+            )
+            continue
+
+        span_start = min(turns[index].start for index in affected)
+        span_end = max(turns[index].end for index in affected)
         replacement: list[SpeakerSegment] = []
+        changes: set[tuple[int, str]] = set()
+        undecided = False
         for segment in local:
-            mapped = mapping.get(segment.speaker_id) or _global_label_for(segment)
+            if segment.end <= span_start or segment.start >= span_end:
+                continue
+            start = max(segment.start, span_start)
+            end = min(segment.end, span_end)
+            if end <= start:
+                continue
+            mapped = mapping.get(segment.speaker_id)
+            if mapped is None:
+                if segment.speaker_id in ambiguous_labels:
+                    undecided = True
+                mapped = next(
+                    (
+                        turns[index].speaker_id
+                        for index in affected
+                        if turns[index].start < end and turns[index].end > start
+                    ),
+                    None,
+                )
             if mapped is None:
                 continue
-            replacement.append(
-                SpeakerSegment(mapped, segment.start, segment.end)
+            replacement.append(SpeakerSegment(mapped, start, end))
+            for index in affected:
+                if (
+                    turns[index].start < end
+                    and turns[index].end > start
+                    and turns[index].speaker_id != mapped
+                ):
+                    changes.add((index, mapped))
+
+        if not replacement or undecided or not changes:
+            reports.append(
+                DiarizationWindow(
+                    index=window.index,
+                    start=window.start,
+                    end=window.end,
+                    turns=len(window_turns),
+                    speakers=tuple(sorted(current)),
+                    mode="kept",
+                    detail=(
+                        "the window could not decide between identities for its "
+                        "ambiguous turns"
+                        if undecided
+                        else "the window agreed with the current attribution"
+                    ),
+                )
             )
-        if not replacement:
             continue
-        replacements[scene.index] = replacement
+
+        replacements[window.index] = replacement
+        replaced.update(affected)
         accepted_vectors.update(_vectors_by_time(local, local_vectors))
         reports.append(
-            SceneDiarization(
-                index=scene.index,
-                start=scene.start,
-                end=scene.end,
+            DiarizationWindow(
+                index=window.index,
+                start=window.start,
+                end=window.end,
                 turns=len(replacement),
-                speakers=tuple(
-                    sorted({segment.speaker_id for segment in replacement})
-                ),
-                mode="scene",
+                speakers=tuple(sorted({segment.speaker_id for segment in replacement})),
+                mode="window",
                 detail=(
-                    "the scene's own diarization separated "
-                    f"{len(resolved - before)} character(s) the global pass merged"
+                    f"the window moved {len(changes)} suspect turn(s) to the identity "
+                    "its own diarization supports"
                 ),
             )
         )
@@ -1768,12 +1877,12 @@ def _reconcile_scenes(
             accepted_vectors,
         )
 
-    merged: list[SpeakerSegment] = []
-    for scene in scenes:
-        if scene.index in replacements:
-            merged.extend(replacements[scene.index])
-        else:
-            merged.extend(turns[index] for index in scene.turn_indexes)
+    merged: list[SpeakerSegment] = [
+        segment for index, segment in enumerate(turns) if index not in replaced
+    ]
+    for window in windows:
+        if window.index in replacements:
+            merged.extend(replacements[window.index])
     merged.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
     return (
         merged,
@@ -1784,90 +1893,63 @@ def _reconcile_scenes(
     )
 
 
-def _merge_duplicate_identities(
-    turns: Sequence[SpeakerSegment],
-    vectors: Mapping[tuple[float, float], tuple[float, ...]],
-    registry: identity.SpeakerRegistry,
-    *,
-    merge_similarity: float,
-    suspect_similarity: float,
-) -> tuple[list[SpeakerSegment], tuple[SpeakerIdentityMerge, ...], tuple[SpeakerMergeSuspect, ...]]:
-    """Merge identities that are the same person, and report the ones that are close.
+def _suspect_pairs(
+    voiceprints: Mapping[str, tuple[float, ...]],
+    seconds: Mapping[str, float],
+    calibration: partition.Calibration,
+) -> tuple[SpeakerMergeSuspect, ...]:
+    """Report identities that are suspiciously alike but were deliberately kept apart.
 
-    Scene-level diarization can name one character twice - a voice heard in two scenes
-    may not match its own earlier voiceprint - so pairs that are almost identical are
-    merged. A pair that is merely *similar* is reported instead of merged: a wrong merge
-    gives two characters one voice, which is exactly the failure this module exists to
-    prevent.
+    A pair this close was either merged already (above the film's same-voice threshold)
+    or left alone because the evidence for one voice was not decisive. The second case
+    is exactly what a listener hears as two characters sharing a voice, so it is
+    reported even though nothing is done about it.
     """
 
-    prototypes = _label_prototypes(turns, vectors)
-    if len(prototypes) < 2:
-        return list(turns), (), ()
-
-    speaker_ids = sorted(prototypes)
-    pairs: list[tuple[float, str, str]] = []
-    for position, first in enumerate(speaker_ids):
-        for second in speaker_ids[position + 1 :]:
-            similarity = identity.cosine_similarity(
-                prototypes[first][0], prototypes[second][0]
-            )
-            pairs.append((similarity, first, second))
-    pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
-
-    survivor: dict[str, str] = {speaker_id: speaker_id for speaker_id in speaker_ids}
-
-    def resolve(speaker_id: str) -> str:
-        while survivor[speaker_id] != speaker_id:
-            speaker_id = survivor[speaker_id]
-        return speaker_id
-
-    merges: list[SpeakerIdentityMerge] = []
+    threshold = calibration.same_similarity - calibration.margin
+    identifiers = sorted(voiceprints)
     suspects: list[SpeakerMergeSuspect] = []
-    for similarity, first, second in pairs:
-        left, right = resolve(first), resolve(second)
-        if left == right:
-            continue
-        if similarity >= merge_similarity:
-            left_seconds = prototypes[left][1]
-            right_seconds = prototypes[right][1]
-            keep, drop = (left, right) if left_seconds >= right_seconds else (right, left)
-            survivor[drop] = keep
-            registry.merge(drop, keep)
-            merges.append(
-                SpeakerIdentityMerge(
-                    from_speaker_id=drop,
-                    to_speaker_id=keep,
-                    similarity=similarity,
-                    turns=prototypes[drop][2],
-                    seconds=prototypes[drop][1],
-                )
+    for position, first in enumerate(identifiers):
+        for second in identifiers[position + 1 :]:
+            similarity = identity.cosine_similarity(
+                voiceprints[first], voiceprints[second]
             )
-            continue
-        if similarity >= suspect_similarity:
+            if similarity < threshold:
+                continue
             suspects.append(
                 SpeakerMergeSuspect(
-                    speaker_ids=(left, right),
+                    speaker_ids=(first, second),
                     similarity=similarity,
                     reason=(
-                        "the two voiceprints are unusually alike; they were left as "
-                        "separate speakers rather than risk one voice for two characters"
+                        "the two voiceprints are close but not close enough to merge; "
+                        "one of them may be a fragment of the other's voice"
                     ),
                 )
             )
+    return tuple(suspects)
 
-    if not merges:
-        return list(turns), (), tuple(suspects)
 
-    renamed = [
-        SpeakerSegment(
-            survivor.get(segment.speaker_id, segment.speaker_id),
-            segment.start,
-            segment.end,
-        )
-        for segment in turns
-    ]
-    return renamed, tuple(merges), tuple(suspects)
+def _rebuild_registry(
+    turns: Sequence[SpeakerSegment],
+    vectors: Mapping[tuple[float, float], tuple[float, ...]],
+    settings: Settings,
+    *,
+    registry_path: str | Path | None,
+) -> tuple[identity.SpeakerRegistry, str | None, str]:
+    """Rebuild every identity from the final partition and persist it once.
+
+    One ``observe`` per identity, carrying the total evidence behind it: observing the
+    same audio again from a window is what made the previous run report 256 s of speech
+    for a 247 s film.
+    """
+
+    registry = identity.SpeakerRegistry()
+    for speaker_id, (vector, seconds, count) in sorted(
+        _label_prototypes(turns, vectors).items()
+    ):
+        registry.observe(speaker_id, vector, seconds, turns=count)
+    written, error = _save_registry(registry, settings, registry_path=registry_path)
+    return registry, written, error
 
 
 def _resolve_speaker_counts(
@@ -1891,6 +1973,26 @@ def _resolve_speaker_counts(
     return num_speakers, min_speakers, max_speakers
 
 
+def _effective_calibration(
+    calibration: partition.Calibration, settings: Settings
+) -> partition.Calibration:
+    """Return the film's own calibration, or the configured fallback when it is unusable.
+
+    A film whose provisional clusters do not separate its voices at all - a cast of one,
+    or a soundtrack so noisy the embeddings agree with everything - cannot be its own
+    reference. Then, and only then, the configured similarity and margin are used, so an
+    operator still has a knob.
+    """
+
+    if calibration.reliable:
+        return calibration
+    return replace(
+        calibration,
+        same_similarity=settings.diarization_identity_min_similarity,
+        margin=settings.diarization_identity_min_margin,
+    )
+
+
 def diarize_detailed(
     audio_path: str | Path,
     *,
@@ -1900,28 +2002,27 @@ def diarize_detailed(
     max_speakers: int | None = None,
     registry_path: str | Path | None = None,
 ) -> DiarizationResult:
-    """Diarize ``audio_path`` into turns, identities, and what could not be settled.
+    """Diarize ``audio_path``, then re-partition the evidence into characters.
 
-    The pipeline has three passes, and each one exists because the previous one cannot
-    see something:
+    Four steps, each seeing something the previous one cannot:
 
-    1. **Global.** Community-1 diarizes the whole dialogue stem. Its speaker count is
-       automatic: no count is passed unless the caller configured bounds.
-    2. **Evidence.** Every turn of at least half a second is embedded, turns heard
-       together are aggregated into one voiceprint, attributions are verified against
-       Community-1's own prototypes, and a cluster whose turns hold two voices is split.
-       Short utterances are aggregated rather than discarded, and any cluster that
-       *nearly* qualified is reported instead of being passed over.
-    3. **Scenes.** The film is cut into scenes at its silences, each scene is diarized
-       on its own, and the characters found in it are named against a registry of
-       identities. That is what finds a character whose whole performance is a handful
-       of short lines in three different scenes, and it is what keeps those lines in
-       one voice.
+    1. **pyannote**, once, over the whole dialogue stem. Its exclusive annotation is the
+       starting attribution and is kept untouched as ``raw_turns``. The speaker count is
+       discovered: no count is passed unless the caller configured bounds.
+    2. **Evidence**: every turn of at least half a second is embedded - inside a padded
+       window when the turn itself is too short - and turns heard together are averaged
+       into one performance, so a character made of short lines has a voiceprint.
+    3. **Re-partition**: those performances are clustered *together*, not per pyannote
+       cluster, because a voice can be spread over several of them. The number of
+       speakers, and whether any number of speakers is believable at all, comes from the
+       film's own similarity scale (:mod:`app.pipeline.speaker_partition`). Every
+       candidate and every rejection is reported.
+    4. **Suspect windows**: short windows around dialogue the re-partitioning could not
+       settle (ambiguous, or overlapping another speaker) are diarized on their own, and
+       may name a character the film-wide pass missed.
 
-    Speaker-count hints that are left unset fall back to
-    ``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``; an explicit
-    argument always wins over the configured value. Neither is required: the number of
-    speakers is discovered, not declared.
+    Identities are rebuilt from the final partition and persisted once, so a character
+    keeps one id and one voice for the whole film and across re-runs.
     """
 
     resolved = settings if settings is not None else get_settings()
@@ -1932,7 +2033,7 @@ def diarize_detailed(
         resolved, num_speakers, min_speakers, max_speakers
     )
     _validate_speaker_counts(num_speakers, min_speakers, max_speakers)
-    mode = _scene_mode(resolved.diarization_scene_mode)
+    mode = _window_mode(resolved.diarization_scene_mode)
     short_turn = resolved.diarization_short_turn_seconds
 
     pipeline = _load_pipeline(resolved, token)
@@ -1946,148 +2047,189 @@ def diarize_detailed(
 
     overlap_annotation = _extract_overlap_annotation(result)
     crosstalk = () if overlap_annotation is None else tuple(_to_crosstalk(overlap_annotation))
-    turns = _to_segments(result)
-
-    scenes: list[_Scene] = []
-    if mode != "off":
-        scenes = _segment_scenes(
-            turns,
-            gap=resolved.diarization_scene_gap_seconds,
-            max_seconds=resolved.diarization_scene_max_seconds,
-        )
+    raw_turns = _to_segments(result)
 
     centroids = _speaker_centroids(result)
-    vectors: dict[int, tuple[float, ...]] = {}
-    if _needs_evidence(
-        turns,
-        centroids,
-        scenes,
-        mode=mode,
-        split=resolved.diarization_split_mixed_speakers,
-        short_turn=short_turn,
-    ):
-        vectors, unmeasured = _evidence_vectors(
-            pipeline, source, turns, crosstalk, minimum_seconds=short_turn
+    if len(raw_turns) >= 2:
+        vectors, unmeasured, _padded = _evidence_vectors(
+            pipeline, source, raw_turns, crosstalk, minimum_seconds=short_turn
         )
     else:
-        unmeasured = sum(
-            1
-            for segment in turns
-            if segment.duration < short_turn or _is_crosstalk_turn(segment, crosstalk)
+        vectors, unmeasured = {}, 0
+
+    # Verification against pyannote's own prototypes is independent of the partition: it
+    # fixes a turn the clustering put in the wrong cluster by comparing it with the
+    # model-space centroid of the speaker it claims to be.
+    turns, corrections = _verify_speaker_attributions(
+        centroids, raw_turns, _evidence_groups(raw_turns, vectors)
+    )
+    units, unit_groups = _evidence_units(turns, vectors)
+    calibration = _effective_calibration(partition.calibrate(units), resolved)
+    provisional_ids = {unit.provisional_id for unit in units}
+
+    if resolved.diarization_split_mixed_speakers:
+        reclustering = partition.repartition(
+            units,
+            calibration,
+            max_extra=resolved.diarization_max_extra_speakers,
+        )
+    else:
+        # The switch keeps pyannote's own clustering, for a run that wants the model's
+        # answer untouched. Calibration and the registry still describe what it found.
+        order: dict[str, int] = {}
+        provisional_labels = tuple(
+            order.setdefault(unit.provisional_id, len(order)) for unit in units
+        )
+        reclustering = partition.Partition(
+            labels=provisional_labels,
+            k=len(order),
+            silhouette=0.0,
+            stability=1.0,
+            accepted=False,
+            reason="global re-partitioning is switched off",
+            candidates=(),
         )
 
-    groups = _evidence_groups(turns, vectors)
-    turns, corrections = _verify_speaker_attributions(centroids, turns, groups)
+    labels = list(reclustering.labels)
+    voiceprints, cluster_seconds, _counts = partition.cluster_voiceprints(
+        units, labels, reclustering.k
+    )
+    assignment = _name_clusters(unit_groups, labels, reclustering.k, provisional_ids)
 
-    splits: tuple[SpeakerClusterSplit, ...] = ()
-    candidates: tuple[SpeakerSplitCandidate, ...] = ()
-    if resolved.diarization_split_mixed_speakers:
-        turns, splits, candidates = _split_mixed_clusters(turns, vectors)
-        for split in splits:
-            _LOGGER.info(
-                "Split %d turn(s) / %.2fs out of %s into %s (within %.2f, across %.2f)",
-                split.turns,
-                split.seconds,
-                split.speaker_id,
-                split.new_speaker_id,
-                split.within_similarity,
-                split.across_similarity,
+    merges_found = partition.merge_indistinguishable(
+        voiceprints,
+        cluster_seconds,
+        # Two identities are merged only when they are almost certainly one person: the
+        # midpoint of the film's own scale is a *matching* threshold, not a merging one.
+        threshold=resolved.diarization_identity_merge_similarity,
+    )
+    # The merge report has to describe the identities *before* they were folded
+    # together, so capture them before the renumbering below overwrites everything.
+    pre_names = dict(assignment)
+    pre_seconds = dict(cluster_seconds)
+    pre_counts = dict(_counts)
+    aliases = {drop: keep for keep, drop, _ in merges_found}
+
+    def resolve(cluster: int) -> int:
+        seen = 0
+        while cluster in aliases and seen < len(aliases) + 1:
+            cluster = aliases[cluster]
+            seen += 1
+        return cluster
+
+    surviving = sorted({resolve(cluster) for cluster in labels})
+    renumbered = {cluster: position for position, cluster in enumerate(surviving)}
+    labels = [renumbered[resolve(cluster)] for cluster in labels]
+    assignment = {
+        renumbered[cluster]: assignment[cluster] for cluster in surviving
+    }
+    k = len(surviving)
+    voiceprints, cluster_seconds, cluster_units = partition.cluster_voiceprints(
+        units, labels, k
+    )
+    merges = tuple(
+        SpeakerIdentityMerge(
+            from_speaker_id=pre_names[drop],
+            to_speaker_id=pre_names[keep],
+            similarity=float(similarity),
+            turns=pre_counts.get(drop, 0),
+            seconds=pre_seconds.get(drop, 0.0),
+        )
+        for keep, drop, similarity in merges_found
+    )
+    discovered = [
+        assignment[cluster]
+        for cluster in sorted(assignment)
+        if assignment[cluster] not in provisional_ids
+    ]
+
+    turns, _unit_assignments, reassignments, uncertain_partition = _apply_partition(
+        turns,
+        unit_groups,
+        labels,
+        assignment,
+        voiceprints,
+        calibration,
+    )
+
+    identity_voiceprints: dict[str, tuple[float, ...]] = {}
+    for cluster, voiceprint in voiceprints.items():
+        identity_voiceprints[assignment[cluster]] = voiceprint
+
+    windows: tuple[DiarizationWindow, ...] = ()
+    uncertain_windows: tuple[UncertainSpeaker, ...] = ()
+    discovered_windows: tuple[str, ...] = ()
+    window_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
+    if mode != "off" and units and resolved.diarization_split_mixed_speakers:
+        suspect = _suspect_windows(
+            turns, unit_groups, labels, voiceprints, calibration, crosstalk
+        )
+        if suspect:
+            (
+                turns,
+                windows,
+                uncertain_windows,
+                discovered_windows,
+                window_vectors,
+            ) = _reconcile_windows(
+                pipeline,
+                source,
+                turns,
+                suspect,
+                identity_voiceprints,
+                calibration,
+                short_turn=short_turn,
             )
 
-    scene_reports: tuple[SceneDiarization, ...] = ()
-    uncertain: tuple[UncertainSpeaker, ...] = ()
-    discovered: tuple[str, ...] = ()
-    merges: tuple[SpeakerIdentityMerge, ...] = ()
-    suspects: tuple[SpeakerMergeSuspect, ...] = ()
-    registry_path_written: str | None = None
-    registry_error = ""
+    timed_vectors = _vectors_by_time(turns, vectors)
+    timed_vectors.update(window_vectors)
+    prototypes = _label_prototypes(turns, timed_vectors)
+    _registry, registry_written, registry_error = _rebuild_registry(
+        turns, timed_vectors, resolved, registry_path=registry_path
+    )
+    suspects = _suspect_pairs(
+        {speaker_id: entry[0] for speaker_id, entry in prototypes.items()},
+        {speaker_id: entry[1] for speaker_id, entry in prototypes.items()},
+        calibration,
+    )
 
-    if mode != "off" and len(scenes) > 1 and vectors:
-        registry, registry_error = _load_registry(
-            resolved, registry_path=registry_path
-        )
-        timed_vectors = _vectors_by_time(turns, vectors)
-        # The global pass names the cast; the registry carries those names forward and
-        # is what scene-level diarization matches against.
-        for speaker_id, (vector, seconds, count) in _label_prototypes(
-            turns, timed_vectors
-        ).items():
-            registry.observe(speaker_id, vector, seconds, turns=count)
-        turns, scene_reports, uncertain, discovered, scene_vectors = _reconcile_scenes(
-            pipeline,
-            source,
-            turns,
-            scenes,
-            registry,
-            mode=mode,
-            suspect_speakers=frozenset(
-                candidate.speaker_id for candidate in candidates
-            ),
-            min_similarity=resolved.diarization_identity_min_similarity,
-            min_margin=resolved.diarization_identity_min_margin,
-        )
-        timed_vectors.update(scene_vectors)
-        turns, merges, suspects = _merge_duplicate_identities(
-            turns,
-            timed_vectors,
-            registry,
-            merge_similarity=resolved.diarization_identity_merge_similarity,
-            suspect_similarity=identity.DEFAULT_SUSPECT_SIMILARITY,
-        )
-        registry_path_written, saved_error = _save_registry(
-            registry, resolved, registry_path=registry_path
-        )
-        registry_error = registry_error or saved_error
+    for merge in merges:
         _LOGGER.info(
-            "Speaker registry: %d identit%s, %d scene(s) diarized on their own",
-            len(registry),
-            "y" if len(registry) == 1 else "ies",
-            sum(1 for report in scene_reports if report.mode == "scene"),
+            "Merged %s into %s (%.2f alike): one person found twice",
+            merge.from_speaker_id,
+            merge.to_speaker_id,
+            merge.similarity,
+        )
+    for reassignment in reassignments:
+        _LOGGER.info(
+            "Moved %.2f-%.2fs from %s to %s (similarity %.2f, margin %.2f)",
+            reassignment.start,
+            reassignment.end,
+            reassignment.original_speaker_id,
+            reassignment.corrected_speaker_id,
+            reassignment.similarity,
+            reassignment.margin,
         )
 
     return DiarizationResult(
         turns=tuple(turns),
         crosstalk=crosstalk,
         corrections=corrections,
-        splits=splits,
-        split_candidates=candidates,
-        scenes=scene_reports,
-        uncertain_speakers=uncertain,
+        raw_turns=tuple(raw_turns),
+        calibration=calibration,
+        reclustering=reclustering,
+        units=len(units),
+        unit_seconds=sum(unit.seconds for unit in units),
+        reassignments=reassignments,
+        windows=windows,
+        uncertain_speakers=uncertain_partition + uncertain_windows,
         merge_suspects=suspects,
         merges=merges,
-        discovered_speakers=discovered,
+        discovered_speakers=tuple(dict.fromkeys(discovered + list(discovered_windows))),
         unmeasured_turns=unmeasured,
-        registry_path=registry_path_written,
+        registry_path=registry_written,
         registry_error=registry_error,
     )
-
-
-def _needs_evidence(
-    turns: Sequence[SpeakerSegment],
-    centroids: Mapping[str, tuple[float, ...]],
-    scenes: Sequence[_Scene],
-    *,
-    mode: str,
-    split: bool,
-    short_turn: float,
-) -> bool:
-    """Return whether anything downstream can use a speaker embedding.
-
-    Embeddings are the expensive part of this module, and a single-scene film needs no
-    scene pass and no registry; the check exists so a run is not made slower for
-    information nothing will read.
-    """
-
-    if len(centroids) >= 2:
-        return True
-    if split:
-        counts: dict[str, int] = {}
-        for segment in turns:
-            if segment.duration >= short_turn:
-                counts[segment.speaker_id] = counts.get(segment.speaker_id, 0) + 1
-        if any(count >= _SPLIT_MIN_CLUSTER_TURNS for count in counts.values()):
-            return True
-    return mode != "off" and len(scenes) > 1
 
 
 def _registry_target(
@@ -2102,24 +2244,6 @@ def _registry_target(
     if settings.diarization_registry_path is not None:
         return Path(settings.diarization_registry_path)
     return Path(settings.work_dir) / identity.DEFAULT_REGISTRY_FILENAME
-
-
-def _load_registry(
-    settings: Settings, *, registry_path: str | Path | None
-) -> tuple[identity.SpeakerRegistry, str]:
-    """Read the run's identities, or start empty and say why if that fails."""
-
-    target = _registry_target(settings, registry_path)
-    if target is None:
-        return identity.SpeakerRegistry(), ""
-    try:
-        registry = identity.SpeakerRegistry.load(target)
-    except (identity.UnreadableRegistryError, OSError) as exc:
-        _LOGGER.warning(
-            "Speaker registry %s could not be read (%s); starting a new one", target, exc
-        )
-        return identity.SpeakerRegistry(), str(exc)
-    return registry, ""
 
 
 def _save_registry(
@@ -2211,13 +2335,12 @@ __all__ = [
     "MissingHuggingFaceTokenError",
     "MissingInputError",
     "ModelInitializationError",
-    "SceneDiarization",
+    "DiarizationWindow",
     "SpeakerAttributionCorrection",
-    "SpeakerClusterSplit",
     "SpeakerIdentityMerge",
     "SpeakerMergeSuspect",
+    "SpeakerReassignment",
     "SpeakerSegment",
-    "SpeakerSplitCandidate",
     "UncertainSpeaker",
     "UnsupportedOutputError",
     "diarize",

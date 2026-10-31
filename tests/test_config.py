@@ -297,13 +297,13 @@ def test_scene_diarization_and_identity_settings_are_configurable(
     assert defaults.diarization_registry_enabled is True
     assert defaults.diarization_registry_path is None
     assert defaults.diarization_short_turn_seconds == 0.5
+    assert defaults.diarization_max_extra_speakers == 3
     payload = defaults.as_dict()
     assert payload["diarization_scene_mode"] == "all"
     assert payload["diarization_registry_path"] is None
 
     monkeypatch.setenv("DIARIZATION_SCENE_MODE", "suspect")
-    monkeypatch.setenv("DIARIZATION_SCENE_GAP_SECONDS", "5")
-    monkeypatch.setenv("DIARIZATION_SCENE_MAX_SECONDS", "90")
+    monkeypatch.setenv("DIARIZATION_MAX_EXTRA_SPEAKERS", "2")
     monkeypatch.setenv("DIARIZATION_REGISTRY_ENABLED", "0")
     monkeypatch.setenv("DIARIZATION_REGISTRY_PATH", "state/speakers.json")
     monkeypatch.setenv("DIARIZATION_IDENTITY_MIN_SIMILARITY", "0.6")
@@ -313,8 +313,7 @@ def test_scene_diarization_and_identity_settings_are_configurable(
 
     settings = Settings.from_env()
     assert settings.diarization_scene_mode == "suspect"
-    assert settings.diarization_scene_gap_seconds == 5.0
-    assert settings.diarization_scene_max_seconds == 90.0
+    assert settings.diarization_max_extra_speakers == 2
     assert settings.diarization_registry_enabled is False
     assert str(settings.diarization_registry_path).endswith("speakers.json")
     assert settings.diarization_identity_min_similarity == 0.6

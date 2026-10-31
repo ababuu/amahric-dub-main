@@ -66,9 +66,9 @@ Environment variables
                       ``all`` (the default) diarizes every scene and reconciles the
                       characters it finds, ``suspect`` only re-diarizes scenes that
                       look under-clustered, ``off`` keeps one global pass.
-``DIARIZATION_SCENE_GAP_SECONDS`` / ``DIARIZATION_SCENE_MAX_SECONDS``
-                      Silence that separates two scenes, and the longest span handed
-                      to the model in one call.
+``DIARIZATION_MAX_EXTRA_SPEAKERS``
+                      How many speakers the global re-partitioning may find beyond the
+                      number pyannote proposed.
 ``DIARIZATION_REGISTRY_ENABLED`` / ``DIARIZATION_REGISTRY_PATH``
                       Whether discovered identities are persisted, and where. The
                       default path lives in ``WORK_DIR``; a re-run of the same film
@@ -135,20 +135,16 @@ DEFAULT_DIARIZATION_MAX_SPEAKERS: Optional[int] = None
 #: reports every split it makes; turn it off to keep exactly the model's own clustering.
 DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS = True
 
-#: How diarization treats the film's scenes. ``all`` diarizes every scene on its own
-#: and reconciles the result with the identities already named, which is what finds a
-#: character whose lines are a few short exchanges scattered through a long film;
-#: ``suspect`` only re-diarizes scenes that look under-clustered, for a cheaper run;
-#: ``off`` keeps one global pass, which is the old behaviour.
+#: How diarization treats dialogue the evidence cannot settle. ``all`` (the default)
+#: diarizes a short suspect window around every ambiguous or overlapping performance;
+#: ``suspect`` behaves the same (windows are inherently suspect-driven) and is kept so
+#: an existing configuration keeps working; ``off`` runs no window pass at all.
 DEFAULT_DIARIZATION_SCENE_MODE = "all"
 
-#: Silence between two turns that makes them different scenes. Films cut on silence and
-#: scene changes, so a gap is the boundary the dialogue itself provides.
-DEFAULT_DIARIZATION_SCENE_GAP_SECONDS = 3.0
-
-#: Longest scene handed to the model in one call. A single unbroken 20-minute stretch of
-#: dialogue is cut here so scene diarization stays bounded in memory and in time.
-DEFAULT_DIARIZATION_SCENE_MAX_SECONDS = 120.0
+#: How many speakers the global re-partitioning may find beyond the number pyannote
+#: proposed. The count itself is discovered: this only bounds the search, so a film can
+#: gain a character the model missed but not an invented cast.
+DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS = 3
 
 #: Whether the identities a run discovers are written to disk and read back on the next
 #: run of the same film, so a character keeps the same id and voice across runs.
@@ -839,13 +835,12 @@ class Settings:
     #: Whether a cluster holding two voices is split, so the second one is not cloned
     #: with the first one's reference.
     diarization_split_mixed_speakers: bool = DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS
-    #: Scene-level diarization: ``all``, ``suspect``, or ``off``. The film is diarized
-    #: scene by scene and the characters found in each are reconciled with a registry of
-    #: identities, so a character with a few short lines keeps one id and one voice.
+    #: Suspect-window diarization: ``all``, ``suspect``, or ``off``. Short windows
+    #: around ambiguous or overlapping dialogue are diarized on their own, so a character
+    #: the film-wide pass missed can still be named.
     diarization_scene_mode: str = DEFAULT_DIARIZATION_SCENE_MODE
-    #: Silence that separates two scenes, and the longest span sent to the model at once.
-    diarization_scene_gap_seconds: float = DEFAULT_DIARIZATION_SCENE_GAP_SECONDS
-    diarization_scene_max_seconds: float = DEFAULT_DIARIZATION_SCENE_MAX_SECONDS
+    #: How many speakers the global re-partitioning may find beyond pyannote's count.
+    diarization_max_extra_speakers: int = DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS
     #: Whether discovered identities persist, and where.
     diarization_registry_enabled: bool = DEFAULT_DIARIZATION_REGISTRY_ENABLED
     diarization_registry_path: Optional[Path] = None
@@ -979,13 +974,9 @@ class Settings:
                 _read_env("DIARIZATION_SCENE_MODE", DEFAULT_DIARIZATION_SCENE_MODE)
                 or DEFAULT_DIARIZATION_SCENE_MODE
             ).lower(),
-            diarization_scene_gap_seconds=_read_float(
-                "DIARIZATION_SCENE_GAP_SECONDS",
-                DEFAULT_DIARIZATION_SCENE_GAP_SECONDS,
-            ),
-            diarization_scene_max_seconds=_read_float(
-                "DIARIZATION_SCENE_MAX_SECONDS",
-                DEFAULT_DIARIZATION_SCENE_MAX_SECONDS,
+            diarization_max_extra_speakers=_read_nonnegative_int(
+                "DIARIZATION_MAX_EXTRA_SPEAKERS",
+                DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS,
             ),
             diarization_registry_enabled=_read_bool(
                 "DIARIZATION_REGISTRY_ENABLED",
@@ -1267,8 +1258,7 @@ class Settings:
             "diarization_max_speakers": self.diarization_max_speakers,
             "diarization_split_mixed_speakers": self.diarization_split_mixed_speakers,
             "diarization_scene_mode": self.diarization_scene_mode,
-            "diarization_scene_gap_seconds": self.diarization_scene_gap_seconds,
-            "diarization_scene_max_seconds": self.diarization_scene_max_seconds,
+            "diarization_max_extra_speakers": self.diarization_max_extra_speakers,
             "diarization_registry_enabled": self.diarization_registry_enabled,
             "diarization_registry_path": (
                 str(self.diarization_registry_path)
@@ -1359,8 +1349,7 @@ __all__ = [
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
     "DEFAULT_DIARIZATION_REGISTRY_ENABLED",
-    "DEFAULT_DIARIZATION_SCENE_GAP_SECONDS",
-    "DEFAULT_DIARIZATION_SCENE_MAX_SECONDS",
+    "DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS",
     "DEFAULT_DIARIZATION_SCENE_MODE",
     "DEFAULT_DIARIZATION_SHORT_TURN_SECONDS",
     "DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS",

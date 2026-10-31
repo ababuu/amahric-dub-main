@@ -145,12 +145,17 @@ class PipelineResult:
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
-    #: Clusters the diarization held two voices in, and the character split off each.
-    speaker_splits: tuple[diarization.SpeakerClusterSplit, ...] = ()
-    #: Clusters that looked like two voices and were left alone, with the reason.
-    split_candidates: tuple[diarization.SpeakerSplitCandidate, ...] = ()
-    #: What each scene's own diarization found, and whether its labels were kept.
-    scene_diarization: tuple[diarization.SceneDiarization, ...] = ()
+    #: pyannote's own speaker labels, before the evidence re-partitioned them.
+    raw_speakers: tuple[str, ...] = ()
+    #: The film's own similarity scale, and the partition chosen from it.
+    calibration: diarization.partition.Calibration | None = None
+    reclustering: diarization.partition.Partition | None = None
+    #: Performances that carried evidence, and every one the partition moved.
+    evidence_units: int = 0
+    evidence_seconds: float = 0.0
+    reassignments: tuple[diarization.SpeakerReassignment, ...] = ()
+    #: What each suspect window's own diarization found, and whether it was kept.
+    windows: tuple[diarization.DiarizationWindow, ...] = ()
     #: Voices that could not be tied to an identity and were given their own.
     uncertain_speakers: tuple[diarization.UncertainSpeaker, ...] = ()
     #: Identity pairs that are suspiciously alike but were deliberately not merged.
@@ -214,6 +219,33 @@ class PipelineResult:
                     "configured" if self.speaker_count_configured else "automatic"
                 ),
                 "unmeasured_turns": self.unmeasured_turns,
+                # pyannote's own answer, kept so the final partition can be compared
+                # with the model's without re-running the film.
+                "original": {
+                    "speakers": list(self.raw_speakers),
+                    "identity_count": len(self.raw_speakers),
+                },
+                # The film's own similarity scale, measured from its embeddings: every
+                # decision below is relative to these numbers, not to a constant.
+                "calibration": (
+                    self.calibration.as_dict() if self.calibration is not None else None
+                ),
+                # The global re-partitioning: what was tried, what was believed, and why
+                # everything else was refused.
+                "reclustering": (
+                    self.reclustering.as_dict()
+                    if self.reclustering is not None
+                    else None
+                ),
+                "evidence": {
+                    "units": self.evidence_units,
+                    "seconds": round(self.evidence_seconds, 3),
+                },
+                # Every performance the evidence moved from pyannote's cluster to
+                # another identity: this is how a scattered character is put together.
+                "reassignments": [
+                    item.as_dict() for item in self.reassignments
+                ],
                 "speaker_corrections": [
                     {
                         "start": correction.start,
@@ -225,39 +257,13 @@ class PipelineResult:
                     }
                     for correction in self.speaker_corrections
                 ],
-                # A cluster that held two voices, split so the second one is not
-                # cloned in the first one's voice.
-                "speaker_splits": [
-                    {
-                        "from": split.speaker_id,
-                        "to": split.new_speaker_id,
-                        "turns": split.turns,
-                        "seconds": round(split.seconds, 3),
-                        "within_similarity": round(split.within_similarity, 4),
-                        "across_similarity": round(split.across_similarity, 4),
-                    }
-                    for split in self.speaker_splits
-                ],
-                # Clusters that looked like two voices and were left alone. Reported
-                # because a merge that was *nearly* caught is worth seeing.
-                "split_candidates": [
-                    candidate.as_dict() for candidate in self.split_candidates
-                ],
-                # Scene-level diarization: what each scene found, and what was kept.
-                "scenes": {
-                    "total": len(self.scene_diarization),
-                    "diarized": sum(
-                        1 for item in self.scene_diarization if item.mode == "scene"
-                    ),
-                    "global": sum(
-                        1 for item in self.scene_diarization if item.mode == "global"
-                    ),
-                    "failed": sum(
-                        1 for item in self.scene_diarization if item.mode == "failed"
-                    ),
-                    "detail": [
-                        item.as_dict() for item in self.scene_diarization
-                    ],
+                # Short windows diarized on their own, and what each one produced.
+                "windows": {
+                    "total": len(self.windows),
+                    "diarized": sum(1 for item in self.windows if item.mode == "window"),
+                    "kept": sum(1 for item in self.windows if item.mode == "kept"),
+                    "failed": sum(1 for item in self.windows if item.mode == "failed"),
+                    "detail": [item.as_dict() for item in self.windows],
                 },
                 "discovered_speakers": list(self.discovered_speakers),
                 "uncertain_speakers": [
@@ -609,41 +615,65 @@ def run_pipeline(
             f"  speaker verification: corrected {len(speaker_corrections)} "
             "high-confidence turn attribution(s)"
         )
-    speaker_splits = tuple(diarized.splits)
-    for split in speaker_splits:
+    if diarized.calibration is not None:
+        calibration = diarized.calibration
         report(
-            f"  speaker split: {split.new_speaker_id} separated from {split.speaker_id} "
-            f"({split.turns} turn(s), {split.seconds:.1f}s; within-similarity "
-            f"{split.within_similarity:.2f}, across {split.across_similarity:.2f})"
+            f"  speaker evidence: {diarized.units} performance(s) / "
+            f"{diarized.unit_seconds:.1f}s; same-voice similarity "
+            f"{calibration.same_similarity:.2f} "
+            f"(within {calibration.within:.2f}, between {calibration.between:.2f})"
+            + ("" if calibration.reliable else "; the configured fallback is in use")
         )
-    scene_reports = tuple(diarized.scenes)
-    scene_reports_kept = tuple(item for item in scene_reports if item.mode == "scene")
-    scene_reports_failed = tuple(item for item in scene_reports if item.mode == "failed")
-    if scene_reports:
+    if diarized.reclustering is not None:
+        outcome = diarized.reclustering
         report(
-            f"  scenes: {len(scene_reports)} diarized on their own, "
-            f"{len(scene_reports_kept)} kept a character the global pass merged"
-            + (f", {len(scene_reports_failed)} could not be diarized" if scene_reports_failed else "")
+            f"  re-partitioning: {outcome.k} speaker(s) at silhouette "
+            f"{outcome.silhouette:.2f}, reproducing {outcome.stability:.2f} - "
+            f"{outcome.reason}"
+        )
+        for candidate in outcome.candidates:
+            if candidate.chosen:
+                continue
+            report(
+                f"    refused {candidate.k} speaker(s): {candidate.reason} "
+                f"(silhouette {candidate.silhouette:.2f}, stability "
+                f"{candidate.stability:.2f})"
+            )
+    raw = diarized.raw_speaker_ids
+    final = diarized.speaker_ids
+    if raw != final:
+        report(
+            f"  identities: pyannote reported {len(raw)} ({', '.join(raw)}), the evidence "
+            f"supports {len(final)} ({', '.join(final)})"
+        )
+    for reassignment in diarized.reassignments:
+        report(
+            f"  reassigned {reassignment.start:.2f}-{reassignment.end:.2f}s from "
+            f"{reassignment.original_speaker_id} to "
+            f"{reassignment.corrected_speaker_id} "
+            f"({reassignment.seconds:.1f}s; similarity {reassignment.similarity:.2f}, "
+            f"margin {reassignment.margin:.2f})"
+        )
+    window_reports = tuple(diarized.windows)
+    if window_reports:
+        report(
+            f"  suspect windows: {len(window_reports)} diarized, "
+            f"{sum(1 for item in window_reports if item.mode == 'window')} corrected a "
+            "fragmented voice, "
+            f"{sum(1 for item in window_reports if item.mode == 'kept')} kept the "
+            "film-wide attribution"
         )
     for uncertain_speaker in diarized.uncertain_speakers:
         report(
             f"  uncertain voice: {uncertain_speaker.speaker_id} "
             f"({uncertain_speaker.seconds:.1f}s; best similarity "
             f"{uncertain_speaker.similarity:.2f}, margin "
-            f"{uncertain_speaker.margin:.2f}); kept as its own speaker rather than "
-            "reusing another character's voice"
+            f"{uncertain_speaker.margin:.2f}); left as it was rather than reassigned"
         )
     for merge in diarized.merges:
         report(
             f"  speaker merge: {merge.from_speaker_id} into {merge.to_speaker_id} "
             f"({merge.similarity:.2f} alike; one person found twice)"
-        )
-    for candidate in diarized.split_candidates:
-        report(
-            f"  merged-speaker candidate: {candidate.speaker_id} looks like two voices "
-            f"({candidate.turns} turn(s), {candidate.seconds:.1f}s, within "
-            f"{candidate.within_similarity:.2f}, across "
-            f"{candidate.across_similarity:.2f}) but was left alone: {candidate.reason}"
         )
     for suspect in diarized.merge_suspects:
         report(
@@ -920,9 +950,13 @@ def run_pipeline(
         lines=lines,
         crosstalk=crosstalk,
         speaker_corrections=speaker_corrections,
-        speaker_splits=speaker_splits,
-        split_candidates=tuple(diarized.split_candidates),
-        scene_diarization=scene_reports,
+        raw_speakers=diarized.raw_speaker_ids,
+        calibration=diarized.calibration,
+        reclustering=diarized.reclustering,
+        evidence_units=diarized.units,
+        evidence_seconds=diarized.unit_seconds,
+        reassignments=tuple(diarized.reassignments),
+        windows=tuple(diarized.windows),
         uncertain_speakers=tuple(diarized.uncertain_speakers),
         merge_suspects=tuple(diarized.merge_suspects),
         speaker_merges=tuple(diarized.merges),

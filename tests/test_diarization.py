@@ -10,6 +10,7 @@ because pyannote itself is mocked and never opens it.
 from __future__ import annotations
 
 import contextlib
+import json
 import dataclasses
 import sys
 import types
@@ -43,6 +44,10 @@ class FakeTurn:
     def __init__(self, start: float, end: float) -> None:
         self.start = start
         self.end = end
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
 
 
 def _scene_base(argument: object) -> float:
@@ -744,8 +749,11 @@ def test_confident_clean_turns_are_reassigned_but_short_and_overlapping_turns_ar
     core_module = types.ModuleType("pyannote.core")
     core_module.Segment = FakeTurn
     monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
+    # This test is about the verification pass alone; the suspect-window pass is
+    # exercised separately and would legitimately rewrite the overlapped turn.
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="off")
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
     assert result.turns == (
         SpeakerSegment("SPEAKER_01", 0.0, 2.0),
@@ -966,149 +974,11 @@ def _install_fake_pyannote_core(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "pyannote.core", core_module)
 
 
-def test_a_cluster_holding_two_voices_is_split(monkeypatch, tmp_path):
-    """The third character in a scene keeps their own voice instead of a neighbour's.
-
-    Six clean turns under one label fall into two groups of three that agree with each
-    other and not across: that is two people the clustering put together.
-    """
-
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_00"),
-        (6.0, 8.0, "SPEAKER_00"),
-        (9.0, 10.6, "SPEAKER_00"),
-        (11.0, 12.6, "SPEAKER_00"),
-        (13.0, 14.6, "SPEAKER_00"),
-    ]
-    vectors = {
-        0.0: [1.0, 0.0, 0.0],
-        3.0: [0.98, 0.1, 0.0],
-        6.0: [1.0, 0.05, 0.05],
-        9.0: [0.0, 1.0, 0.0],
-        11.0: [0.1, 0.98, 0.0],
-        13.0: [0.05, 1.0, 0.1],
-    }
-    crops = _embedding_output(turns, vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert len(result.splits) == 1
-    split = result.splits[0]
-    assert split.speaker_id == "SPEAKER_00"
-    assert split.new_speaker_id == "SPEAKER_01"
-    assert split.turns == 3
-    assert split.seconds == pytest.approx(4.8)
-    assert split.within_similarity > 0.9
-    assert split.across_similarity < 0.2
-    # The three later turns - the quieter voice - are the ones that moved.
-    assert result.turns == (
-        SpeakerSegment("SPEAKER_00", 0.0, 2.0),
-        SpeakerSegment("SPEAKER_00", 3.0, 5.0),
-        SpeakerSegment("SPEAKER_00", 6.0, 8.0),
-        SpeakerSegment("SPEAKER_01", 9.0, 10.6),
-        SpeakerSegment("SPEAKER_01", 11.0, 12.6),
-        SpeakerSegment("SPEAKER_01", 13.0, 14.6),
-    )
-    assert len(crops.crops) == 6
-
-
-def test_one_voice_in_a_cluster_is_left_alone(monkeypatch, tmp_path):
-    """A single speaker is not split just because the pass ran."""
-
-    _patch(monkeypatch)
-    turns = [(float(start), float(start) + 2.0, "SPEAKER_00") for start in (0, 3, 6, 9, 12, 15)]
-    vectors = {float(start): [1.0, 0.05 * index, 0.0] for index, start in enumerate((0, 3, 6, 9, 12, 15))}
-    _embedding_output(turns, vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert result.splits == ()
-    assert {segment.speaker_id for segment in result.turns} == {"SPEAKER_00"}
-
-
-def test_too_little_of_the_second_voice_is_not_a_character(monkeypatch, tmp_path):
-    """Two turns are not a character: they stay where the clustering put them."""
-
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_00"),
-        (6.0, 8.0, "SPEAKER_00"),
-        (9.0, 10.0, "SPEAKER_00"),
-        (11.0, 12.0, "SPEAKER_00"),
-    ]
-    vectors = {
-        0.0: [1.0, 0.0, 0.0],
-        3.0: [0.98, 0.1, 0.0],
-        6.0: [1.0, 0.05, 0.05],
-        9.0: [0.0, 1.0, 0.0],
-        11.0: [0.0, 0.98, 0.1],
-    }
-    _embedding_output(turns, vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert result.splits == ()
-    assert {segment.speaker_id for segment in result.turns} == {"SPEAKER_00"}
-
-
-def test_the_split_can_be_switched_off(monkeypatch, tmp_path):
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_00"),
-        (6.0, 8.0, "SPEAKER_00"),
-        (9.0, 10.6, "SPEAKER_00"),
-        (11.0, 12.6, "SPEAKER_00"),
-        (13.0, 14.6, "SPEAKER_00"),
-    ]
-    vectors = {
-        0.0: [1.0, 0.0, 0.0],
-        3.0: [0.98, 0.1, 0.0],
-        6.0: [1.0, 0.05, 0.05],
-        9.0: [0.0, 1.0, 0.0],
-        11.0: [0.1, 0.98, 0.0],
-        13.0: [0.05, 1.0, 0.1],
-    }
-    crops = _embedding_output(turns, vectors)
-    _install_fake_pyannote_core(monkeypatch)
-    settings = _settings(tmp_path)
-    settings = dataclasses.replace(settings, diarization_split_mixed_speakers=False)
-
-    result = diarize_detailed(_audio(tmp_path), settings=settings)
-
-    assert result.splits == ()
-    assert crops.crops == []
-
-
-def test_a_cluster_with_too_few_clean_turns_is_not_embedded(monkeypatch, tmp_path):
-    """No embedding is spent on a cluster that could not be split anyway."""
-
-    _patch(monkeypatch)
-    turns = [(0.0, 2.0, "SPEAKER_00"), (3.0, 5.0, "SPEAKER_00")]
-    crops = _embedding_output(turns, {0.0: [1.0, 0.0], 3.0: [1.0, 0.0]})
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert result.splits == ()
-    assert crops.crops == []
-
-# ---------------------------------------------------------------------------
-# short dialogue: evidence aggregated across turns, not discarded
-# ---------------------------------------------------------------------------
-
-
 class _Waveform:
     """A crop the embedder turns back into the vector the test scripted.
 
     ``base`` is the film time the crop starts at, which is what pyannote's own
-    scene-relative timestamps are measured from.
+    window-relative timestamps are measured from.
     """
 
     def __init__(self, vector: list[float], base: float = 0.0) -> None:
@@ -1120,11 +990,12 @@ class _Waveform:
 
 
 class _ScriptedAudio:
-    """Return a scripted embedding for a turn, and a scene slice for anything else."""
+    """Return a scripted embedding for a turn, and a window slice for anything else."""
 
     def __init__(self, vectors: dict[tuple[float, float], list[float]]) -> None:
         self.vectors = vectors
         self.turns: list[tuple[float, float]] = []
+        self.padded: list[tuple[float, float]] = []
         self.slices: list[tuple[float, float]] = []
 
     def crop(self, _audio_file, segment, *, mode):  # noqa: ANN001, ANN201
@@ -1133,6 +1004,21 @@ class _ScriptedAudio:
         if key in self.vectors:
             self.turns.append(key)
             return _Waveform(self.vectors[key], base=segment.start), 16000
+        # A turn shorter than the embedding window is embedded inside a padded window;
+        # pyannote hears the turn, so that is the voiceprint the window returns. Window
+        # slices are longer than any padded window and are left untouched.
+        if segment.end - segment.start <= 1.6:
+            # Only scripted turns that fit entirely inside the padded window speak for
+            # it; the most specific (shortest) such turn wins.
+            fits = [
+                (end - start, (start, end))
+                for (start, end) in self.vectors
+                if start >= segment.start - 1e-6 and end <= segment.end + 1e-6
+            ]
+            if fits:
+                fits.sort()
+                self.padded.append(key)
+                return _Waveform(self.vectors[fits[0][1]], base=segment.start), 16000
         self.slices.append(key)
         return _Waveform([0.0, 0.0, 0.0], base=segment.start), 16000
 
@@ -1142,7 +1028,7 @@ def _scripted(
     local_results: list[list[tuple[float, float, str]]],
     vectors: dict[tuple[float, float], list[float]],
 ) -> _ScriptedAudio:
-    """Script the global pass and then each scene pass, in call order."""
+    """Script the global pass and then each suspect window, in call order."""
 
     FakePipeline.results = [_pipeline_output(global_turns)] + [
         _pipeline_output(turns) for turns in local_results
@@ -1165,283 +1051,355 @@ def _centroid_output(
     )
 
 
-def test_short_utterances_are_aggregated_into_one_verification_decision(monkeypatch, tmp_path):
-    """Three lines under 1.5 s, all misattributed, are corrected together.
+# ---------------------------------------------------------------------------
+# global re-partitioning: the scattered character
+# ---------------------------------------------------------------------------
 
-    The old per-turn check discarded every turn under 1.5 s, so a character made only
-    of short lines was never verified at all. Their evidence is aggregated instead.
+_VA = [1.0, 0.0, 0.0, 0.0]
+_VB = [0.0, 1.0, 0.0, 0.0]
+_VC = [0.0, 0.0, 1.0, 0.0]
+
+
+def _scattered_film():
+    """A, B and C where C's lines carry A's label three times and B's once.
+
+    This is the shape the artifacts showed: one character's dialogue spread over both
+    provisional clusters, in short performances, which no per-cluster split can undo.
+    """
+
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (12.0, 13.1, "SPEAKER_00"),
+        (15.0, 16.1, "SPEAKER_00"),
+        (18.0, 19.1, "SPEAKER_00"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        (60.0, 61.1, "SPEAKER_01"),
+        (80.0, 85.0, "SPEAKER_00"),
+        (86.0, 91.0, "SPEAKER_01"),
+    ]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (12.0, 13.1): _VC,
+        (15.0, 16.1): _VC,
+        (18.0, 19.1): _VC,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (60.0, 61.1): _VC,
+        (80.0, 85.0): _VA,
+        (86.0, 91.0): _VB,
+    }
+    return turns, vectors
+
+
+def test_a_voice_scattered_over_two_clusters_becomes_one_identity(monkeypatch, tmp_path):
+    """The three-character regression, at the level where the bug lives.
+
+    pyannote reports two speakers. Character C speaks for 4.4 s in four short
+    performances, three of which carry SPEAKER_00 and one SPEAKER_01. The re-partitioning
+    must produce three identities, put every one of C's performances in the same one, and
+    leave A and B apart.
+    """
+
+    _patch(monkeypatch)
+    turns, vectors = _scattered_film()
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    # pyannote's own answer is kept, untouched, for comparison.
+    assert result.raw_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    # The evidence supports a third character - discovered, not declared.
+    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01", "SPEAKER_02")
+    assert result.discovered_speakers == ("SPEAKER_02",)
+
+    by_start = {round(segment.start, 2): segment.speaker_id for segment in result.turns}
+    scattered = [12.0, 15.0, 18.0, 60.0]
+    assert {by_start[start] for start in scattered} == {"SPEAKER_02"}
+    # A and B are not merged, and keep pyannote's ids.
+    assert {by_start[start] for start in (0.0, 40.0, 80.0)} == {"SPEAKER_00"}
+    assert {by_start[start] for start in (6.0, 46.0, 86.0)} == {"SPEAKER_01"}
+
+    # Every move is recorded with the evidence that justified it.
+    assert len(result.reassignments) == 4
+    assert {item.corrected_speaker_id for item in result.reassignments} == {"SPEAKER_02"}
+    assert all(item.margin > 0 for item in result.reassignments)
+
+    # The partition that produced this is reported, including what was refused.
+    assert result.reclustering is not None
+    assert result.reclustering.accepted is True
+    assert result.reclustering.k == 3
+    assert any(candidate.chosen for candidate in result.reclustering.candidates)
+
+
+def test_the_registry_is_rebuilt_once_from_the_final_partition(monkeypatch, tmp_path):
+    """Evidence is counted once per identity: the previous run reported more speech
+    than the film contained."""
+
+    _patch(monkeypatch)
+    turns, vectors = _scattered_film()
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    registry = json.loads(
+        Path(result.registry_path).read_text(encoding="utf-8")
+    )
+    asserted = sum(speaker["evidence_seconds"] for speaker in registry["speakers"])
+    assert asserted == pytest.approx(result.unit_seconds, abs=1e-3)
+    assert len(registry["speakers"]) == 3
+
+
+def test_a_single_voice_is_not_turned_into_a_cast(monkeypatch, tmp_path):
+    """Noisy short performances of one voice must not become new characters."""
+
+    _patch(monkeypatch)
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    turns = []
+    vectors = {}
+    for index in range(8):
+        start = 3.0 * index
+        turns.append((start, start + 1.2, "SPEAKER_00"))
+        noise = rng.normal(0.0, 0.25, size=4)
+        vectors[(start, start + 1.2)] = [1.0 + noise[0], noise[1], noise[2], noise[3]]
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.speaker_ids == ("SPEAKER_00",)
+    assert result.reassignments == ()
+    assert result.reclustering is not None
+    assert result.reclustering.candidates
+    assert any(
+        "bis" in candidate.reason or "reproduc" in candidate.reason or "silhouette" in candidate.reason
+        for candidate in result.reclustering.candidates
+    )
+
+
+def test_an_undecidable_performance_keeps_pyannotes_identity(monkeypatch, tmp_path):
+    """Never silently assign an uncertain voice: it stays put and is reported."""
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        (60.0, 62.0, "SPEAKER_00"),
+    ]
+    nearly = [0.55, 0.62, 0.0, 0.0]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (60.0, 62.0): nearly,
+    }
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.turns[-1].speaker_id == "SPEAKER_00"
+    assert result.uncertain_speakers
+    assert any(
+        item.speaker_id == "SPEAKER_00" for item in result.uncertain_speakers
+    )
+    assert all(item.reason for item in result.uncertain_speakers)
+
+
+def test_the_repartition_can_be_switched_off(monkeypatch, tmp_path):
+    """A run that wants pyannote's clustering exactly can have it."""
+
+    _patch(monkeypatch)
+    turns, vectors = _scattered_film()
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(
+        _settings(tmp_path), diarization_split_mixed_speakers=False
+    )
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.reassignments == ()
+    assert result.reclustering is not None
+    assert "switched off" in result.reclustering.reason
+
+
+def test_too_few_performances_keep_the_model_labels(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    turns = [(0.0, 5.0, "SPEAKER_00"), (10.0, 15.0, "SPEAKER_01")]
+    _scripted(turns, [], {(0.0, 5.0): _VA, (10.0, 15.0): _VB})
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.reclustering is not None
+    assert result.reclustering.accepted is False
+    assert "reliable performance" in result.reclustering.reason
+
+
+# ---------------------------------------------------------------------------
+# suspect windows
+# ---------------------------------------------------------------------------
+
+
+def test_a_suspect_window_can_move_dialogue_between_existing_identities(
+    monkeypatch, tmp_path
+):
+    """A window is allowed to reassign, not only to add a new character."""
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        (60.0, 62.0, "SPEAKER_00"),
+    ]
+    halfway = [0.6, 0.6, 0.0, 0.0]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (60.0, 62.0): halfway,
+        # The window's own diarization hears that turn as two clean fragments of B.
+        (60.0, 61.0): _VB,
+        (61.0, 62.0): _VB,
+    }
+    _scripted(
+        turns,
+        [[(60.0, 61.0, "SPEAKER_00"), (61.0, 62.0, "SPEAKER_00")]],
+        vectors,
+    )
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert result.windows, "an ambiguous turn should open a suspect window"
+    assert [item.mode for item in result.windows] == ["window"]
+    moved = [segment for segment in result.turns if segment.start >= 60.0]
+    assert {segment.speaker_id for segment in moved} == {"SPEAKER_01"}
+
+
+def test_a_window_that_cannot_be_diarized_keeps_the_attribution(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        (60.0, 62.0, "SPEAKER_00"),
+    ]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (60.0, 62.0): [0.6, 0.6, 0.0, 0.0],
+    }
+    _scripted(turns, [], vectors)
+    FakePipeline.results = [
+        _pipeline_output(turns),
+        object(),
+    ]
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    assert [item.mode for item in result.windows] == ["failed"]
+    assert result.turns[-1].speaker_id == "SPEAKER_00"
+
+
+def test_the_window_pass_can_be_switched_off(monkeypatch, tmp_path):
+    _patch(monkeypatch)
+    turns = [(0.0, 5.0, "SPEAKER_00"), (20.0, 25.0, "SPEAKER_01")]
+    audio = _scripted(turns, [], {(0.0, 5.0): _VA, (20.0, 25.0): _VB})
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="off")
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert result.windows == ()
+    assert audio.slices == []
+
+def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_path):
+    """The regression the artifacts describe, at the timings they measured.
+
+    Two speakers are reported. Character C speaks six short lines - 19.8 s, 105-111 s and
+    214.6 s - five of which pyannote labels SPEAKER_00 and one SPEAKER_01. C must end up
+    as one identity, and A and B must stay apart.
     """
 
     _patch(monkeypatch)
     turns = [
         (0.0, 2.0, "SPEAKER_00"),
-        (4.0, 4.6, "SPEAKER_00"),
-        (5.4, 6.0, "SPEAKER_00"),
-        (6.8, 7.4, "SPEAKER_00"),
-    ]
-    _scripted(
-        turns,
-        [],
-        {
-            (0.0, 2.0): [1.0, 0.0],
-            (4.0, 4.6): [0.0, 1.0],
-            (5.4, 6.0): [0.0, 1.0],
-            (6.8, 7.4): [0.0, 1.0],
-        },
-    )
-    FakePipeline.results = [
-        _centroid_output(
-            turns,
-            [(0.0, 2.0, "SPEAKER_00"), (4.0, 7.4, "SPEAKER_01")],
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-    ]
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    # The 2 s turn is its own performance and was already right.
-    assert result.turns[0] == SpeakerSegment("SPEAKER_00", 0.0, 2.0)
-    # The three short ones were wrong and are corrected as a group.
-    assert [turn.speaker_id for turn in result.turns[1:]] == ["SPEAKER_01"] * 3
-    assert len(result.corrections) == 3
-
-
-def test_one_short_fragment_is_not_enough_to_reassign(monkeypatch, tmp_path):
-    """A single line under 1.5 s is never a decision, however clear the embedding is."""
-
-    _patch(monkeypatch)
-    turns = [(0.0, 2.0, "SPEAKER_00"), (4.0, 4.4, "SPEAKER_00")]
-    _scripted(
-        turns,
-        [],
-        {(0.0, 2.0): [1.0, 0.0], (4.0, 4.4): [0.0, 1.0]},
-    )
-    FakePipeline.results = [
-        _centroid_output(
-            turns,
-            [(0.0, 2.0, "SPEAKER_00"), (4.0, 4.4, "SPEAKER_01")],
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-    ]
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert [turn.speaker_id for turn in result.turns] == ["SPEAKER_00", "SPEAKER_00"]
-    assert result.corrections == ()
-
-
-# ---------------------------------------------------------------------------
-# scene-level diarization: the three-character scene, and identity across scenes
-# ---------------------------------------------------------------------------
-
-_A = [1.0, 0.0, 0.0]
-_B = [0.0, 1.0, 0.0]
-_C = [0.0, 0.0, 1.0]
-
-
-def test_a_character_who_only_says_short_lines_is_separated_in_their_scene(
-    monkeypatch, tmp_path
-):
-    """The known failure: three characters, two labels, and one is only ever brief.
-
-    The global pass puts C inside A's cluster and the split pass cannot rescue them
-    (C has 2.4 s of speech, less than the 4 s a new character must stand on). The
-    scene pass can, because a scene is small enough for the model to hear three voices.
-    """
-
-    _patch(monkeypatch)
-    global_turns = [
-        (0.0, 2.0, "SPEAKER_00"),
         (3.0, 5.0, "SPEAKER_01"),
-        (6.0, 8.0, "SPEAKER_00"),
+        (14.97, 19.31, "SPEAKER_01"),
+        (19.77, 20.43, "SPEAKER_00"),   # C
         (20.0, 22.0, "SPEAKER_00"),
-        (23.0, 23.8, "SPEAKER_00"),
-        (25.0, 25.7, "SPEAKER_00"),
-        (27.0, 27.9, "SPEAKER_00"),
-        (40.0, 42.0, "SPEAKER_01"),
-        (43.0, 45.0, "SPEAKER_00"),
+        (24.63, 25.13, "SPEAKER_00"),
+        (105.75, 106.29, "SPEAKER_00"),  # C
+        (107.78, 109.10, "SPEAKER_00"),  # C
+        (109.89, 110.47, "SPEAKER_00"),  # C
+        (110.66, 111.46, "SPEAKER_01"),  # C
+        (112.23, 113.89, "SPEAKER_01"),
+        (114.09, 116.35, "SPEAKER_01"),
+        (116.67, 121.35, "SPEAKER_01"),
+        (201.52, 203.9, "SPEAKER_00"),
+        (213.57, 214.37, "SPEAKER_00"),
+        (214.59, 215.51, "SPEAKER_00"),  # C
     ]
-    scene_one = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_01"),
-        (6.0, 8.0, "SPEAKER_00"),
-    ]
-    scene_two = [
-        (20.0, 22.0, "SPEAKER_00"),
-        (23.0, 23.8, "SPEAKER_01"),
-        (25.0, 25.7, "SPEAKER_01"),
-        (27.0, 27.9, "SPEAKER_01"),
-    ]
-    scene_three = [(40.0, 42.0, "SPEAKER_01"), (43.0, 45.0, "SPEAKER_00")]
-    vectors = {
-        (0.0, 2.0): _A,
-        (3.0, 5.0): _B,
-        (6.0, 8.0): _A,
-        (20.0, 22.0): _A,
-        (23.0, 23.8): _C,
-        (25.0, 25.7): _C,
-        (27.0, 27.9): _C,
-        (40.0, 42.0): _B,
-        (43.0, 45.0): _A,
+    characters = {
+        (0.0, 2.0): _VA,
+        (3.0, 5.0): _VB,
+        (14.97, 19.31): _VB,
+        (20.0, 22.0): _VA,
+        (24.63, 25.13): _VA,
+        (112.23, 113.89): _VB,
+        (114.09, 116.35): _VB,
+        (116.67, 121.35): _VB,
+        (201.52, 203.9): _VA,
+        (213.57, 214.37): _VA,
     }
-    _scripted(global_turns, [scene_one, scene_two, scene_three], vectors)
+    for start, end, _label in turns:
+        if (start, end) not in characters:
+            characters[(start, end)] = _VC
+
+    _scripted(turns, [], characters)
     _install_fake_pyannote_core(monkeypatch)
 
     result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
 
-    # Three characters, discovered without being told how many there are.
-    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01", "SPEAKER_02")
-    assert result.discovered_speakers == ("SPEAKER_02",)
-    # C's brief lines are the ones that move.
-    recovered = [
-        turn for turn in result.turns if turn.speaker_id == "SPEAKER_02"
-    ]
-    assert [round(turn.start, 2) for turn in recovered] == [23.0, 25.0, 27.0]
-    # The scene that needed it kept its own labels; the others kept the global ones.
-    assert {scene.index: scene.mode for scene in result.scenes} == {
-        0: "global",
-        1: "scene",
-        2: "global",
+    assert result.raw_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    by_start = {round(segment.start, 2): segment.speaker_id for segment in result.turns}
+    # C's lines, all of them, one identity - including the one pyannote gave to B.
+    assert {by_start[start] for start in (19.77, 105.75, 107.78, 109.89, 110.66, 214.59)} == {
+        "SPEAKER_02"
     }
-    # The split pass declined C for want of speech, and said so instead of staying quiet.
-    assert len(result.split_candidates) == 1
-    candidate = result.split_candidates[0]
-    assert candidate.speaker_id == "SPEAKER_00"
-    assert "4.0s" in candidate.reason
-    # The identities were persisted with the run.
-    assert result.registry_path is not None
-    assert Path(result.registry_path).exists()
-
-
-def test_a_character_heard_in_two_scenes_keeps_one_identity(monkeypatch, tmp_path):
-    """The registry is what stops one character becoming two ids, and two voices."""
-
-    _patch(monkeypatch)
-    global_turns = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_01"),
-        (20.0, 22.0, "SPEAKER_00"),
-        (23.0, 23.8, "SPEAKER_00"),
-        (25.0, 25.7, "SPEAKER_00"),
-        (40.0, 42.0, "SPEAKER_00"),
-        (43.0, 43.8, "SPEAKER_00"),
-        (45.0, 45.9, "SPEAKER_00"),
-    ]
-    scene_one = [(0.0, 2.0, "SPEAKER_00"), (3.0, 5.0, "SPEAKER_01")]
-    scene_two = [
-        (20.0, 22.0, "SPEAKER_00"),
-        (23.0, 23.8, "SPEAKER_01"),
-        (25.0, 25.7, "SPEAKER_01"),
-    ]
-    scene_three = [
-        (40.0, 42.0, "SPEAKER_00"),
-        (43.0, 43.8, "SPEAKER_01"),
-        (45.0, 45.9, "SPEAKER_01"),
-    ]
-    vectors = {
-        (0.0, 2.0): _A,
-        (3.0, 5.0): _B,
-        (20.0, 22.0): _A,
-        (23.0, 23.8): _C,
-        (25.0, 25.7): _C,
-        (40.0, 42.0): _A,
-        (43.0, 43.8): _C,
-        (45.0, 45.9): _C,
-    }
-    _scripted(global_turns, [scene_one, scene_two, scene_three], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    # One new character, not one per scene.
-    assert result.discovered_speakers == ("SPEAKER_02",)
-    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01", "SPEAKER_02")
-    in_second_scene = [
-        turn for turn in result.turns if turn.speaker_id == "SPEAKER_02"
-    ]
-    assert [round(turn.start, 2) for turn in in_second_scene] == [23.0, 25.0, 43.0, 45.0]
-    assert sum(1 for scene in result.scenes if scene.mode == "scene") == 2
-
-
-def test_a_voice_too_close_to_two_identities_gets_its_own_and_is_reported(
-    monkeypatch, tmp_path
-):
-    """Never silently assign an uncertain character to another speaker."""
-
-    _patch(monkeypatch)
-    global_turns = [
-        (0.0, 2.0, "SPEAKER_00"),
-        (3.0, 5.0, "SPEAKER_01"),
-        (20.0, 22.0, "SPEAKER_00"),
-        (24.0, 26.0, "SPEAKER_01"),
-    ]
-    scene_one = [(0.0, 2.0, "SPEAKER_00"), (3.0, 5.0, "SPEAKER_01")]
-    scene_two = [
-        (20.0, 21.0, "SPEAKER_00"),
-        (21.5, 23.2, "SPEAKER_02"),
-        (24.0, 26.0, "SPEAKER_01"),
-    ]
-    halfway = [0.70710678, 0.70710678, 0.0]
-    vectors = {
-        (0.0, 2.0): _A,
-        (3.0, 5.0): _B,
-        (20.0, 21.0): _A,
-        (21.5, 23.2): halfway,
-        (24.0, 26.0): _B,
-    }
-    _scripted(global_turns, [scene_one, scene_two], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert len(result.uncertain_speakers) == 1
-    uncertain = result.uncertain_speakers[0]
-    assert uncertain.speaker_id == "SPEAKER_02"
-    assert "too close" in uncertain.reason
-    # It was not folded into either of the identities it resembled.
-    assert SpeakerSegment("SPEAKER_02", 21.5, 23.2) in result.turns
-
-
-def test_a_scene_the_model_cannot_handle_keeps_the_global_attribution(monkeypatch, tmp_path):
-    """A scene pass that fails is reported, never silently substituted."""
-
-    _patch(monkeypatch)
-    global_turns = [
-        (0.0, 3.0, "SPEAKER_00"),
-        (20.0, 23.0, "SPEAKER_00"),
-    ]
-    vectors = {(0.0, 3.0): _A, (20.0, 23.0): _A}
-    _scripted(global_turns, [], vectors)
-    # The first scene call returns something unusable; the second is fine.
-    FakePipeline.results = [
-        _pipeline_output(global_turns),
-        object(),
-        _pipeline_output([(20.0, 23.0, "SPEAKER_00")]),
-    ]
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert [turn.speaker_id for turn in result.turns] == ["SPEAKER_00", "SPEAKER_00"]
-    assert [scene.mode for scene in result.scenes] == ["failed", "global"]
-
-
-def test_scene_diarization_can_be_switched_off(monkeypatch, tmp_path):
-    """``DIARIZATION_SCENE_MODE=off`` keeps one global pass and no scene calls."""
-
-    _patch(monkeypatch)
-    global_turns = [(0.0, 2.0, "SPEAKER_00"), (20.0, 22.0, "SPEAKER_00")]
-    audio = _scripted(
-        global_turns, [], {(0.0, 2.0): _A, (20.0, 22.0): _A}
-    )
-    _install_fake_pyannote_core(monkeypatch)
-    settings = dataclasses.replace(
-        _settings(tmp_path), diarization_scene_mode="off"
-    )
-
-    result = diarize_detailed(_audio(tmp_path), settings=settings)
-
-    assert result.scenes == ()
-    assert audio.slices == []
+    # A and B keep their own identities and are not merged with each other or with C.
+    assert {by_start[start] for start in (0.0, 20.0, 24.63, 201.52, 213.57)} == {"SPEAKER_00"}
+    assert {by_start[start] for start in (3.0, 14.97, 112.23, 114.09, 116.67)} == {"SPEAKER_01"}
+    assert len(result.reassignments) == 6
