@@ -81,6 +81,10 @@ MANIFEST_FILENAME = "manifest.json"
 #: per-source intermediates, kept with the run rather than in ``WORK_DIR``.
 STAGES_DIRNAME = "stages"
 
+#: The identities diarization discovered, kept with the run so a re-run of the same film
+#: reuses them instead of renumbering its characters.
+SPEAKER_REGISTRY_FILENAME = "speaker_registry.json"
+
 #: Stage names, in execution order, as recorded in the manifest.
 STAGE_ORDER: tuple[str, ...] = (
     "extract",
@@ -143,6 +147,26 @@ class PipelineResult:
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
     #: Clusters the diarization held two voices in, and the character split off each.
     speaker_splits: tuple[diarization.SpeakerClusterSplit, ...] = ()
+    #: Clusters that looked like two voices and were left alone, with the reason.
+    split_candidates: tuple[diarization.SpeakerSplitCandidate, ...] = ()
+    #: What each scene's own diarization found, and whether its labels were kept.
+    scene_diarization: tuple[diarization.SceneDiarization, ...] = ()
+    #: Voices that could not be tied to an identity and were given their own.
+    uncertain_speakers: tuple[diarization.UncertainSpeaker, ...] = ()
+    #: Identity pairs that are suspiciously alike but were deliberately not merged.
+    merge_suspects: tuple[diarization.SpeakerMergeSuspect, ...] = ()
+    #: Identity pairs merged as one person discovered twice.
+    speaker_merges: tuple[diarization.SpeakerIdentityMerge, ...] = ()
+    #: Characters only scene-level diarization found.
+    discovered_speakers: tuple[str, ...] = ()
+    #: Turns too short or too overlapped to carry speaker evidence.
+    unmeasured_turns: int = 0
+    #: Where the run persisted its speaker identities, when it did.
+    speaker_registry: Path | None = None
+    #: Why the speaker registry could not be read or written, when that happened.
+    registry_error: str = ""
+    #: ``True`` when the run was given speaker-count bounds instead of discovering them.
+    speaker_count_configured: bool = False
     #: Characters the film gave no usable reference, spoken in a designed voice.
     designed_voices: tuple[DesignedVoice, ...] = ()
 
@@ -184,6 +208,12 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
+                # How the count was arrived at: discovered by the model and scene pass,
+                # or bounded by a configured hint. Never assumed.
+                "speaker_count_source": (
+                    "configured" if self.speaker_count_configured else "automatic"
+                ),
+                "unmeasured_turns": self.unmeasured_turns,
                 "speaker_corrections": [
                     {
                         "start": correction.start,
@@ -208,6 +238,39 @@ class PipelineResult:
                     }
                     for split in self.speaker_splits
                 ],
+                # Clusters that looked like two voices and were left alone. Reported
+                # because a merge that was *nearly* caught is worth seeing.
+                "split_candidates": [
+                    candidate.as_dict() for candidate in self.split_candidates
+                ],
+                # Scene-level diarization: what each scene found, and what was kept.
+                "scenes": {
+                    "total": len(self.scene_diarization),
+                    "diarized": sum(
+                        1 for item in self.scene_diarization if item.mode == "scene"
+                    ),
+                    "global": sum(
+                        1 for item in self.scene_diarization if item.mode == "global"
+                    ),
+                    "failed": sum(
+                        1 for item in self.scene_diarization if item.mode == "failed"
+                    ),
+                    "detail": [
+                        item.as_dict() for item in self.scene_diarization
+                    ],
+                },
+                "discovered_speakers": list(self.discovered_speakers),
+                "uncertain_speakers": [
+                    item.as_dict() for item in self.uncertain_speakers
+                ],
+                "merge_suspects": [item.as_dict() for item in self.merge_suspects],
+                "merges": [item.as_dict() for item in self.speaker_merges],
+                "registry": (
+                    portable_path(self.speaker_registry)
+                    if self.speaker_registry is not None
+                    else None
+                ),
+                "registry_error": self.registry_error or None,
                 # Simultaneous speech the exclusive attribution could not carry.
                 # Reported so a run can be audited for it without re-listening.
                 "crosstalk": {
@@ -530,6 +593,9 @@ def run_pipeline(
         diarization.diarize_detailed,
         stems.speech,
         settings=resolved,
+        # The registry lives with the run, so a re-run of the same film keeps the
+        # identities it established rather than renumbering its characters.
+        registry_path=run_dir / SPEAKER_REGISTRY_FILENAME,
     )
     turns = tuple(diarized.turns)
     if not turns:
@@ -550,6 +616,42 @@ def run_pipeline(
             f"({split.turns} turn(s), {split.seconds:.1f}s; within-similarity "
             f"{split.within_similarity:.2f}, across {split.across_similarity:.2f})"
         )
+    scene_reports = tuple(diarized.scenes)
+    scene_reports_kept = tuple(item for item in scene_reports if item.mode == "scene")
+    scene_reports_failed = tuple(item for item in scene_reports if item.mode == "failed")
+    if scene_reports:
+        report(
+            f"  scenes: {len(scene_reports)} diarized on their own, "
+            f"{len(scene_reports_kept)} kept a character the global pass merged"
+            + (f", {len(scene_reports_failed)} could not be diarized" if scene_reports_failed else "")
+        )
+    for uncertain_speaker in diarized.uncertain_speakers:
+        report(
+            f"  uncertain voice: {uncertain_speaker.speaker_id} "
+            f"({uncertain_speaker.seconds:.1f}s; best similarity "
+            f"{uncertain_speaker.similarity:.2f}, margin "
+            f"{uncertain_speaker.margin:.2f}); kept as its own speaker rather than "
+            "reusing another character's voice"
+        )
+    for merge in diarized.merges:
+        report(
+            f"  speaker merge: {merge.from_speaker_id} into {merge.to_speaker_id} "
+            f"({merge.similarity:.2f} alike; one person found twice)"
+        )
+    for candidate in diarized.split_candidates:
+        report(
+            f"  merged-speaker candidate: {candidate.speaker_id} looks like two voices "
+            f"({candidate.turns} turn(s), {candidate.seconds:.1f}s, within "
+            f"{candidate.within_similarity:.2f}, across "
+            f"{candidate.across_similarity:.2f}) but was left alone: {candidate.reason}"
+        )
+    for suspect in diarized.merge_suspects:
+        report(
+            f"  merge suspect: {suspect.speaker_ids[0]} and {suspect.speaker_ids[1]} "
+            f"are {suspect.similarity:.2f} alike; left separate on purpose"
+        )
+    if diarized.registry_error:
+        report(f"  speaker registry: {diarized.registry_error}")
     if crosstalk:
         report(
             f"  crosstalk: {len(crosstalk)} region(s), "
@@ -819,6 +921,21 @@ def run_pipeline(
         crosstalk=crosstalk,
         speaker_corrections=speaker_corrections,
         speaker_splits=speaker_splits,
+        split_candidates=tuple(diarized.split_candidates),
+        scene_diarization=scene_reports,
+        uncertain_speakers=tuple(diarized.uncertain_speakers),
+        merge_suspects=tuple(diarized.merge_suspects),
+        speaker_merges=tuple(diarized.merges),
+        discovered_speakers=tuple(diarized.discovered_speakers),
+        unmeasured_turns=diarized.unmeasured_turns,
+        speaker_registry=(
+            Path(diarized.registry_path) if diarized.registry_path else None
+        ),
+        registry_error=diarized.registry_error,
+        speaker_count_configured=(
+            resolved.diarization_min_speakers is not None
+            or resolved.diarization_max_speakers is not None
+        ),
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,

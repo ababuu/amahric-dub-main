@@ -287,6 +287,42 @@ def test_diarization_speaker_counts_are_optional_and_configurable(
     assert settings.as_dict()["diarization_max_speakers"] == 12
 
 
+def test_scene_diarization_and_identity_settings_are_configurable(
+    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+) -> None:
+    """The speaker count stays automatic; scenes and identities are tunable."""
+
+    defaults = Settings.from_env()
+    assert defaults.diarization_scene_mode == "all"
+    assert defaults.diarization_registry_enabled is True
+    assert defaults.diarization_registry_path is None
+    assert defaults.diarization_short_turn_seconds == 0.5
+    payload = defaults.as_dict()
+    assert payload["diarization_scene_mode"] == "all"
+    assert payload["diarization_registry_path"] is None
+
+    monkeypatch.setenv("DIARIZATION_SCENE_MODE", "suspect")
+    monkeypatch.setenv("DIARIZATION_SCENE_GAP_SECONDS", "5")
+    monkeypatch.setenv("DIARIZATION_SCENE_MAX_SECONDS", "90")
+    monkeypatch.setenv("DIARIZATION_REGISTRY_ENABLED", "0")
+    monkeypatch.setenv("DIARIZATION_REGISTRY_PATH", "state/speakers.json")
+    monkeypatch.setenv("DIARIZATION_IDENTITY_MIN_SIMILARITY", "0.6")
+    monkeypatch.setenv("DIARIZATION_IDENTITY_MIN_MARGIN", "0.1")
+    monkeypatch.setenv("DIARIZATION_IDENTITY_MERGE_SIMILARITY", "0.92")
+    monkeypatch.setenv("DIARIZATION_SHORT_TURN_SECONDS", "0.4")
+
+    settings = Settings.from_env()
+    assert settings.diarization_scene_mode == "suspect"
+    assert settings.diarization_scene_gap_seconds == 5.0
+    assert settings.diarization_scene_max_seconds == 90.0
+    assert settings.diarization_registry_enabled is False
+    assert str(settings.diarization_registry_path).endswith("speakers.json")
+    assert settings.diarization_identity_min_similarity == 0.6
+    assert settings.diarization_identity_min_margin == 0.1
+    assert settings.diarization_identity_merge_similarity == 0.92
+    assert settings.diarization_short_turn_seconds == 0.4
+
+
 def test_a_malformed_speaker_count_is_rejected(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:

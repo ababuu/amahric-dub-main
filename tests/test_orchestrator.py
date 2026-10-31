@@ -187,6 +187,7 @@ class Stages:
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
         self.seen_crosstalk: object = ()
+        self.registry_path: Path | None = None
         self.track = root / "stages" / "movie_mix.wav"
 
     def _record(self, name: str, *args: object) -> None:
@@ -217,10 +218,13 @@ class Stages:
             effects=output_dir / "movie_effects.wav",
         )
 
-    def diarize_detailed(self, speech: Path, *, settings: Settings):  # noqa: ANN201
+    def diarize_detailed(
+        self, speech: Path, *, settings: Settings, registry_path: Path | None = None
+    ):  # noqa: ANN201
         from app.pipeline.diarization import DiarizationResult
 
         self._record("diarization", speech, settings)
+        self.registry_path = registry_path
         return DiarizationResult(turns=tuple(self.turns), crosstalk=tuple(self.crosstalk))
 
     def transcribe(
@@ -507,11 +511,29 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["final_video"] == result.to_dict()["final_video"]
     assert payload["run"]["synthesized_lines"] == len(result.clips)
     assert payload["run"]["partial"] is False
-    assert payload["run"]["diarization"] == {
-        "turns": 1,
-        "speakers": [SPEAKER],
-        "crosstalk": {"regions": 0, "seconds": 0.0, "detail": []},
+    diarization_block = payload["run"]["diarization"]
+    assert diarization_block["turns"] == 1
+    assert diarization_block["speakers"] == [SPEAKER]
+    assert diarization_block["crosstalk"] == {"regions": 0, "seconds": 0.0, "detail": []}
+    # The speaker count is discovered unless a run is given bounds, and the manifest
+    # says which it was.
+    assert diarization_block["speaker_count_source"] == "automatic"
+    # Nothing about character identity is decided quietly: an empty QC block means the
+    # run had nothing to report, not that the checks were skipped.
+    assert diarization_block["speaker_corrections"] == []
+    assert diarization_block["speaker_splits"] == []
+    assert diarization_block["split_candidates"] == []
+    assert diarization_block["uncertain_speakers"] == []
+    assert diarization_block["merge_suspects"] == []
+    assert diarization_block["merges"] == []
+    assert diarization_block["scenes"] == {
+        "total": 0,
+        "diarized": 0,
+        "global": 0,
+        "failed": 0,
+        "detail": [],
     }
+    assert diarization_block["registry"] is None
     assert payload["run"]["tts"]["clips"][0]["amharic"] == stages.dialogue[0].amharic
     assert payload["run"]["voice_profiles"][SPEAKER]["reference_duration"] == 5.0
     assert payload["run"]["timing"]["lines"] == len(result.alignment)

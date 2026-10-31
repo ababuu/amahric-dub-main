@@ -59,8 +59,27 @@ Environment variables
                       Preferred length of a voice-cloning reference, in seconds.
 ``TTS_MODEL``         Amharic speech adapter used by the TTS stage.``DIARIZATION_MIN_SPEAKERS`` / ``DIARIZATION_MAX_SPEAKERS``
                       Optional bounds on how many speakers diarization may find.
-                      A cast list turns these into the strongest single guard
-                      against a character splitting into several clusters.
+                      Unset means the model decides, and scene-level diarization
+                      then names the characters it finds; there is no global
+                      speaker limit.
+``DIARIZATION_SCENE_MODE``
+                      ``all`` (the default) diarizes every scene and reconciles the
+                      characters it finds, ``suspect`` only re-diarizes scenes that
+                      look under-clustered, ``off`` keeps one global pass.
+``DIARIZATION_SCENE_GAP_SECONDS`` / ``DIARIZATION_SCENE_MAX_SECONDS``
+                      Silence that separates two scenes, and the longest span handed
+                      to the model in one call.
+``DIARIZATION_REGISTRY_ENABLED`` / ``DIARIZATION_REGISTRY_PATH``
+                      Whether discovered identities are persisted, and where. The
+                      default path lives in ``WORK_DIR``; a re-run of the same film
+                      reuses the identities it established.
+``DIARIZATION_IDENTITY_MIN_SIMILARITY`` / ``..._MIN_MARGIN`` / ``..._MERGE_SIMILARITY``
+                      How similar a scene's voiceprint must be to an existing
+                      character to reuse that id, how far ahead of the runner-up it
+                      must be, and when two ids are merged as one person.
+``DIARIZATION_SHORT_TURN_SECONDS``
+                      Shortest turn that carries speaker evidence on its own; shorter
+                      fragments are aggregated with their neighbours instead.
 ``TTS_MAX_PAUSE_SECONDS``
                       Longest pause rendered around a synthesized line.
 ``TTS_MIN_LINE_SECONDS``
@@ -115,6 +134,41 @@ DEFAULT_DIARIZATION_MAX_SPEAKERS: Optional[int] = None
 #: the whole film, which is audible everywhere they speak. The pass is conservative and
 #: reports every split it makes; turn it off to keep exactly the model's own clustering.
 DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS = True
+
+#: How diarization treats the film's scenes. ``all`` diarizes every scene on its own
+#: and reconciles the result with the identities already named, which is what finds a
+#: character whose lines are a few short exchanges scattered through a long film;
+#: ``suspect`` only re-diarizes scenes that look under-clustered, for a cheaper run;
+#: ``off`` keeps one global pass, which is the old behaviour.
+DEFAULT_DIARIZATION_SCENE_MODE = "all"
+
+#: Silence between two turns that makes them different scenes. Films cut on silence and
+#: scene changes, so a gap is the boundary the dialogue itself provides.
+DEFAULT_DIARIZATION_SCENE_GAP_SECONDS = 3.0
+
+#: Longest scene handed to the model in one call. A single unbroken 20-minute stretch of
+#: dialogue is cut here so scene diarization stays bounded in memory and in time.
+DEFAULT_DIARIZATION_SCENE_MAX_SECONDS = 120.0
+
+#: Whether the identities a run discovers are written to disk and read back on the next
+#: run of the same film, so a character keeps the same id and voice across runs.
+DEFAULT_DIARIZATION_REGISTRY_ENABLED = True
+
+#: Cosine similarity a scene's voiceprint needs to reuse an identity the run already
+#: named. Below it the registry mints a new speaker instead of guessing.
+DEFAULT_DIARIZATION_IDENTITY_MIN_SIMILARITY = 0.55
+
+#: How far the best identity must beat the runner-up before it is reused. Inside this
+#: margin the two voices are not separable, so a new identity is minted and reported as
+#: uncertain rather than folding two characters into one voice.
+DEFAULT_DIARIZATION_IDENTITY_MIN_MARGIN = 0.08
+
+#: Two identities this similar are merged as one person discovered twice.
+DEFAULT_DIARIZATION_IDENTITY_MERGE_SIMILARITY = 0.90
+
+#: Shortest turn that can carry speaker evidence on its own. pyannote's speaker
+#: embedding needs about half a second; shorter fragments are counted, never decided on.
+DEFAULT_DIARIZATION_SHORT_TURN_SECONDS = 0.5
 
 #: faster-whisper model used to transcribe the dialogue stem.
 DEFAULT_TRANSCRIPTION_MODEL = "large-v3"
@@ -785,6 +839,27 @@ class Settings:
     #: Whether a cluster holding two voices is split, so the second one is not cloned
     #: with the first one's reference.
     diarization_split_mixed_speakers: bool = DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS
+    #: Scene-level diarization: ``all``, ``suspect``, or ``off``. The film is diarized
+    #: scene by scene and the characters found in each are reconciled with a registry of
+    #: identities, so a character with a few short lines keeps one id and one voice.
+    diarization_scene_mode: str = DEFAULT_DIARIZATION_SCENE_MODE
+    #: Silence that separates two scenes, and the longest span sent to the model at once.
+    diarization_scene_gap_seconds: float = DEFAULT_DIARIZATION_SCENE_GAP_SECONDS
+    diarization_scene_max_seconds: float = DEFAULT_DIARIZATION_SCENE_MAX_SECONDS
+    #: Whether discovered identities persist, and where.
+    diarization_registry_enabled: bool = DEFAULT_DIARIZATION_REGISTRY_ENABLED
+    diarization_registry_path: Optional[Path] = None
+    #: How sure the registry must be before a scene's voice reuses an identity, and when
+    #: two identities are one person.
+    diarization_identity_min_similarity: float = (
+        DEFAULT_DIARIZATION_IDENTITY_MIN_SIMILARITY
+    )
+    diarization_identity_min_margin: float = DEFAULT_DIARIZATION_IDENTITY_MIN_MARGIN
+    diarization_identity_merge_similarity: float = (
+        DEFAULT_DIARIZATION_IDENTITY_MERGE_SIMILARITY
+    )
+    #: Shortest turn that carries speaker evidence on its own.
+    diarization_short_turn_seconds: float = DEFAULT_DIARIZATION_SHORT_TURN_SECONDS
     #: faster-whisper model and CTranslate2 compute type for transcription.
     transcription_model: str = DEFAULT_TRANSCRIPTION_MODEL
     transcription_compute_type: str = DEFAULT_TRANSCRIPTION_COMPUTE_TYPE
@@ -899,6 +974,43 @@ class Settings:
             diarization_split_mixed_speakers=_read_bool(
                 "DIARIZATION_SPLIT_MIXED_SPEAKERS",
                 DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS,
+            ),
+            diarization_scene_mode=(
+                _read_env("DIARIZATION_SCENE_MODE", DEFAULT_DIARIZATION_SCENE_MODE)
+                or DEFAULT_DIARIZATION_SCENE_MODE
+            ).lower(),
+            diarization_scene_gap_seconds=_read_float(
+                "DIARIZATION_SCENE_GAP_SECONDS",
+                DEFAULT_DIARIZATION_SCENE_GAP_SECONDS,
+            ),
+            diarization_scene_max_seconds=_read_float(
+                "DIARIZATION_SCENE_MAX_SECONDS",
+                DEFAULT_DIARIZATION_SCENE_MAX_SECONDS,
+            ),
+            diarization_registry_enabled=_read_bool(
+                "DIARIZATION_REGISTRY_ENABLED",
+                DEFAULT_DIARIZATION_REGISTRY_ENABLED,
+            ),
+            diarization_registry_path=(
+                Path(_read_env("DIARIZATION_REGISTRY_PATH"))
+                if _read_env("DIARIZATION_REGISTRY_PATH")
+                else None
+            ),
+            diarization_identity_min_similarity=_read_float(
+                "DIARIZATION_IDENTITY_MIN_SIMILARITY",
+                DEFAULT_DIARIZATION_IDENTITY_MIN_SIMILARITY,
+            ),
+            diarization_identity_min_margin=_read_float(
+                "DIARIZATION_IDENTITY_MIN_MARGIN",
+                DEFAULT_DIARIZATION_IDENTITY_MIN_MARGIN,
+            ),
+            diarization_identity_merge_similarity=_read_float(
+                "DIARIZATION_IDENTITY_MERGE_SIMILARITY",
+                DEFAULT_DIARIZATION_IDENTITY_MERGE_SIMILARITY,
+            ),
+            diarization_short_turn_seconds=_read_float(
+                "DIARIZATION_SHORT_TURN_SECONDS",
+                DEFAULT_DIARIZATION_SHORT_TURN_SECONDS,
             ),
             transcription_model=(
                 _read_env("TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL)
@@ -1154,6 +1266,23 @@ class Settings:
             "diarization_min_speakers": self.diarization_min_speakers,
             "diarization_max_speakers": self.diarization_max_speakers,
             "diarization_split_mixed_speakers": self.diarization_split_mixed_speakers,
+            "diarization_scene_mode": self.diarization_scene_mode,
+            "diarization_scene_gap_seconds": self.diarization_scene_gap_seconds,
+            "diarization_scene_max_seconds": self.diarization_scene_max_seconds,
+            "diarization_registry_enabled": self.diarization_registry_enabled,
+            "diarization_registry_path": (
+                str(self.diarization_registry_path)
+                if self.diarization_registry_path is not None
+                else None
+            ),
+            "diarization_identity_min_similarity": (
+                self.diarization_identity_min_similarity
+            ),
+            "diarization_identity_min_margin": self.diarization_identity_min_margin,
+            "diarization_identity_merge_similarity": (
+                self.diarization_identity_merge_similarity
+            ),
+            "diarization_short_turn_seconds": self.diarization_short_turn_seconds,
             "transcription_model": self.transcription_model,
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
@@ -1223,9 +1352,17 @@ __all__ = [
     "DEFAULT_OMNIVOICE_TORCH_DTYPE",
     "DEFAULT_DIALOGUE_BIBLE_FILENAME",
     "DEFAULT_DIALOGUE_BIBLE_PATH",
+    "DEFAULT_DIARIZATION_IDENTITY_MERGE_SIMILARITY",
+    "DEFAULT_DIARIZATION_IDENTITY_MIN_MARGIN",
+    "DEFAULT_DIARIZATION_IDENTITY_MIN_SIMILARITY",
     "DEFAULT_DIARIZATION_MAX_SPEAKERS",
     "DEFAULT_DIARIZATION_MIN_SPEAKERS",
     "DEFAULT_DIARIZATION_MODEL",
+    "DEFAULT_DIARIZATION_REGISTRY_ENABLED",
+    "DEFAULT_DIARIZATION_SCENE_GAP_SECONDS",
+    "DEFAULT_DIARIZATION_SCENE_MAX_SECONDS",
+    "DEFAULT_DIARIZATION_SCENE_MODE",
+    "DEFAULT_DIARIZATION_SHORT_TURN_SECONDS",
     "DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS",
     "DEFAULT_MIX_DIALOGUE_GAIN_DB",
     "DEFAULT_MIX_DUCK_DB",
