@@ -444,8 +444,8 @@ def repartition(
     calibration: Calibration,
     *,
     max_extra: int = 3,
-    min_cluster_units: int = 2,
-    min_cluster_seconds: float = 0.5,
+    min_cluster_units: int = 3,
+    min_cluster_seconds: float = 4.0,
     repeats: int = 5,
 ) -> Partition:
     """Find the partition of ``units`` the evidence supports, or keep the provisional one.
@@ -455,13 +455,6 @@ def repartition(
     two proposed speakers is the failure this module exists to prevent - a merge is only
     accepted when the evidence for it is far stronger than the evidence for keeping them
     apart.
-
-    The size guards here are about *proposing* a cluster, not about establishing a
-    character. Two independent, cohesive, well-separated performances are a candidate
-    voice however briefly it speaks; whether that voice is an established character is
-    decided afterwards, from its accumulated evidence, by
-    :func:`app.pipeline.speaker_identity.assess_identity`. Keeping the two questions
-    apart is what lets a character whose lines are all short exist at all.
     """
 
     if len(units) < max(2, min_cluster_units):
