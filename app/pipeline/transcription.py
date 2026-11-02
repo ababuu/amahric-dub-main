@@ -549,6 +549,11 @@ MAX_SENTENCE_GAP_SECONDS = 2.0
 MAX_SENTENCE_SECONDS = 12.0
 MAX_SENTENCE_PARTS = 6
 
+#: Slack allowed when checking that a sentence's span covers its parts. Transcribed
+#: timestamps are rounded to the millisecond, so an exact comparison would reject
+#: sentences that are in fact correct.
+_SPAN_TOLERANCE = 1e-3
+
 #: Characters that end a sentence in the languages this pipeline transcribes.
 _TERMINAL_PUNCTUATION = (".", "!", "?", "\u2026", "\u1362", "\u1367")
 
@@ -663,6 +668,18 @@ class DialogueSentence:
                     f"parts[{index}] belongs to {part.speaker_id!r}, not {self.speaker_id!r}"
                 )
 
+        # The sentence's span must cover every part: the parts are the moments the actor
+        # actually spoke, and a span narrower than one of them would make the line's
+        # timing disagree with its own text - which is how a performance beat ends up
+        # asking for audio outside the line it belongs to.
+        first = min(part.start for part in parts)
+        last = max(part.end for part in parts)
+        if start > first + _SPAN_TOLERANCE or end < last - _SPAN_TOLERANCE:
+            raise InvalidSegmentError(
+                f"the span ({start}-{end}s) does not cover its parts "
+                f"({first}-{last}s)"
+            )
+
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
         object.__setattr__(self, "text", self.text.strip())
@@ -715,11 +732,17 @@ def assemble_sentences(
 
     def flush() -> None:
         if parts:
+            # The span is the union of the parts, not the first part's start and the
+            # last part's end. Transcribed segments can overlap - a turn boundary inside
+            # a word gives "Don't lay that on me." ending at 14.929 and "on." starting at
+            # 14.510 - and taking the last part's end then *truncates* the sentence, which
+            # leaves the earlier part reaching past its own line. The line's timing is
+            # what the timing stage fits the dub into, so it must cover every part.
             sentences.append(
                 DialogueSentence(
                     speaker_id=parts[0].speaker_id,
-                    start=parts[0].start,
-                    end=parts[-1].end,
+                    start=min(part.start for part in parts),
+                    end=max(part.end for part in parts),
                     text=_join_sentence_parts(parts),
                     parts=tuple(parts),
                 )

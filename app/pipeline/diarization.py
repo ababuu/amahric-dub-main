@@ -1338,11 +1338,14 @@ def _apply_partition(
 ]:
     """Move each performance to the identity the evidence supports, or leave it alone.
 
-    A performance only moves when the cluster it was put in beats the next best by
-    ``calibration.margin``. That is the rule that stops a 0.6 s fragment being handed to
-    a character on the strength of one embedding: the ambiguity is reported (as a count
-    of undecided performances, not as an "uncertain speaker" - the speaker it stays with
-    is the one that is not in doubt) and the turn keeps the identity pyannote gave it.
+    A performance only moves when *both* hold: the identity it is being moved to is at
+    least as similar as the film's own same-voice threshold, and it beats the next best
+    identity by ``calibration.margin``. The margin alone is not enough - on a film whose
+    two identities sit 0.8 apart, a turn that resembles neither can still win by a clear
+    margin, and moving it would be a guess dressed as a decision. The ambiguity is
+    reported (as a count of undecided performances, not as an "uncertain speaker" - the
+    speaker it stays with is the one that is not in doubt) and the turn keeps the
+    identity pyannote gave it.
     """
 
     assignments: list[str] = []
@@ -1357,7 +1360,9 @@ def _apply_partition(
         best_score = scores[0][1] if scores else -1.0
         rival = max((score for cluster, score in scores if cluster != label), default=-1.0)
         margin = best_score - rival
-        if target != unit.speaker_id and margin < calibration.margin:
+        if target != unit.speaker_id and (
+            margin < calibration.margin or best_score < calibration.same_similarity
+        ):
             assignments.append(unit.speaker_id)
             undecided += 1
             undecided_seconds += unit.speech_seconds
@@ -1664,14 +1669,31 @@ def _vectors_by_time(
 def _label_prototypes(
     segments: Sequence[SpeakerSegment],
     vectors: Mapping[tuple[float, float], tuple[float, ...]],
+    *,
+    minimum_seconds: float = 0.0,
 ) -> dict[str, tuple[tuple[float, ...], float, int]]:
-    """Return each speaker's voiceprint, the seconds behind it, and its turn count."""
+    """Return each speaker's voiceprint, the seconds behind it, and its turn count.
+
+    ``minimum_seconds`` keeps short, padded turns out of the voiceprint. That matters for
+    any *decision*: a padded 0.6 s line is a usable voiceprint but a noisy one, and mixing
+    many of them into two identity prototypes pulls both towards the film's common
+    direction and makes two clearly different people look alike. When a speaker has no
+    turn that long, all of their turns are used rather than none.
+    """
 
     grouped: dict[str, list[tuple[SpeakerSegment, tuple[float, ...]]]] = {}
     for segment in segments:
         vector = vectors.get((round(segment.start, 6), round(segment.end, 6)))
         if vector is not None:
             grouped.setdefault(segment.speaker_id, []).append((segment, vector))
+    if minimum_seconds > 0:
+        grouped = {
+            speaker_id: [
+                entry for entry in entries if entry[0].duration >= minimum_seconds
+            ]
+            or entries
+            for speaker_id, entries in grouped.items()
+        }
     prototypes: dict[str, tuple[tuple[float, ...], float, int]] = {}
     for speaker_id, entries in grouped.items():
         vector = _weighted_mean(
@@ -2328,13 +2350,19 @@ def diarize_detailed(
 
     timed_vectors = _vectors_by_time(turns, vectors)
     timed_vectors.update(window_vectors)
-    prototypes = _label_prototypes(turns, timed_vectors)
+    # The merge check and the calibration must speak the same language: both are about
+    # *who someone is*, so both use only turns long enough to carry a clean voiceprint.
+    # Mixing padded short turns into the prototypes is what makes two clearly different
+    # people look 0.84 alike while their long turns sit 0.00 apart.
+    clean_prototypes = _label_prototypes(
+        turns, timed_vectors, minimum_seconds=partition.CLEAN_UNIT_SECONDS
+    )
     _registry, registry_written, registry_error = _rebuild_registry(
         turns, timed_vectors, resolved, registry_path=registry_path
     )
     suspects = _suspect_pairs(
-        {speaker_id: entry[0] for speaker_id, entry in prototypes.items()},
-        {speaker_id: entry[1] for speaker_id, entry in prototypes.items()},
+        {speaker_id: entry[0] for speaker_id, entry in clean_prototypes.items()},
+        {speaker_id: entry[1] for speaker_id, entry in clean_prototypes.items()},
         calibration,
     )
 

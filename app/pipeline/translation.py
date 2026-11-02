@@ -1012,6 +1012,35 @@ def _clip_beat(
     return clipped_start, clipped_end
 
 
+def _clipped_parts(
+    parts: Sequence[Any], *, line_start: float, line_end: float
+) -> dict[int, tuple[float, float]]:
+    """Return each part's interval, clipped into the line and stripped of overlaps.
+
+    The mapping is keyed by the part's 1-based number, so a beat can still be matched to
+    the part the model named. Transcribed segments overlap whenever a turn boundary falls
+    inside a word, so two parts can cover the same instant; beats are a sequence and
+    ``AdaptedDialogue`` requires them not to overlap, so the overlap is resolved here, in
+    the one place the timings are already being adjusted: a part that starts before the
+    previous one ends is moved up to that end. A part left with no duration is dropped.
+    """
+
+    intervals: dict[int, tuple[float, float]] = {}
+    previous_end = line_start
+    for number, part in enumerate(parts, start=1):
+        interval = _clip_beat(
+            part.start, part.end, line_start=line_start, line_end=line_end
+        )
+        if interval is None:
+            continue
+        start = max(interval[0], previous_end)
+        if interval[1] - start <= TIMESTAMP_TOLERANCE:
+            continue
+        intervals[number] = (start, interval[1])
+        previous_end = interval[1]
+    return intervals
+
+
 def _beats_from(
     raw: Any,
     parts: Sequence[Any],
@@ -1030,30 +1059,28 @@ def _beats_from(
     error (an unknown or repeated part number) is reported as invalid model output:
     the application will not guess which part was meant.
 
-    Every beat is clipped to the line's own interval before it is built. The parts are
-    meant to be inside the line, but nothing enforces that, and a part that reaches
-    past the line's end used to produce a beat ``AdaptedDialogue`` then rejected -
-    which failed the whole batch over metadata nobody listens to. The line's text and
-    timing are the application's and are never changed here.
+    Every beat is clipped to the line's own interval *and* to the end of the beat before
+    it. Parts are meant to sit inside the line and to follow one another, but nothing
+    guarantees either - a turn boundary inside a word makes them overlap - and a beat
+    that violated that used to fail the whole batch over metadata nobody listens to.
+    The line's text and timing are the application's and are never changed here.
     """
 
     if len(parts) < 2:
         return ()
+    intervals = _clipped_parts(parts, line_start=line_start, line_end=line_end)
+    if not intervals:
+        return ()
     if raw is None:
-        clipped = (
-            _clip_beat(part.start, part.end, line_start=line_start, line_end=line_end)
-            for part in parts
-        )
         return tuple(
             PerformanceBeat(
-                start=interval[0],
-                end=interval[1],
+                start=intervals[number][0],
+                end=intervals[number][1],
                 emotion=fallback[0],
                 intensity=fallback[1],
                 delivery=fallback[2],
             )
-            for interval in clipped
-            if interval is not None
+            for number in sorted(intervals)
         )
     if not isinstance(raw, list):
         raise InvalidModelOutputError(
@@ -1087,10 +1114,7 @@ def _beats_from(
             raise InvalidModelOutputError(
                 f"the model returned part {number} more than once"
             )
-        part = parts[number - 1]
-        interval = _clip_beat(
-            part.start, part.end, line_start=line_start, line_end=line_end
-        )
+        interval = intervals.get(number)
         if interval is None:
             # The whole part is outside the line: there is no moment of this line for
             # the direction to apply to, so it is dropped rather than misplaced.
@@ -1110,15 +1134,11 @@ def _beats_from(
             ) from exc
 
     beats: list[PerformanceBeat] = []
-    for number, part in enumerate(parts, start=1):
+    for number in sorted(intervals):
         if number in by_part:
             beats.append(by_part[number])
             continue
-        interval = _clip_beat(
-            part.start, part.end, line_start=line_start, line_end=line_end
-        )
-        if interval is None:
-            continue
+        interval = intervals[number]
         beats.append(
             PerformanceBeat(
                 start=interval[0],
@@ -1320,20 +1340,39 @@ def _adapt_batch(
 def _beats_were_adjusted(
     segment: TranscriptSegment | DialogueSentence, beats: Sequence[PerformanceBeat]
 ) -> bool:
-    """Return whether any beat differs from its part's own timestamps.
+    """Return whether any beat differs from where its part sits inside the line.
 
-    True means either a beat was narrowed into the line's interval or one that fell
-    wholly outside it was dropped - both of which are reported so a manifest reader
-    knows the performance metadata was corrected rather than silently trusted.
+    True means a beat was narrowed into the line's interval, moved up past an overlapping
+    part, or dropped because it fell wholly outside - all of which are reported so a
+    manifest reader knows the performance metadata was corrected rather than trusted.
+
+    A single-segment line carries no beats by design, so it is never counted: comparing
+    one part against zero beats would report every ordinary line as adjusted, which is
+    exactly the noise that made this report useless.
     """
 
     parts = getattr(segment, "parts", ())
-    if len(parts) != len(beats):
+    if len(parts) < 2:
+        return False
+    line_start = float(segment.start)
+    line_end = float(segment.end)
+    # Compare against the parts as they stand: any beat that is not simply "this part,
+    # as given" was corrected - narrowed into the line, moved past an overlapping part,
+    # or dropped because it fell outside.
+    raw = [
+        interval
+        for interval in (
+            _clip_beat(part.start, part.end, line_start=line_start, line_end=line_end)
+            for part in parts
+        )
+        if interval is not None
+    ]
+    if len(raw) != len(beats):
         return True
     return any(
-        abs(part.start - beat.start) > TIMESTAMP_TOLERANCE
-        or abs(part.end - beat.end) > TIMESTAMP_TOLERANCE
-        for part, beat in zip(parts, beats)
+        abs(start - beat.start) > TIMESTAMP_TOLERANCE
+        or abs(end - beat.end) > TIMESTAMP_TOLERANCE
+        for (start, end), beat in zip(raw, beats)
     )
 
 
@@ -1957,6 +1996,9 @@ def adapt_dialogue(
             f"{settings.translation_backend!r}"
         )
 
+    # One request per batch is a deliberate cost policy - no rewrites, retries, or
+    # failover. The per-batch report in _reduce_overshooting_lines already says how many
+    # lines overshoot, so nothing is silently ignored.
     if maximum_reduction_attempts != 0 and on_progress is not None:
         on_progress(
             "  translation rewrites disabled; each batch is sent exactly once"

@@ -1493,3 +1493,84 @@ def test_a_window_discovery_with_enough_evidence_is_a_character(monkeypatch, tmp
     assert result.unresolved_speakers == ()
     assert any(item.mode == "window" for item in result.windows)
 
+
+def test_a_move_needs_more_than_a_margin(monkeypatch, tmp_path):
+    """The reported run moved a turn at similarity 0.28, below its own same-voice 0.31.
+
+    A face-off between two identities the turn resembles equally well produces a large
+    margin in one direction, but nothing about that turn is like either of them. It must
+    stay where it is and be reported rather than handed to a character by margin alone.
+    """
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        # Nothing like either voice: orthogonal to both, so it cannot be moved safely.
+        (60.0, 62.0, "SPEAKER_01"),
+    ]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (60.0, 62.0): [0.0, 0.0, 1.0, 0.0],
+    }
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    # It stayed where pyannote put it: a turn unlike both identities is never moved on
+    # the strength of a margin alone.
+    assert result.turns[-1].speaker_id == "SPEAKER_01"
+    assert all(
+        item.original_speaker_id != "SPEAKER_01" or item.start != 60.0
+        for item in result.reassignments
+    )
+    # And the line itself is preserved in its own slot.
+    assert any(segment.start == pytest.approx(60.0) for segment in result.turns)
+
+
+def test_merge_suspects_use_the_same_evidence_as_the_calibration(monkeypatch, tmp_path):
+    """Two different people must not look alike just because both spoke briefly.
+
+    Short turns are embedded inside padded windows, which makes their voiceprints
+    noisy in a common direction. Mixing them into the identity prototypes pulled the two
+    identities to 0.84 alike on the reported run while their long turns sat 0.00 apart.
+    """
+
+    _patch(monkeypatch)
+    turns = []
+    vectors = {}
+    # Two clearly different long voices...
+    for index in range(3):
+        start = 10.0 * index
+        turns.append((start, start + 4.0, "SPEAKER_00"))
+        vectors[(start, start + 4.0)] = _VA
+    for index in range(3):
+        start = 40.0 + 10.0 * index
+        turns.append((start, start + 4.0, "SPEAKER_01"))
+        vectors[(start, start + 4.0)] = _VB
+    # ...plus many brief turns whose padded voiceprints share a drifting direction.
+    for index in range(6):
+        start = 80.0 + 3.0 * index
+        label = "SPEAKER_00" if index % 2 == 0 else "SPEAKER_01"
+        turns.append((start, start + 0.6, label))
+        drift = 1.0 + 0.01 * index
+        vectors[(start, start + 0.6)] = [0.4 * drift, 0.4 * drift, 0.82, 0.0]
+    _scripted(turns, [], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+
+    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+
+    # The two identities are as far apart as their long turns say, not as close as the
+    # noisy short ones would suggest.
+    assert result.merge_suspects == ()
+

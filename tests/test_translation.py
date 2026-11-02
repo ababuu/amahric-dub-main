@@ -2229,10 +2229,12 @@ def _sentence(*segments, speaker="SPEAKER_00"):
     from app.pipeline.transcription import DialogueSentence
 
     parts = tuple(segments)
+    # The span is the union of the parts, exactly as assemble_sentences builds it: a
+    # sentence narrower than one of its own parts is no longer constructible.
     return DialogueSentence(
         speaker_id=speaker,
-        start=parts[0].start,
-        end=parts[-1].end,
+        start=min(part.start for part in parts),
+        end=max(part.end for part in parts),
         text=" ".join(part.text for part in parts),
         parts=parts,
     )
@@ -2349,94 +2351,90 @@ def test_a_whole_number_part_index_is_accepted(monkeypatch):
     assert [beat.emotion for beat in adapted.beats] == ["calm", "angry"]
 
 # ---------------------------------------------------------------------------
-# a beat may not describe audio outside the line it belongs to
+# a beat may not describe audio outside the line, or overlap the beat before it
 # ---------------------------------------------------------------------------
 
 
-def _mismatched_sentence():
-    """A sentence whose last part reaches past the line's own end.
+def _overlapping_sentence():
+    """A sentence whose parts overlap, which is what a word-split turn produces.
 
-    This is the reported shape: dialogue_000007 covered 13.429-14.630s while a part of
-    it - and therefore the beat built from that part - ran to 14.929s. Nothing in the
-    data model enforces that a sentence's span covers its parts, so the adaptation stage
-    has to be the place that keeps a beat inside the line.
+    ``transcription.assemble_sentences`` now takes the span as the union of the parts, so
+    this line covers 13.429-14.929s; its second part still starts inside the first, which
+    is the shape that used to produce two beats covering the same instant and fail the
+    whole batch.
     """
 
-    from app.pipeline.transcription import DialogueSentence
-
     parts = (
-        _segment(start=13.429, end=14.0, text="I mean, you're"),
-        _segment(start=14.0, end=14.929, text="sitting on a gold mine"),
+        _segment(start=13.429, end=14.929, text="No, no, no. Don't lay that on me."),
+        _segment(start=14.510, end=14.630, text="on."),
     )
-    return DialogueSentence(
-        speaker_id="SPEAKER_00",
-        start=13.429,
-        end=14.630,
-        text="I mean, you're sitting on a gold mine",
-        parts=parts,
-    )
+    return _sentence(*parts)
 
 
-def test_a_beat_is_clipped_to_the_line_it_belongs_to(monkeypatch):
+def test_overlapping_parts_do_not_produce_overlapping_beats(monkeypatch):
+    """The reported failure: 'beats[1] starts before the beat before it ends'."""
+
     _patch(monkeypatch)
-    sentence = _mismatched_sentence()
+    sentence = _overlapping_sentence()
     FakeOpenAI.transform = lambda body: body
 
     messages: list[str] = []
     (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
 
-    # The line keeps its exact, application-owned interval.
-    assert line.start == 13.429
-    assert line.end == 14.630
-    # No beat describes audio after the line ends.
-    assert line.beats
-    assert all(beat.end <= line.end + translation.TIMESTAMP_TOLERANCE for beat in line.beats)
-    assert all(beat.start >= line.start - translation.TIMESTAMP_TOLERANCE for beat in line.beats)
-    # The correction is reported rather than silent.
-    assert "narrowed to the line's own interval" in " ".join(messages)
-
-
-def test_a_part_wholly_outside_the_line_is_dropped_not_misplaced(monkeypatch):
-    _patch(monkeypatch)
-    from app.pipeline.transcription import DialogueSentence
-
-    parts = (
-        _segment(start=13.429, end=14.0, text="I mean, you're"),
-        _segment(start=14.7, end=14.929, text="sitting"),
-    )
-    sentence = DialogueSentence(
-        speaker_id="SPEAKER_00",
-        start=13.429,
-        end=14.630,
-        text="I mean, you're sitting",
-        parts=parts,
-    )
-
-    def beats_for_both(body):
-        body["lines"][0]["beats"] = [
-            {"part": 1, "emotion": "even", "intensity": 0.4, "delivery": "level"},
-            {"part": 2, "emotion": "warm", "intensity": 0.5, "delivery": "soft"},
-        ]
-        return body
-
-    FakeOpenAI.transform = beats_for_both
-    messages: list[str] = []
-    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
-
-    # The part after the line ends has no moment of this line to describe.
-    assert len(line.beats) == 1
-    assert line.beats[0].end <= 14.0 + translation.TIMESTAMP_TOLERANCE
+    # The line keeps its exact, application-owned interval...
+    assert (line.start, line.end) == (13.429, 14.929)
+    # ...its translated text survives, and no beat overlaps the one before it.
     assert line.amharic
-    assert line.end == 14.630
+    previous = line.start
+    for beat in line.beats:
+        assert beat.start >= previous - translation.TIMESTAMP_TOLERANCE
+        assert beat.end <= line.end + translation.TIMESTAMP_TOLERANCE
+        previous = beat.end
+    # No salvage was needed, so the model's own direction is still in place.
+    assert line.delivery != "neutral" or line.emotion != "neutral"
+    assert not any("kept its translated text" in message for message in messages)
 
 
-def test_the_line_timing_is_never_taken_from_the_parts(monkeypatch):
-    """App timing wins even when the parts disagree with the span."""
+def test_an_ordinary_line_is_not_reported_as_adjusted(monkeypatch):
+    """A single-segment line has no beats by design, so it is never 'narrowed'."""
 
     _patch(monkeypatch)
-    sentence = _mismatched_sentence()
     FakeOpenAI.transform = lambda body: body
 
-    (line,) = adapt_dialogue([sentence], settings=_settings())
+    messages: list[str] = []
+    adapt_dialogue([_segment()], settings=_settings(), on_progress=messages.append)
 
-    assert (line.start, line.end) == (13.429, 14.630)
+    assert not any("narrowed to the line's own interval" in message for message in messages)
+
+
+def test_a_beat_that_would_overlap_is_narrowed_and_reported(monkeypatch):
+    """Only a genuinely adjusted multi-part line is counted."""
+
+    _patch(monkeypatch)
+    sentence = _overlapping_sentence()
+    FakeOpenAI.transform = lambda body: body
+
+    messages: list[str] = []
+    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
+
+    assert any("narrowed to the line's own interval" in message for message in messages)
+
+
+def test_a_sentence_span_must_cover_its_parts():
+    """The invariant that made a beat fall outside its own line, now enforced."""
+
+    from app.pipeline.transcription import DialogueSentence
+
+    parts = (
+        _segment(start=13.429, end=14.929, text="one"),
+        _segment(start=14.510, end=14.630, text="two"),
+    )
+
+    with pytest.raises(Exception, match="does not cover its parts"):
+        DialogueSentence(
+            speaker_id="SPEAKER_00",
+            start=13.429,
+            end=14.630,
+            text="one two",
+            parts=parts,
+        )

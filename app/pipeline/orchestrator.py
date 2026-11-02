@@ -676,15 +676,15 @@ def run_pipeline(
             f"  uncertain speaker: {uncertain_speaker.speaker_id} "
             f"({uncertain_speaker.seconds:.1f}s; best similarity "
             f"{uncertain_speaker.similarity:.2f}, margin "
-            f"{uncertain_speaker.margin:.2f}); keeps its turns but is not counted as an "
-            "established character - " + uncertain_speaker.reason
+            f"{uncertain_speaker.margin:.2f}); not counted as an established character - "
+            + uncertain_speaker.reason
         )
     for unresolved in diarized.unresolved_speakers:
         report(
             f"  not established: {unresolved.speaker_id} "
             f"({unresolved.seconds:.1f}s; best similarity "
-            f"{unresolved.similarity:.2f}, margin {unresolved.margin:.2f}); its turns "
-            "keep the attribution they had - " + unresolved.reason
+            f"{unresolved.similarity:.2f}, margin {unresolved.margin:.2f}) - "
+            + unresolved.reason
         )
     if diarized.undecided_performances:
         report(

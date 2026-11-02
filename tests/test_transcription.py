@@ -995,3 +995,49 @@ def test_a_sentence_rejects_parts_from_another_speaker() -> None:
                 _segment(1.0, 2.0, "there", speaker="SPEAKER_01"),
             ),
         )
+
+
+def test_a_sentence_span_covers_parts_that_overlap():
+    """A turn boundary inside a word makes consecutive segments overlap.
+
+    The sentence's span must be the union of its parts, not the last part's end: taking
+    the last end truncated "No, no, no. Don't lay that on me." (to 14.929) at 14.630,
+    which left the line's timing disagreeing with its own text and pushed a performance
+    beat outside the line it belonged to.
+    """
+
+    from app.pipeline.transcription import (
+        MAX_SENTENCE_GAP_SECONDS,
+        assemble_sentences,
+    )
+
+    first = TranscriptSegment(
+        speaker_id="SPEAKER_01", start=13.429, end=14.929, text="No, no, no. Don't lay"
+    )
+    second = TranscriptSegment(
+        speaker_id="SPEAKER_01", start=14.510, end=14.630, text="on."
+    )
+    assert second.start < first.end <= second.start + MAX_SENTENCE_GAP_SECONDS
+
+    (sentence,) = assemble_sentences([first, second])
+
+    assert sentence.start == pytest.approx(13.429)
+    # The later part ends first, so the union - not the last part - sets the end.
+    assert sentence.end == pytest.approx(14.929)
+    assert sentence.end >= max(part.end for part in sentence.parts)
+    assert sentence.start <= min(part.start for part in sentence.parts)
+
+
+def test_a_sentence_narrower_than_its_parts_is_rejected():
+    from app.pipeline.transcription import DialogueSentence
+
+    parts = (
+        TranscriptSegment("SPEAKER_00", 0.0, 3.0, "one"),
+        TranscriptSegment("SPEAKER_00", 1.0, 2.0, "two"),
+    )
+
+    with pytest.raises(InvalidSegmentError, match="does not cover its parts"):
+        DialogueSentence(
+            speaker_id="SPEAKER_00", start=0.0, end=2.0, text="one two", parts=parts
+        )
+
