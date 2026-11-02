@@ -2322,28 +2322,25 @@ def synthesize_dialogue_detailed(
             voice_profiles, speakers=speakers, allow_missing=True
         )
 
-        # A character the film gave no usable reference is spoken in a designed voice,
-        # never in another character's. An engine that cannot design one would have to
-        # borrow a reference, so this is where that run has to stop instead.
+        # Nobody is spoken in a voice that is not theirs. A character whose turns are all
+        # short gets a reference stitched from those turns (see
+        # voice_profiles._composite_reference); a character with *no* profile at all has
+        # no audio in the film to imitate, and there is nothing honest left to speak them
+        # with, so the run stops and says which speaker is missing.
         unprofiled = [speaker_id for speaker_id in speakers if speaker_id not in profiles]
-        if unprofiled and not (
-            cloning_engine is not None and cloning_engine.supports_voice_design
-        ):
+        if unprofiled:
             raise MissingVoiceProfileError(
                 f"speaker {unprofiled[0]!r} has no voice profile; build one with "
-                "app.pipeline.voice_profiles.build_voice_profiles first, or use an "
-                "engine that can design a voice for a speaker the film cannot describe"
+                "app.pipeline.voice_profiles.build_voice_profiles first. A designed "
+                "stand-in voice is deliberately not used: every character is spoken in "
+                "the actor's own voice, however short their performance"
             )
-        designed = assign_designed_voices(unprofiled, settings=resolved)
 
         # Validate the reference audio of every speaker that is about to be used
         # before any model runs: a missing reference should fail the run the same way
         # whether or not earlier lines could already be synthesized.
         identities: dict[str, str] = {}
         for speaker_id in speakers:
-            if speaker_id in designed:
-                identities[speaker_id] = designed_voice_identity(designed[speaker_id])
-                continue
             profile = profiles[speaker_id]
             reference = profile.resolve_reference_audio()
             _validate_audio_file(

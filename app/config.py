@@ -69,6 +69,9 @@ Environment variables
 ``DIARIZATION_MAX_EXTRA_SPEAKERS``
                       How many speakers the global re-partitioning may find beyond the
                       number pyannote proposed.
+``DIARIZATION_SCENE_GAP_SECONDS`` / ``DIARIZATION_SCENE_MAX_SECONDS``
+                      The silence that separates two scenes, and the longest scene sent
+                      to the model in one call.
 ``DIARIZATION_REGISTRY_ENABLED`` / ``DIARIZATION_REGISTRY_PATH``
                       Whether discovered identities are persisted, and where. The
                       default path lives in ``WORK_DIR``; a re-run of the same film
@@ -135,16 +138,25 @@ DEFAULT_DIARIZATION_MAX_SPEAKERS: Optional[int] = None
 #: reports every split it makes; turn it off to keep exactly the model's own clustering.
 DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS = True
 
-#: How diarization treats dialogue the evidence cannot settle. ``all`` (the default)
-#: diarizes a short suspect window around every ambiguous or overlapping performance;
-#: ``suspect`` behaves the same (windows are inherently suspect-driven) and is kept so
-#: an existing configuration keeps working; ``off`` runs no window pass at all.
+#: How diarization treats scenes. ``all`` (the default) diarizes every scene on its own
+#: so that every voice in it is accounted for, however short its turn; ``suspect`` only
+#: re-hears the scenes where the film-wide evidence was ambiguous or overlapping, which is
+#: cheaper on a feature-length film; ``off`` keeps the single global pass.
 DEFAULT_DIARIZATION_SCENE_MODE = "all"
 
 #: How many speakers the global re-partitioning may find beyond the number pyannote
 #: proposed. The count itself is discovered: this only bounds the search, so a film can
 #: gain a character the model missed but not an invented cast.
 DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS = 3
+
+#: Silence between two turns that makes them different scenes. Scene-level accounting
+#: diarizes each scene on its own so that every voice in it is found, however briefly it
+#: speaks; the dialogue's own pauses are what defines a scene.
+DEFAULT_DIARIZATION_SCENE_GAP_SECONDS = 3.0
+
+#: Longest stretch handed to the model as one scene, so an unbroken 20-minute run of
+#: dialogue stays bounded in memory and time.
+DEFAULT_DIARIZATION_SCENE_MAX_SECONDS = 120.0
 
 #: Whether the identities a run discovers are written to disk and read back on the next
 #: run of the same film, so a character keeps the same id and voice across runs.
@@ -835,12 +847,15 @@ class Settings:
     #: Whether a cluster holding two voices is split, so the second one is not cloned
     #: with the first one's reference.
     diarization_split_mixed_speakers: bool = DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS
-    #: Suspect-window diarization: ``all``, ``suspect``, or ``off``. Short windows
-    #: around ambiguous or overlapping dialogue are diarized on their own, so a character
-    #: the film-wide pass missed can still be named.
+    #: Scene diarization: ``all``, ``suspect``, or ``off``. Each scene is diarized on its
+    #: own so that every voice in it is accounted for, however short its turn, and a
+    #: character the film-wide pass merged can still be named.
     diarization_scene_mode: str = DEFAULT_DIARIZATION_SCENE_MODE
     #: How many speakers the global re-partitioning may find beyond pyannote's count.
     diarization_max_extra_speakers: int = DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS
+    #: Silence that separates two scenes, and the longest scene sent to the model at once.
+    diarization_scene_gap_seconds: float = DEFAULT_DIARIZATION_SCENE_GAP_SECONDS
+    diarization_scene_max_seconds: float = DEFAULT_DIARIZATION_SCENE_MAX_SECONDS
     #: Whether discovered identities persist, and where.
     diarization_registry_enabled: bool = DEFAULT_DIARIZATION_REGISTRY_ENABLED
     diarization_registry_path: Optional[Path] = None
@@ -977,6 +992,14 @@ class Settings:
             diarization_max_extra_speakers=_read_nonnegative_int(
                 "DIARIZATION_MAX_EXTRA_SPEAKERS",
                 DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS,
+            ),
+            diarization_scene_gap_seconds=_read_float(
+                "DIARIZATION_SCENE_GAP_SECONDS",
+                DEFAULT_DIARIZATION_SCENE_GAP_SECONDS,
+            ),
+            diarization_scene_max_seconds=_read_float(
+                "DIARIZATION_SCENE_MAX_SECONDS",
+                DEFAULT_DIARIZATION_SCENE_MAX_SECONDS,
             ),
             diarization_registry_enabled=_read_bool(
                 "DIARIZATION_REGISTRY_ENABLED",
@@ -1259,6 +1282,8 @@ class Settings:
             "diarization_split_mixed_speakers": self.diarization_split_mixed_speakers,
             "diarization_scene_mode": self.diarization_scene_mode,
             "diarization_max_extra_speakers": self.diarization_max_extra_speakers,
+            "diarization_scene_gap_seconds": self.diarization_scene_gap_seconds,
+            "diarization_scene_max_seconds": self.diarization_scene_max_seconds,
             "diarization_registry_enabled": self.diarization_registry_enabled,
             "diarization_registry_path": (
                 str(self.diarization_registry_path)
@@ -1350,6 +1375,8 @@ __all__ = [
     "DEFAULT_DIARIZATION_MODEL",
     "DEFAULT_DIARIZATION_REGISTRY_ENABLED",
     "DEFAULT_DIARIZATION_MAX_EXTRA_SPEAKERS",
+    "DEFAULT_DIARIZATION_SCENE_GAP_SECONDS",
+    "DEFAULT_DIARIZATION_SCENE_MAX_SECONDS",
     "DEFAULT_DIARIZATION_SCENE_MODE",
     "DEFAULT_DIARIZATION_SHORT_TURN_SECONDS",
     "DEFAULT_DIARIZATION_SPLIT_MIXED_SPEAKERS",

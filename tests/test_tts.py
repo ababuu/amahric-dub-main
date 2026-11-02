@@ -455,42 +455,35 @@ def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_speaker_without_a_profile_is_spoken_in_a_designed_voice(rig: Rig) -> None:
-    rig.engine = FakeDesigningEngine(events=rig.events)
+def test_a_speaker_without_any_profile_stops_the_run(rig: Rig) -> None:
+    """No designed stand-in: a character is spoken in their own voice or not at all.
 
-    result = tts.synthesize_dialogue_detailed(
-        [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
-    )
-
-    assert len(result.clips) == 1
-    call = rig.engine.calls[0]
-    assert "voice_reference" not in call
-    assert "reference_text" not in call
-    assert call["instruct"] == tts.assign_designed_voices(
-        ["SPEAKER_09"], settings=rig.settings()
-    )["SPEAKER_09"]
-    assert result.clips[0].voice_reference_path is None
-    assert [voice.speaker_id for voice in result.designed] == ["SPEAKER_09"]
-    assert any("designed voice" in note for note in result.notes)
-
-
-def test_a_cloned_and_a_designed_character_are_kept_apart(rig: Rig) -> None:
-    """One reference-less speaker must not disturb the cloned one's artifacts."""
+    A speaker with no profile has no audio in the film to imitate, so there is nothing
+    honest to speak them with. The run says which speaker is missing instead of quietly
+    inventing a voice that is not theirs.
+    """
 
     rig.engine = FakeDesigningEngine(events=rig.events)
 
-    result = tts.synthesize_dialogue_detailed(
-        [_line(), _line(speaker_id="SPEAKER_09", start=10.0, end=12.0)],
-        rig.stem,
-        {rig.profile.speaker_id: rig.profile},
-        settings=rig.settings(),
-    )
+    with pytest.raises(tts.MissingVoiceProfileError, match="SPEAKER_09"):
+        tts.synthesize_dialogue_detailed(
+            [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
+        )
 
-    cloned, designed = rig.engine.calls
-    assert cloned["voice_reference"] == rig.profile.resolve_reference_audio()
-    assert "instruct" not in cloned
-    assert "voice_reference" not in designed
-    assert len({clip.audio_path for clip in result.clips}) == 2
+    # Nothing was synthesized, and no designed voice was assigned.
+    assert rig.engine.calls == []
+
+
+def test_the_error_names_the_setting_that_builds_the_missing_profile(rig: Rig) -> None:
+    rig.engine = FakeDesigningEngine(events=rig.events)
+
+    with pytest.raises(tts.MissingVoiceProfileError, match="build_voice_profiles"):
+        tts.synthesize_dialogue_detailed(
+            [_line(), _line(speaker_id="SPEAKER_09", start=10.0, end=12.0)],
+            rig.stem,
+            {rig.profile.speaker_id: rig.profile},
+            settings=rig.settings(),
+        )
 
 
 def test_designed_voices_are_distinct_and_stable() -> None:

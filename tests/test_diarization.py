@@ -1256,14 +1256,19 @@ def test_a_single_performance_is_not_a_partition(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# suspect windows
+# scene accounting
 # ---------------------------------------------------------------------------
 
 
-def test_a_suspect_window_can_move_dialogue_between_existing_identities(
+def test_a_scene_can_reassign_dialogue_between_existing_identities(
     monkeypatch, tmp_path
 ):
-    """A window is allowed to reassign, not only to add a new character."""
+    """When the scene hears the same two voices in the other order, it corrects them.
+
+    The scene's local clusters are mapped to identities by voice, not by label, so a
+    scene that hears B where the film-wide pass heard A relabels that turn - it does not
+    invent a third character.
+    """
 
     _patch(monkeypatch)
     turns = [
@@ -1275,7 +1280,6 @@ def test_a_suspect_window_can_move_dialogue_between_existing_identities(
         (46.0, 51.0, "SPEAKER_01"),
         (60.0, 62.0, "SPEAKER_00"),
     ]
-    halfway = [0.6, 0.6, 0.0, 0.0]
     vectors = {
         (0.0, 5.0): _VA,
         (6.0, 11.0): _VB,
@@ -1283,27 +1287,37 @@ def test_a_suspect_window_can_move_dialogue_between_existing_identities(
         (26.0, 31.0): _VB,
         (40.0, 45.0): _VA,
         (46.0, 51.0): _VB,
-        (60.0, 62.0): halfway,
-        # The window's own diarization hears that turn as two clean fragments of B.
-        (60.0, 61.0): _VB,
-        (61.0, 62.0): _VB,
+        (60.0, 62.0): [0.6, 0.6, 0.0, 0.0],
     }
-    _scripted(
-        turns,
-        [[(60.0, 61.0, "SPEAKER_00"), (61.0, 62.0, "SPEAKER_00")]],
-        vectors,
-    )
+    # The scene splits the film into the same two voices but labels them the opposite
+    # way round, and it puts the last turn in the voice the film-wide pass called
+    # SPEAKER_00.
+    local = [
+        (0.0, 5.0, "SPEAKER_01"),
+        (6.0, 11.0, "SPEAKER_00"),
+        (20.0, 25.0, "SPEAKER_01"),
+        (26.0, 31.0, "SPEAKER_00"),
+        (40.0, 45.0, "SPEAKER_01"),
+        (46.0, 51.0, "SPEAKER_00"),
+        (60.0, 62.0, "SPEAKER_00"),
+    ]
+    _scripted(turns, [local], vectors)
     _install_fake_pyannote_core(monkeypatch)
+    # One scene for the whole film, so the rewrite is about relabelling, not splitting.
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=300.0)
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
-    assert result.windows, "an ambiguous turn should open a suspect window"
-    assert [item.mode for item in result.windows] == ["window"]
+    assert result.windows, "the film should be diarized scene by scene"
+    assert [item.mode for item in result.windows] == ["separated"]
     moved = [segment for segment in result.turns if segment.start >= 60.0]
     assert {segment.speaker_id for segment in moved} == {"SPEAKER_01"}
+    # Two identities, not three: a relabel is not a discovery.
+    assert result.confirmed_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.uncertain_speakers == ()
 
 
-def test_a_window_that_cannot_be_diarized_keeps_the_attribution(monkeypatch, tmp_path):
+def test_a_scene_that_cannot_be_diarized_keeps_the_attribution(monkeypatch, tmp_path):
     _patch(monkeypatch)
     turns = [
         (0.0, 5.0, "SPEAKER_00"),
@@ -1324,19 +1338,169 @@ def test_a_window_that_cannot_be_diarized_keeps_the_attribution(monkeypatch, tmp
         (60.0, 62.0): [0.6, 0.6, 0.0, 0.0],
     }
     _scripted(turns, [], vectors)
-    FakePipeline.results = [
-        _pipeline_output(turns),
-        object(),
-    ]
+    FakePipeline.results = [_pipeline_output(turns), object()]
     _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=300.0)
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
     assert [item.mode for item in result.windows] == ["failed"]
     assert result.turns[-1].speaker_id == "SPEAKER_00"
 
 
-def test_the_window_pass_can_be_switched_off(monkeypatch, tmp_path):
+def _two_voice_film(pairs: int, extra: list[float]):
+    """A film with two established voices plus one very short voice in extra scenes.
+
+    The extra turns are labelled SPEAKER_00 by the film-wide pass - the merge this pass
+    exists to undo - and their voiceprint is a third direction entirely.
+    """
+
+    turns: list[tuple[float, float, str]] = []
+    vectors: dict[tuple[float, float], list[float]] = {}
+    at = 0.0
+    for _ in range(pairs):
+        turns.append((at, at + 5.0, "SPEAKER_00"))
+        vectors[(at, at + 5.0)] = _VA
+        at += 6.0
+        turns.append((at, at + 5.0, "SPEAKER_01"))
+        vectors[(at, at + 5.0)] = _VB
+        at += 6.0
+    scenes = [[(segment[0], segment[1], segment[2]) for segment in turns[: pairs * 2]]]
+    for start in extra:
+        turns.append((start, start + 2.0, "SPEAKER_00"))
+        vectors[(start, start + 2.0)] = _VC
+        scenes.append([(start, start + 2.0, "SPEAKER_00")])
+    return turns, vectors, scenes
+
+
+def test_a_short_voice_in_a_scene_is_accounted_for(monkeypatch, tmp_path):
+    """The point of the scene pass: a 2s voice is a speaker, not a rounding error.
+
+    No duration threshold is applied to a voice the scene separates. It gets its own id,
+    keeps its own turn and its own reference; because it appears in only one scene it is
+    reported as uncertain rather than confirmed.
+    """
+
+    _patch(monkeypatch)
+    turns, vectors, scenes = _two_voice_film(3, [60.0])
+    _scripted(turns, scenes, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=3.0)
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert "SPEAKER_02" in result.speaker_ids
+    assert any(segment.speaker_id == "SPEAKER_02" for segment in result.turns)
+    # Accounted for, and honestly labelled: one appearance is not yet a character.
+    assert "SPEAKER_02" in result.uncertain_speaker_ids
+    assert "SPEAKER_02" not in result.confirmed_speaker_ids
+    assert any("one scene only" in item.reason for item in result.uncertain_speakers)
+    # A scene can add a name but must never drop dialogue.
+    assert sum(segment.duration for segment in result.turns) == pytest.approx(32.0)
+
+
+def test_a_scene_with_more_voices_than_the_film_found_splits_the_merged_one(
+    monkeypatch, tmp_path
+):
+    """The core failure: a voice the film-wide prototypes absorbed gets its own id.
+
+    The scene's third voice is close enough to SPEAKER_00 that prototype matching alone
+    would keep it merged. What exposes it is the count: the scene separates three voices
+    and the film-wide pass handed it two identities, so the weakest-matching cluster is a
+    voice of its own rather than a piece of an identity that is already present.
+    """
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+        (100.0, 102.0, "SPEAKER_00"),
+        (104.0, 106.0, "SPEAKER_00"),
+        (110.0, 112.0, "SPEAKER_01"),
+    ]
+    near = [0.9, 0.1, 0.0, 0.0]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+        (100.0, 102.0): near,
+        (104.0, 106.0): _VA,
+        (110.0, 112.0): _VB,
+    }
+    opening = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+    ]
+    closing = [
+        (100.0, 102.0, "SPEAKER_00"),
+        (104.0, 106.0, "SPEAKER_01"),
+        (110.0, 112.0, "SPEAKER_02"),
+    ]
+    _scripted(turns, [opening, closing], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=15.0)
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert [item.mode for item in result.windows] == ["agreed", "separated"]
+    third = [segment for segment in result.turns if segment.start >= 100.0]
+    assert [segment.speaker_id for segment in third] == [
+        "SPEAKER_02",
+        "SPEAKER_00",
+        "SPEAKER_01",
+    ]
+    # Nothing was merged to get there: the two established voices keep their ids.
+    assert result.confirmed_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert "SPEAKER_02" in result.uncertain_speaker_ids
+
+
+def test_suspect_mode_rehears_only_the_scenes_that_look_ambiguous(monkeypatch, tmp_path):
+    """``suspect`` is the cheap mode: it diarizes a scene only when it has crosstalk.
+
+    Accounting for every voice means hearing a scene whole, so even the cheap mode works
+    in scenes - it just chooses which ones deserve the extra call.
+    """
+
+    _patch(monkeypatch)
+    exclusive = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (100.0, 105.0, "SPEAKER_00"),
+        (106.0, 111.0, "SPEAKER_01"),
+    ]
+    overlapping = exclusive + [(101.0, 104.0, "SPEAKER_01")]
+    _scripted(exclusive, [[(100.0, 105.0, "SPEAKER_00"), (106.0, 111.0, "SPEAKER_01")]], {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (100.0, 105.0): _VA,
+        (106.0, 111.0): _VB,
+    })
+    FakePipeline.results[0] = _crosstalk_output(exclusive=exclusive, overlapping=overlapping)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="suspect")
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    # Only the overlapping scene was diarized again, it was heard whole, and it produced
+    # a real result rather than a failed window.
+    assert len(result.windows) == 1
+    assert result.windows[0].mode == "agreed"
+    assert result.windows[0].start == pytest.approx(100.0)
+    assert result.windows[0].end == pytest.approx(111.0)
+
+
+def test_the_scene_pass_can_be_switched_off(monkeypatch, tmp_path):
     _patch(monkeypatch)
     turns = [(0.0, 5.0, "SPEAKER_00"), (20.0, 25.0, "SPEAKER_01")]
     audio = _scripted(turns, [], {(0.0, 5.0): _VA, (20.0, 25.0): _VB})
@@ -1347,6 +1511,7 @@ def test_the_window_pass_can_be_switched_off(monkeypatch, tmp_path):
 
     assert result.windows == ()
     assert audio.slices == []
+
 
 def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_path):
     """The regression the artifacts describe, at the timings they measured.
@@ -1361,7 +1526,7 @@ def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_p
         (0.0, 2.0, "SPEAKER_00"),
         (3.0, 5.0, "SPEAKER_01"),
         (14.97, 19.31, "SPEAKER_01"),
-        (19.77, 20.43, "SPEAKER_00"),   # C
+        (19.77, 20.43, "SPEAKER_00"),  # C
         (20.0, 22.0, "SPEAKER_00"),
         (24.63, 25.13, "SPEAKER_00"),
         (105.75, 106.29, "SPEAKER_00"),  # C
@@ -1393,8 +1558,11 @@ def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_p
 
     _scripted(turns, [], characters)
     _install_fake_pyannote_core(monkeypatch)
+    # The global re-partition is what has to recover C; the scene pass is exercised by
+    # its own tests and would only add noise here.
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="off")
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
     assert result.raw_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
     by_start = {round(segment.start, 2): segment.speaker_id for segment in result.turns}
@@ -1406,92 +1574,6 @@ def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_p
     assert {by_start[start] for start in (0.0, 20.0, 24.63, 201.52, 213.57)} == {"SPEAKER_00"}
     assert {by_start[start] for start in (3.0, 14.97, 112.23, 114.09, 116.67)} == {"SPEAKER_01"}
     assert len(result.reassignments) == 6
-
-
-def test_a_thin_window_discovery_is_not_counted_as_a_character(monkeypatch, tmp_path):
-    """The reported regression: two speakers chosen, a third identity reported on 1.8 s.
-
-    A window that separates a voice it cannot corroborate must not add a character the
-    film-wide evidence declined. Its turns go back where they were, and the candidate is
-    reported as unresolved rather than counted.
-    """
-
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 5.0, "SPEAKER_00"),
-        (6.0, 11.0, "SPEAKER_01"),
-        (20.0, 25.0, "SPEAKER_00"),
-        (26.0, 31.0, "SPEAKER_01"),
-        (40.0, 45.0, "SPEAKER_00"),
-        (46.0, 51.0, "SPEAKER_01"),
-        (60.0, 62.0, "SPEAKER_00"),
-    ]
-    thin = [0.5, 0.5, 0.6, 0.3]
-    vectors = {
-        (0.0, 5.0): _VA,
-        (6.0, 11.0): _VB,
-        (20.0, 25.0): _VA,
-        (26.0, 31.0): _VB,
-        (40.0, 45.0): _VA,
-        (46.0, 51.0): _VB,
-        (60.0, 62.0): [0.5, 0.5, 0.0, 0.0],
-        # The window hears 1.8 s of a third voice inside the ambiguous turn.
-        (60.0, 61.8): thin,
-    }
-    _scripted(turns, [[(60.0, 61.8, "SPEAKER_00")]], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert result.raw_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    # Two identities, and both of them confirmed.
-    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    assert result.confirmed_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    assert result.uncertain_speaker_ids == ()
-    assert result.discovered_speakers == ()
-    # The candidate is reported, with the reason and the evidence it did not have.
-    assert len(result.unresolved_speakers) == 1
-    unresolved = result.unresolved_speakers[0]
-    assert unresolved.speaker_id.startswith("SPEAKER_")
-    assert unresolved.seconds == pytest.approx(1.8)
-    assert "needed to establish a character" in unresolved.reason
-    # Its turn went back to the identity it had before the window ran.
-    assert result.turns[-1].speaker_id == "SPEAKER_00"
-    assert all(item.mode != "window" for item in result.windows)
-
-
-def test_a_window_discovery_with_enough_evidence_is_a_character(monkeypatch, tmp_path):
-    """The same path, with a voice the window can actually support."""
-
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 5.0, "SPEAKER_00"),
-        (6.0, 11.0, "SPEAKER_01"),
-        (20.0, 25.0, "SPEAKER_00"),
-        (26.0, 31.0, "SPEAKER_01"),
-        (40.0, 45.0, "SPEAKER_00"),
-        (46.0, 51.0, "SPEAKER_01"),
-        (60.0, 64.5, "SPEAKER_00"),
-    ]
-    third = [0.0, 0.0, 1.0, 0.0]
-    vectors = {
-        (0.0, 5.0): _VA,
-        (6.0, 11.0): _VB,
-        (20.0, 25.0): _VA,
-        (26.0, 31.0): _VB,
-        (40.0, 45.0): _VA,
-        (46.0, 51.0): _VB,
-        (60.0, 64.5): [0.5, 0.5, 0.0, 0.0],
-        (61.0, 64.0): third,
-    }
-    _scripted(turns, [[(61.0, 64.0, "SPEAKER_00")]], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert "SPEAKER_02" in result.speaker_ids
-    assert result.unresolved_speakers == ()
-    assert any(item.mode == "window" for item in result.windows)
 
 
 def test_a_move_needs_more_than_a_margin(monkeypatch, tmp_path):
@@ -1524,8 +1606,10 @@ def test_a_move_needs_more_than_a_margin(monkeypatch, tmp_path):
     }
     _scripted(turns, [], vectors)
     _install_fake_pyannote_core(monkeypatch)
+    # This is about the global partition's move rule, not the scene pass.
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="off")
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
     # It stayed where pyannote put it: a turn unlike both identities is never moved on
     # the strength of a margin alone.
@@ -1567,10 +1651,32 @@ def test_merge_suspects_use_the_same_evidence_as_the_calibration(monkeypatch, tm
         vectors[(start, start + 0.6)] = [0.4 * drift, 0.4 * drift, 0.82, 0.0]
     _scripted(turns, [], vectors)
     _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_mode="off")
 
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
 
     # The two identities are as far apart as their long turns say, not as close as the
     # noisy short ones would suggest.
     assert result.merge_suspects == ()
 
+
+def test_a_voice_seen_in_two_scenes_is_confirmed(monkeypatch, tmp_path):
+    """The same short voice in two scenes is a recurring character, and is confirmed."""
+
+    _patch(monkeypatch)
+    turns, vectors, scenes = _two_voice_film(3, [100.0, 130.0])
+    _scripted(turns, scenes, vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=3.0)
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    # Three scenes were diarized on their own; two of them separated the same voice.
+    assert [item.mode for item in result.windows] == ["agreed", "separated", "separated"]
+    assert "SPEAKER_02" in result.confirmed_speaker_ids
+    assert all(
+        segment.speaker_id == "SPEAKER_02"
+        for segment in result.turns
+        if segment.start >= 100.0
+    )
+    assert result.uncertain_speakers == ()

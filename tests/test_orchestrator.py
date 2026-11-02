@@ -293,9 +293,15 @@ class Stages:
         )
 
     def align_dialogue(
-        self, clips: object, *, output_dir: Path, settings: Settings
+        self,
+        clips: object,
+        *,
+        output_dir: Path,
+        settings: Settings,
+        crosstalk: object = (),
     ) -> list[AlignedClip]:
         self._record("timing", clips, output_dir, settings)
+        self.crosstalk_seen = tuple(crosstalk)  # type: ignore[arg-type]
         return [_aligned(self.root, clip) for clip in clips]  # type: ignore[union-attr]
 
     def mix_track(
@@ -531,9 +537,10 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert diarization_block["reclustering"] is None
     assert diarization_block["evidence"] == {"units": 0, "seconds": 0.0}
     assert diarization_block["reassignments"] == []
-    assert diarization_block["windows"] == {
+    assert diarization_block["scenes"] == {
         "total": 0,
-        "diarized": 0,
+        "separated": 0,
+        "agreed": 0,
         "kept": 0,
         "failed": 0,
         "detail": [],
@@ -693,7 +700,7 @@ def test_voice_sample_files_do_not_replace_film_actor_references(
 
     reported = " ".join(messages)
     assert "voice samples" not in reported
-    assert "voice references: using the film actors" in reported
+    assert "every character is spoken in the actor's own voice" in reported
     assert "voice_samples" not in result.stage_seconds
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
@@ -946,31 +953,39 @@ def test_no_voice_profiles_stops_the_run(tmp_path: Path, stages: Stages) -> None
     assert "tts" not in stages.order
 
 
-def test_a_character_the_film_cannot_describe_is_still_voiced(
+def test_a_short_character_is_reported_as_stitched_not_designed(
     tmp_path: Path, stages: Stages
 ) -> None:
-    """One character with no usable reference must not end a run that can voice the rest."""
+    """A character the film gives only short turns is still spoken in their own voice."""
 
-    from app.pipeline.tts import DesignedVoice
-    from app.pipeline.voice_profiles import UnusableVoiceProfile
+    from app.pipeline.voice_profiles import VoiceProfile
 
-    stages.unusable = [
-        UnusableVoiceProfile(
-            speaker_id="SPEAKER_09",
-            reason="the longest continuous stretch of speech is 1.20s",
-        )
-    ]
-    stages.designed = [DesignedVoice("SPEAKER_09", "female, elderly")]
+    stitched = VoiceProfile(
+        speaker_id="SPEAKER_09",
+        reference_audio=tmp_path / "SPEAKER_09" / "reference.wav",
+        reference_start=10.0,
+        reference_end=11.2,
+        composite=True,
+        reference_spans=((10.0, 11.2),),
+        reference_speech_seconds=1.2,
+    )
+    (tmp_path / "SPEAKER_09").mkdir(parents=True, exist_ok=True)
+    stitched.reference_audio.write_bytes(b"stitched")
+    stages.profiles = {**stages.profiles, "SPEAKER_09": stitched}
 
-    result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
+    messages: list[str] = []
+    result = run_pipeline(
+        _source(tmp_path), settings=_settings(tmp_path), progress=messages.append
+    )
 
     assert "tts" in stages.order
-    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-    assert payload["run"]["tts"]["designed_voices"] == [
-        {"speaker_id": "SPEAKER_09", "instruct": "female, elderly"}
-    ]
-    assert "designed from a description" in result.report()
-
+    reported = " ".join(messages)
+    assert "every character is spoken in the actor's own voice" in reported
+    assert "1 stitched from their own short turns" in reported
+    # The summary says the same thing, and nothing claims a designed stand-in.
+    assert "in the actor's own voice" in result.report()
+    assert "1 stitched from short turns" in result.report()
+    assert "designed" not in result.report()
 
 def test_negative_max_lines_is_rejected(tmp_path: Path, stages: Stages) -> None:
     with pytest.raises(orchestrator.OrchestrationError):

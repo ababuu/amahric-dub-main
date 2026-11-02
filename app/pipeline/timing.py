@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,18 @@ ATEMPO_MAX = 2.0
 #: Length of the fade applied to the tail of a line that has to be cut short, in
 #: seconds. Long enough that the cut is inaudible, short enough not to lose a syllable.
 TRIM_FADE_SECONDS = 0.025
+
+#: Most of a real simultaneous exchange that a dub may reproduce. The source may have two
+#: people talking over each other for much longer than this, but a translated line is new
+#: speech in a new language: past a few seconds, two copies at once stop being an
+#: interruption and become unintelligible. Beyond this the later line waits.
+MAX_DELIBERATE_OVERLAP_SECONDS = 2.5
+
+#: Most overlap the two lines' *own* source windows may justify. Overlapping dialogue
+#: windows are weaker evidence than a diarization crosstalk region: they can also come
+#: from two sentences assembled across a turn boundary. A second of it is a real
+#: interruption; more than that is usually bookkeeping, so it is capped tighter.
+MAX_WINDOW_OVERLAP_SECONDS = 1.0
 
 
 class TimingError(RuntimeError):
@@ -138,6 +151,10 @@ class AlignedClip:
     #: A drifted line is *late* rather than doubling another voice, which is the smaller
     #: cost: two voices at once is unintelligible, a late line is merely a little behind.
     drift: float = 0.0
+    #: Seconds of this line that deliberately sound underneath the line before it, because
+    #: the film had the two characters speaking at once. Reported so an overlap in the dub
+    #: can always be traced back to an overlap in the source.
+    deliberate_overlap: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
@@ -161,7 +178,8 @@ class AlignedClip:
             )
 
         for name in ("start", "tempo", "required_tempo", "rendered_pause_before",
-                     "rendered_pause_after", "drift", "overrun", "trimmed"):
+                     "rendered_pause_after", "drift", "overrun", "trimmed",
+                     "deliberate_overlap"):
             value = getattr(self, name)
             number = _finite(name, value)
             if number < 0:
@@ -234,6 +252,7 @@ class AlignedClip:
             "trimmed": self.trimmed,
             "overrun": self.overrun,
             "drift": self.drift,
+            "deliberate_overlap": self.deliberate_overlap,
             "rendered_pause_before": self.rendered_pause_before,
             "rendered_pause_after": self.rendered_pause_after,
             "duration": self.duration,
@@ -632,6 +651,7 @@ def align_dialogue(
     *,
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
+    crosstalk: Sequence[Any] = (),
 ) -> list[AlignedClip]:
     """Fit every clip to its original window, in the order it was given.
 
@@ -644,6 +664,10 @@ def align_dialogue(
         ``<WORK_DIR>/timing/aligned``.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
+    crosstalk:
+        Regions where the film itself has two characters speaking at once, from
+        diarization. Two lines inside such a region are left overlapping the way the
+        source was, and the overlap is recorded on the later line.
 
     Returns
     -------
@@ -689,7 +713,19 @@ def align_dialogue(
             rooms.append(None)
             continue
         following = ordered[position + 1]
-        deadline = _audio_start(following) - guard
+        # Two lines the film had speaking at once are allowed to overlap by that much, so
+        # the earlier one is not squeezed to make room for a neighbour it was already
+        # talking over.
+        simultaneous = _simultaneous_seconds(
+            first_speaker=clip.speaker_id,
+            first_start=clip.start,
+            first_end=clip.end,
+            second_speaker=following.speaker_id,
+            second_start=following.start,
+            second_end=following.end,
+            crosstalk=crosstalk,
+        )
+        deadline = _audio_start(following) - guard + simultaneous
         rooms.append(deadline - clip.dialogue.start - clip.rendered_pause_after)
 
     aligned: list[AlignedClip] = []
@@ -705,11 +741,63 @@ def align_dialogue(
         aligned,
         guard=guard,
         overlap=resolved.timing_max_overlap_seconds,
+        crosstalk=crosstalk,
     )
 
 
+def _simultaneous_seconds(
+    *,
+    first_speaker: str,
+    first_start: float,
+    first_end: float,
+    second_speaker: str,
+    second_start: float,
+    second_end: float,
+    crosstalk: Sequence[Any],
+) -> float:
+    """Return how long the film had these two characters speaking at once.
+
+    Two signals are combined. The lines' own source windows may overlap, which is what a
+    dub most often has to preserve; and the overlap-aware annotation may report a region
+    naming both speakers, which is the only evidence left when the exclusive attribution
+    (one speaker per instant) has already dropped one of the two voices. Window overlap is
+    capped at :data:`MAX_WINDOW_OVERLAP_SECONDS` because assembled sentences can overlap
+    without anyone speaking at once, while a region is direct evidence and is capped at
+    :data:`MAX_DELIBERATE_OVERLAP_SECONDS`.
+
+    One character never overlaps themselves: their turns do not overlap in the source, and
+    the same voice laid over itself is heard as a stutter rather than as an interruption.
+    """
+
+    if first_speaker == second_speaker:
+        return 0.0
+    granted = min(max(0.0, first_end - second_start), MAX_WINDOW_OVERLAP_SECONDS)
+    for region in crosstalk:
+        speakers = getattr(region, "speaker_ids", ())
+        if first_speaker not in speakers or second_speaker not in speakers:
+            continue
+        start = getattr(region, "start", None)
+        end = getattr(region, "end", None)
+        if start is None or end is None:
+            continue
+        # The part of the region the second line is inside, and only if the first line is
+        # still going at that point.
+        overlap_end = min(float(end), second_end)
+        if second_start >= overlap_end or float(end) <= first_start:
+            continue
+        granted = max(
+            granted,
+            min(overlap_end - second_start, MAX_DELIBERATE_OVERLAP_SECONDS),
+        )
+    return granted
+
+
 def _cascade(
-    aligned: list[AlignedClip], *, guard: float, overlap: float = 0.0
+    aligned: list[AlignedClip],
+    *,
+    guard: float,
+    overlap: float = 0.0,
+    crosstalk: Sequence[Any] = (),
 ) -> list[AlignedClip]:
     """Place lines later so that no two of them are ever *intelligibly* at once.
 
@@ -717,20 +805,26 @@ def _cascade(
     either rushing it past intelligibility or cutting a word off the end. Both were
     tried; both were audible. So the overrun is paid for in position instead: the next
     line waits until this one has finished, except for the configured short handover
-    allowance between different speakers. Originally simultaneous lines are subject to
-    the same cap as any other handover.
+    allowance between different speakers.
 
     ``overlap`` is the concession that keeps the picture: up to this many seconds of the
     previous line may still be sounding when the next one starts, which is what a
     conversation already sounds like, before the next line is moved at all. A third of a
     second of hand-over is heard as a natural interruption; three seconds of it is two
-    people talking at once, which is the thing a dub must never do.
+    people talking at once, which is the thing a dub must never do *by accident*.
+
+    Real crosstalk is the one case where two voices at once is not an accident. When the
+    film itself has these two characters speaking simultaneously - a
+    :class:`~app.pipeline.diarization.CrosstalkRegion` names both speakers and covers the
+    current line - the dub reproduces that overlap up to
+    :data:`MAX_DELIBERATE_OVERLAP_SECONDS`, and the seconds it did so are recorded on the
+    line. A dub that always separated them would sound unlike the scene it is dubbing.
 
     The allowance is for a change of speaker. The same character never hands over to
     themselves - their turns do not overlap in the source, and the same voice laid over
     itself is not heard as an interruption but as a stutter, because the ear has nothing
     to separate the two copies with. So one speaker's speech is never left sounding under
-    their own next line.
+    their own next line, crosstalk or not.
 
     Everything here is measured between *speech* boundaries rather than file boundaries.
     A clip carries its rendered pauses with it, and silence over silence is inaudible, so
@@ -743,8 +837,26 @@ def _cascade(
     for clip in aligned:
         same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
         allowed = 0.0 if same_speaker else overlap
+        simultaneous = (
+            0.0
+            if same_speaker or previous is None
+            else _simultaneous_seconds(
+                first_speaker=previous.speaker_id,
+                first_start=previous.clip.start,
+                first_end=previous.clip.end,
+                second_speaker=clip.speaker_id,
+                second_start=clip.clip.start,
+                second_end=clip.clip.end,
+                crosstalk=crosstalk,
+            )
+        )
+        allowed = max(allowed, simultaneous)
+        # A gap between two voices is a preference; reproducing the film is the point. Where
+        # the source itself had these two at once, the handover gap is not charged against
+        # the overlap, so the line lands where the actor did.
+        if simultaneous > 0.0:
+            allowed += guard
         # The constraint is on speech, not the files: pauses are inaudible over silence.
-        # Even genuine source crosstalk is capped so translated dialogue stays clear.
         floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
         start = max(clip.start, floor)
         drift = start - clip.start
@@ -766,6 +878,21 @@ def _cascade(
                     "spoken over",
                 ),
             )
+        heard_at_once = 0.0
+        if previous is not None and not same_speaker and simultaneous > 0.0:
+            heard_at_once = previous_speech_end - (
+                clip.start + clip.rendered_pause_before
+            )
+            if heard_at_once > 1e-6:
+                clip = replace(
+                    clip,
+                    deliberate_overlap=heard_at_once,
+                    notes=clip.notes
+                    + (
+                        "the film had these two speaking at once here, so this line is "
+                        f"left overlapping the one before it by {heard_at_once:.3f}s",
+                    ),
+                )
         previous_speech_end = (
             clip.start + clip.rendered_pause_before + clip.speech_duration
         )
@@ -779,6 +906,8 @@ __all__ = [
     "ATEMPO_MAX",
     "ATEMPO_MIN",
     "EXACT_FIT_TOLERANCE_SECONDS",
+    "MAX_DELIBERATE_OVERLAP_SECONDS",
+    "MAX_WINDOW_OVERLAP_SECONDS",
     "PIPELINE_SAMPLE_RATE",
     "TIMING_DIRECTORY_NAME",
     "AlignedClip",

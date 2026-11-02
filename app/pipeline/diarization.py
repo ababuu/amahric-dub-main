@@ -6,7 +6,7 @@ returns the speaker turns every later stage needs::
 
     speech.wav -> diarize() -> [SpeakerSegment(speaker_id, start, end), ...]
 
-Three passes, each covering something the one before it cannot see:
+Four passes, each covering something the one before it cannot see:
 
 1. **Global**, the model's own view. Community-1 diarizes the whole dialogue stem and
    returns an exclusive annotation (one speaker per instant) plus an overlap-aware one
@@ -14,13 +14,17 @@ Three passes, each covering something the one before it cannot see:
    unless the caller configures one.
 2. **Evidence**, this module's own embeddings. Every turn of at least half a second is
    embedded; turns heard together are aggregated into one voiceprint, so a character
-   whose lines are all short still has evidence to be judged on. Attributions are
-   verified against Community-1's speaker prototypes, and a cluster whose turns hold
-   two voices is split - with every near-miss reported as a candidate.
-3. **Suspect windows**, where the film-wide evidence was too thin to decide. Short
-   windows around ambiguous or overlapping dialogue are diarized on their own, and may
-   name a character the film-wide pass missed or move one of its turns to another
-   identity. Only the turns a window was opened for can be changed by it.
+   whose lines are all short still has evidence to be judged on.
+3. **Re-partitioning**, where the film is re-clustered as one body of evidence instead of
+   inheriting the model's clusters. The number of speakers is chosen from the film's own
+   similarity scale, and a character whose lines were scattered across two model clusters
+   comes back as one identity.
+4. **Scenes**, where the film is accounted for character by character. Each scene is
+   diarized on its own, so a character whose whole part is a few short lines in one
+   conversation is found there and given an identity - however briefly they speak, and
+   never by a duration threshold. The scene's voices are matched to identities by voice,
+   and where the scene separates more voices than the film-wide pass heard, the extra one
+   is a character the film-wide prototypes had merged.
 
 The identities themselves come from the final partition, are rebuilt once, and are
 persisted, so one character keeps one id and one cloned voice for the whole film. A
@@ -132,36 +136,16 @@ _CLUSTER_DOMINANCE = 0.6
 #: still follow it. Beyond this it keeps the label pyannote gave it.
 _UNMEASURED_INHERIT_SECONDS = 2.0
 
-#: Most new characters one suspect window may introduce: a few seconds of audio that
-#: yields a cast is a mistake, not a discovery.
-_WINDOW_MAX_NEW_IDENTITIES = 1
+#: A scene is allowed to name this many voices on top of the ones the film-wide
+#: attribution already gave it. A scene that hears more than twice the cast it was handed
+#: is separating noise, not finding characters.
+_SCENE_IDENTITY_HEADROOM = 1.0
 
-#: A window needs at least this much speech in a cluster before it may name a character
-#: from it.
-_WINDOW_MIN_CLUSTER_SECONDS = 1.0
+#: Two pieces of a re-cut turn closer together than this are the same piece.
+_SCENE_PIECE_TOLERANCE = 1e-3
 
-#: Evidence a window-discovered voice needs *across the run* before it counts as a
-#: character. A film-wide partition that declined a third speaker, plus a suspect window
-#: that briefly found one, must not end up reporting a third identity on 1.8 seconds of
-#: audio: a window's own diarization is the noisiest evidence in the pipeline, and a
-#: three-second clip of a neighbour's turn easily becomes a "new character" there. Below
-#: this the candidate is reported as unresolved, and its turns keep the attribution they
-#: had before the window ran.
-_IDENTITY_MIN_CONFIRMED_SECONDS = 3.0
-
-#: Shortest suspect window worth a diarization call, and the longest one allowed: these
-#: are windows around ambiguous dialogue, not scenes.
-_WINDOW_MIN_SPAN_SECONDS = 2.0
-_WINDOW_MAX_SPAN_SECONDS = 15.0
-
-#: How much audio either side of an ambiguous performance a suspect window covers.
-_WINDOW_PAD_SECONDS = 0.75
-
-#: Silence between two suspect performances that still belongs to the same window.
-_WINDOW_JOIN_GAP_SECONDS = 1.0
-
-#: The window modes the pipeline understands.
-_WINDOW_MODES = ("all", "suspect", "off")
+#: The scene modes the pipeline understands: every scene, only ambiguous scenes, or none.
+_SCENE_MODES = ("all", "suspect", "off")
 
 
 
@@ -311,8 +295,9 @@ class DiarizationResult:
 
     Nothing about a character's identity is decided silently: ``reclustering`` reports
     the partition chosen and every one refused, ``reassignments`` every performance that
-    moved, ``windows`` what each suspect window found, ``uncertain_speakers`` the voices
-    that could not be told apart, and ``merges`` the identities that were one person.
+    moved, ``windows`` what each scene's own diarization found, ``uncertain_speakers`` the
+    voices that could not be told apart, and ``merges`` the identities that were one
+    person.
     """
 
     turns: tuple[SpeakerSegment, ...]
@@ -331,7 +316,7 @@ class DiarizationResult:
     unit_seconds: float = 0.0
     #: Every performance the re-partitioning moved to a different identity.
     reassignments: tuple["SpeakerReassignment", ...] = ()
-    #: Suspect windows diarized on their own, and what each one produced.
+    #: Each scene diarized on its own, and what it produced.
     windows: tuple["DiarizationWindow", ...] = ()
     #: Voices that could not be tied to an identity with confidence. They were given an
     #: id of their own rather than being folded into somebody else's, and they are *not*
@@ -1439,29 +1424,77 @@ def _window_mode(value: str) -> str:
     """Return the validated window mode, or raise for a value that is not one."""
 
     mode = (value or "").strip().lower()
-    if mode not in _WINDOW_MODES:
+    if mode not in _SCENE_MODES:
         raise InvalidInputError(
-            f"DIARIZATION_SCENE_MODE must be one of {', '.join(_WINDOW_MODES)}, "
+            f"DIARIZATION_SCENE_MODE must be one of {', '.join(_SCENE_MODES)}, "
             f"got {value!r}"
         )
     return mode
 
 
-def _suspect_windows(
+def _segment_scenes(
+    turns: Sequence[SpeakerSegment], *, gap: float, max_seconds: float
+) -> list[_Window]:
+    """Cut the film into scenes at the silences between its turns.
+
+    This is the accounting unit the pipeline is built around: a scene is where a
+    conversation happens, and every character who speaks in it must come out of it with
+    an identity - however briefly they speak. The boundaries fall between turns, so a
+    scene always holds whole turns and its diarization can be spliced back without
+    re-timing anything.
+    """
+
+    if not turns:
+        return []
+    spans: list[list[float]] = []
+    start = turns[0].start
+    previous = turns[0]
+    for segment in turns[1:]:
+        if segment.start - previous.end >= gap or segment.end - start > max_seconds:
+            spans.append([start, previous.end])
+            start = segment.start
+        previous = segment
+    spans.append([start, previous.end])
+
+    scenes: list[_Window] = []
+    for begin, end in spans:
+        inside = tuple(
+            index
+            for index, segment in enumerate(turns)
+            if segment.start < end + 1e-9 and segment.end > begin - 1e-9
+        )
+        if not inside:
+            continue
+        scenes.append(
+            _Window(
+                index=len(scenes),
+                start=begin,
+                end=end,
+                turn_indexes=inside,
+                # A scene is not "suspect" or otherwise: its speakers are accounted for
+                # whether or not anything about it looks ambiguous.
+                suspect_indexes=inside,
+            )
+        )
+    return scenes
+
+
+def _suspect_scenes(
     turns: Sequence[SpeakerSegment],
+    scenes: Sequence[_Window],
     units: Sequence["_EvidenceGroup"],
     labels: Sequence[int],
     voiceprints: Mapping[int, tuple[float, ...]],
     calibration: partition.Calibration,
     crosstalk: tuple[CrosstalkRegion, ...],
 ) -> list[_Window]:
-    """Return short windows around the dialogue the evidence could not settle.
+    """Return the scenes whose dialogue the film-wide evidence could not settle.
 
-    Two things make a performance worth a second look: its two best clusters are too
-    close to call, or it overlaps another speaker - the one case where the exclusive
-    annotation necessarily drops a voice. The windows cover only those performances plus
-    a little context, never a whole scene: diarizing a minute of film again asks the same
-    question that already failed.
+    Two things make a scene worth a second look: one of its performances has its two best
+    clusters too close to call, or one of its turns overlaps another speaker - the one
+    case where the exclusive annotation necessarily drops a voice. The scene is diarized
+    whole, because a voice that has to be re-heard is always in conversation with the
+    voices around it.
     """
 
     suspect_indexes: set[int] = set()
@@ -1477,48 +1510,23 @@ def _suspect_windows(
     for index, segment in enumerate(turns):
         if _is_crosstalk_turn(segment, crosstalk):
             suspect_indexes.add(index)
-    if not suspect_indexes:
-        return []
 
-    spans = sorted(
-        (max(0.0, turns[index].start - _WINDOW_PAD_SECONDS),
-         turns[index].end + _WINDOW_PAD_SECONDS)
-        for index in suspect_indexes
-    )
-    merged: list[list[float]] = []
-    for start, end in spans:
-        if (
-            merged
-            and start - merged[-1][1] <= _WINDOW_JOIN_GAP_SECONDS
-            and end - merged[-1][0] <= _WINDOW_MAX_SPAN_SECONDS
-        ):
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-
-    windows: list[_Window] = []
-    for start, end in merged:
-        if end - start < _WINDOW_MIN_SPAN_SECONDS:
+    selected: list[_Window] = []
+    for scene in scenes:
+        if not suspect_indexes.intersection(scene.turn_indexes):
             continue
-        inside = tuple(
-            index
-            for index, segment in enumerate(turns)
-            if segment.start < end and segment.end > start
-        )
-        if not inside:
-            continue
-        windows.append(
+        selected.append(
             _Window(
-                index=len(windows),
-                start=start,
-                end=end,
-                turn_indexes=inside,
+                index=len(selected),
+                start=scene.start,
+                end=scene.end,
+                turn_indexes=scene.turn_indexes,
                 suspect_indexes=tuple(
-                    index for index in inside if index in suspect_indexes
+                    index for index in scene.turn_indexes if index in suspect_indexes
                 ),
             )
         )
-    return windows
+    return selected
 
 
 def _window_argument(
@@ -1735,11 +1743,50 @@ def _local_clusters(
     return clusters
 
 
-def _reconcile_windows(
+def _relabel_scene(
+    scene_turns: Sequence[SpeakerSegment],
+    local: Sequence[SpeakerSegment],
+    mapping: Mapping[str, str],
+) -> list[SpeakerSegment]:
+    """Return the scene's turns with the identities its own diarization supports.
+
+    The scene's own segmentation is used only to *place* identities: every instant
+    covered by an original turn stays covered, so a scene can never lose dialogue. Where
+    a local turn overlaps an original turn, the original is split at the local boundary
+    and each piece takes the identity the local cluster was mapped to; anything the local
+    pass did not cover keeps the label the film-wide attribution gave it.
+    """
+
+    relabelled: list[SpeakerSegment] = []
+    for turn in scene_turns:
+        boundaries = {turn.start, turn.end}
+        covering: list[SpeakerSegment] = []
+        for segment in local:
+            if segment.start < turn.end and segment.end > turn.start:
+                covering.append(segment)
+                boundaries.add(max(turn.start, segment.start))
+                boundaries.add(min(turn.end, segment.end))
+        ordered = sorted(boundary for boundary in boundaries if turn.start <= boundary <= turn.end)
+        for begin, stop in zip(ordered, ordered[1:]):
+            if stop - begin <= _SCENE_PIECE_TOLERANCE:
+                continue
+            middle = (begin + stop) / 2.0
+            match = next(
+                (segment for segment in covering if segment.start <= middle < segment.end),
+                None,
+            )
+            speaker_id = (
+                mapping.get(match.speaker_id) if match is not None else None
+            ) or turn.speaker_id
+            relabelled.append(SpeakerSegment(speaker_id, begin, stop))
+    return relabelled
+
+
+def _reconcile_scenes(
     pipeline: Any,
     audio_path: Path,
     turns: Sequence[SpeakerSegment],
-    windows: Sequence[_Window],
+    scenes: Sequence[_Window],
     voiceprints: Mapping[str, tuple[float, ...]],
     calibration: partition.Calibration,
     *,
@@ -1748,53 +1795,63 @@ def _reconcile_windows(
     list[SpeakerSegment],
     tuple[DiarizationWindow, ...],
     tuple[UncertainSpeaker, ...],
-    tuple[UnresolvedSpeaker, ...],
     tuple[str, ...],
     dict[tuple[float, float], tuple[float, ...]],
 ]:
-    """Diarize each suspect window on its own and let it correct the attribution.
+    """Diarize each scene on its own and make sure every voice in it has an identity.
 
-    A window may change only the turns it was opened for - the ambiguous ones, and the
-    ones under crosstalk - so a noisy few seconds cannot rewrite a scene it merely
-    borders. Within that remit it can do both things the film-wide pass can do: name a
-    character the current attribution lacks, and *move* dialogue from one existing
-    identity to another when its own diarization separates them.
+    This is the accounting pass, and it is deliberately not a *suspect* pass: a scene is
+    diarized because it is a scene, so a character whose whole part is one short line in
+    one conversation is found there and nowhere else. Every voice the scene separates
+    gets an identity - the ones already known keep theirs, and any voice that matches
+    nothing in the film is given an id of its own on the spot. A duration threshold is
+    exactly wrong here: it is the short parts this pass exists to account for.
 
-    A character a window names is not automatically a character of the film. A window is
-    the noisiest evidence in the pipeline, so an identity it introduces must clear
-    :data:`_IDENTITY_MIN_CONFIRMED_SECONDS` of its own audio across the run before it is
-    counted; below that the candidate is reported as unresolved and its turns go back to
-    the attribution they had before any window ran.
+    Matching is by voice, never by label, so a scene that hears the same two people in the
+    other order relabels them. A scene also cannot keep a merge the film-wide pass made:
+    if it separates more clusters than it was handed identities, the weakest-matching of
+    those clusters is a voice of its own - that is how a character the film-wide
+    prototypes absorbed gets an id back.
+
+    What a scene may *not* do is rewrite a scene it merely borders: its labels replace the
+    current attribution only when it named a voice of its own, or separated more voices
+    than the film-wide pass heard there, or heard the same number in a different
+    arrangement. Otherwise the film-wide labels, decided on far more audio, stand. Every
+    instant the scene's own segmentation does not cover keeps the attribution it had, so
+    a scene can add a name but never drop dialogue.
+
+    An identity found in only one scene is kept and reported as uncertain rather than
+    confirmed - not because it is fake, but because one appearance is not yet evidence
+    that the film has a recurring character there.
     """
 
     reports: list[DiarizationWindow] = []
     uncertain: list[UncertainSpeaker] = []
-    unresolved: list[UnresolvedSpeaker] = []
     replacements: dict[int, list[SpeakerSegment]] = {}
-    affected_by_window: dict[int, set[int]] = {}
     replaced: set[int] = set()
     accepted_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
     discovered: list[str] = []
     catalogue: dict[str, tuple[float, ...]] = dict(voiceprints)
-    #: Audio a window found for each identity *it* introduced, and the best evidence
-    #: behind it. Used to decide whether the candidate is a character or noise.
-    candidate_seconds: dict[str, float] = {}
-    candidate_evidence: dict[str, tuple[float, float]] = {}
+    appearances: dict[str, int] = {speaker_id: 0 for speaker_id in catalogue}
+    seconds_by_identity: dict[str, float] = {speaker_id: 0.0 for speaker_id in catalogue}
+    worst_evidence: dict[str, tuple[float, float]] = {}
+    known_at_start = set(catalogue)
 
-    for window in windows:
-        window_turns = [turns[index] for index in window.turn_indexes]
-        current = {segment.speaker_id for segment in window_turns}
-        local = _diarize_window(pipeline, audio_path, window)
+    for scene in scenes:
+        scene_turns = [turns[index] for index in scene.turn_indexes]
+        current = {segment.speaker_id for segment in scene_turns}
+
+        local = _diarize_window(pipeline, audio_path, scene)
         if local is None:
             reports.append(
                 DiarizationWindow(
-                    index=window.index,
-                    start=window.start,
-                    end=window.end,
-                    turns=len(window_turns),
+                    index=scene.index,
+                    start=scene.start,
+                    end=scene.end,
+                    turns=len(scene_turns),
                     speakers=tuple(sorted(current)),
                     mode="failed",
-                    detail="the window could not be diarized on its own",
+                    detail="the scene could not be diarized on its own",
                 )
             )
             continue
@@ -1805,22 +1862,23 @@ def _reconcile_windows(
         if not local_vectors:
             reports.append(
                 DiarizationWindow(
-                    index=window.index,
-                    start=window.start,
-                    end=window.end,
-                    turns=len(window_turns),
+                    index=scene.index,
+                    start=scene.start,
+                    end=scene.end,
+                    turns=len(scene_turns),
                     speakers=tuple(sorted(current)),
                     mode="kept",
-                    detail="the window's turns were too short to embed",
+                    detail="the scene's turns were too short to embed",
                 )
             )
             continue
 
-        mapping: dict[str, str] = {}
-        ambiguous_labels: set[str] = set()
-        minted = 0
-        for label, cluster in sorted(_local_clusters(local, local_vectors).items()):
-            if cluster.vector is None or cluster.seconds < _WINDOW_MIN_CLUSTER_SECONDS:
+        clusters = _local_clusters(local, local_vectors)
+        ranked_clusters: list[
+            tuple[float, float, str, str, _LocalCluster]
+        ] = []
+        for label, cluster in sorted(clusters.items()):
+            if cluster.vector is None:
                 continue
             ranked = sorted(
                 (
@@ -1829,225 +1887,151 @@ def _reconcile_windows(
                 ),
                 key=lambda item: (-item[1], item[0]),
             )
-            if not ranked:
-                continue
-            best_id, best_score = ranked[0]
+            best_id, best_score = ranked[0] if ranked else ("", -1.0)
             rival = max((score for _, score in ranked[1:]), default=-1.0)
-            margin = best_score - rival
-            if best_score >= calibration.same_similarity and margin >= calibration.margin:
+            ranked_clusters.append((best_score, best_score - rival, best_id, label, cluster))
+
+        # A scene that separates more voices than the film-wide pass gave it has heard a
+        # merge, not noise: the extra clusters cannot be explained by the identities it
+        # was handed. The surplus is taken from the weakest-matching clusters, which is
+        # how a voice the film-wide prototypes absorbed gets its own id back.
+        surplus = max(0, len(ranked_clusters) - max(len(current), 1))
+        by_quality = sorted(
+            ranked_clusters, key=lambda item: (-item[0], -item[1], item[3])
+        )
+        established = {item[3] for item in by_quality[: len(by_quality) - surplus]}
+
+        mapping: dict[str, str] = {}
+        minted = 0
+        budget = max(1, int(len(current) * _SCENE_IDENTITY_HEADROOM))
+        for best_score, margin, best_id, label, cluster in ranked_clusters:
+            decisive = (
+                bool(best_id)
+                and best_score >= calibration.same_similarity
+                and margin >= calibration.margin
+            )
+            if decisive and label in established:
                 mapping[label] = best_id
-                if best_id in candidate_seconds:
-                    candidate_seconds[best_id] += cluster.seconds
-                    previous = candidate_evidence.get(best_id)
-                    if previous is None or margin < previous[1]:
-                        candidate_evidence[best_id] = (best_score, margin)
+            elif minted < budget:
+                new_id = _next_speaker_id(set(catalogue) | set(mapping.values()))
+                catalogue[new_id] = cluster.vector
+                mapping[label] = new_id
+                minted += 1
+                discovered.append(new_id)
+            else:
+                # No budget left to name another voice in this scene: keep the label the
+                # film-wide pass gave, and say the scene could not account for it.
                 continue
-            if minted >= _WINDOW_MAX_NEW_IDENTITIES:
-                ambiguous_labels.add(label)
-                continue
-            new_id = _next_speaker_id(set(catalogue) | set(mapping.values()))
-            catalogue[new_id] = cluster.vector
-            mapping[label] = new_id
-            minted += 1
-            discovered.append(new_id)
-            candidate_seconds[new_id] = candidate_seconds.get(new_id, 0.0) + cluster.seconds
-            candidate_evidence[new_id] = (best_score, margin)
-
-        affected = [
-            index
-            for index in window.suspect_indexes
-            if any(
-                segment.start < turns[index].end and segment.end > turns[index].start
-                for segment in local
+            speaker_id = mapping[label]
+            appearances[speaker_id] = appearances.get(speaker_id, 0) + 1
+            seconds_by_identity[speaker_id] = (
+                seconds_by_identity.get(speaker_id, 0.0) + cluster.seconds
             )
-        ]
-        if not affected:
+            previous = worst_evidence.get(speaker_id)
+            if previous is None or margin < previous[1]:
+                worst_evidence[speaker_id] = (best_score, margin)
+
+        separate = len(set(mapping.values()))
+        replacement = _relabel_scene(scene_turns, local, mapping)
+        # A scene is worth adopting when it accounts for a voice the film-wide pass
+        # merged, or when it hears more voices than the film-wide pass gave it, or when it
+        # hears the same number in a different arrangement.
+        changes = sum(
+            1
+            for segment in replacement
+            if next(
+                (
+                    candidate.speaker_id
+                    for candidate in scene_turns
+                    if candidate.start < segment.end
+                    and candidate.end > segment.start
+                ),
+                segment.speaker_id,
+            )
+            != segment.speaker_id
+        )
+        adopt = bool(replacement) and (
+            minted > 0
+            or separate > len(current)
+            or (separate == len(current) and changes)
+        )
+        if not adopt:
             reports.append(
                 DiarizationWindow(
-                    index=window.index,
-                    start=window.start,
-                    end=window.end,
-                    turns=len(window_turns),
+                    index=scene.index,
+                    start=scene.start,
+                    end=scene.end,
+                    turns=len(scene_turns),
                     speakers=tuple(sorted(current)),
-                    mode="kept",
-                    detail="the window's own diarization did not cover the suspect turns",
-                )
-            )
-            continue
-
-        span_start = min(turns[index].start for index in affected)
-        span_end = max(turns[index].end for index in affected)
-        replacement: list[SpeakerSegment] = []
-        changes: set[tuple[int, str]] = set()
-        undecided = False
-        for segment in local:
-            if segment.end <= span_start or segment.start >= span_end:
-                continue
-            start = max(segment.start, span_start)
-            end = min(segment.end, span_end)
-            if end <= start:
-                continue
-            mapped = mapping.get(segment.speaker_id)
-            if mapped is None:
-                if segment.speaker_id in ambiguous_labels:
-                    undecided = True
-                mapped = next(
-                    (
-                        turns[index].speaker_id
-                        for index in affected
-                        if turns[index].start < end and turns[index].end > start
-                    ),
-                    None,
-                )
-            if mapped is None:
-                continue
-            replacement.append(SpeakerSegment(mapped, start, end))
-            for index in affected:
-                if (
-                    turns[index].start < end
-                    and turns[index].end > start
-                    and turns[index].speaker_id != mapped
-                ):
-                    changes.add((index, mapped))
-
-        if not replacement or undecided or not changes:
-            reports.append(
-                DiarizationWindow(
-                    index=window.index,
-                    start=window.start,
-                    end=window.end,
-                    turns=len(window_turns),
-                    speakers=tuple(sorted(current)),
-                    mode="kept",
+                    mode="agreed",
                     detail=(
-                        "the window could not decide between identities for its "
-                        "ambiguous turns"
-                        if undecided
-                        else "the window agreed with the current attribution"
+                        f"the scene separates {separate} voice(s), which the film-wide "
+                        "attribution already accounts for"
                     ),
                 )
             )
             continue
-
-        replacements[window.index] = replacement
-        affected_by_window[window.index] = set(affected)
-        replaced.update(affected)
+        replacements[scene.index] = replacement
+        replaced.update(scene.turn_indexes)
         accepted_vectors.update(_vectors_by_time(local, local_vectors))
         reports.append(
             DiarizationWindow(
-                index=window.index,
-                start=window.start,
-                end=window.end,
+                index=scene.index,
+                start=scene.start,
+                end=scene.end,
                 turns=len(replacement),
-                speakers=tuple(sorted({segment.speaker_id for segment in replacement})),
-                mode="window",
+                speakers=tuple(
+                    sorted({segment.speaker_id for segment in replacement})
+                ),
+                mode="separated",
                 detail=(
-                    f"the window moved {len(changes)} suspect turn(s) to the identity "
-                    "its own diarization supports"
+                    f"the scene separates {separate} voice(s); the film-wide pass had "
+                    f"{len(current)}"
                 ),
             )
         )
 
-    if not replacements:
-        return (
-            list(turns),
-            tuple(reports),
-            tuple(uncertain),
-            tuple(unresolved),
-            tuple(discovered),
-            accepted_vectors,
-        )
-
-    # A window only *proposes* a character. Demote the ones the run did not accumulate
-    # enough of, and drop the whole window that introduced them: a window that promoted a
-    # two-second fragment to a character is not evidence about anything else either, so
-    # its suspect turns keep the attribution they had before it ran.
-    thin = [
-        speaker_id
-        for speaker_id, seconds in candidate_seconds.items()
-        if seconds < _IDENTITY_MIN_CONFIRMED_SECONDS
-    ]
-    names = set(thin)
-    tainted = {
-        index
-        for index, replacement in replacements.items()
-        if any(segment.speaker_id in names for segment in replacement)
-    }
-    for index in sorted(tainted):
-        replacements.pop(index)
-        replaced.difference_update(affected_by_window.get(index, set()))
-    for speaker_id in thin:
-        seconds = candidate_seconds[speaker_id]
-        similarity, margin = candidate_evidence.get(speaker_id, (-1.0, 0.0))
-        unresolved.append(
-            UnresolvedSpeaker(
+    # Every identity is accounted for, and one that the film only ever produces once is
+    # reported as uncertain: kept, spoken in its own voice, but not yet confirmed.
+    for speaker_id, count in sorted(appearances.items()):
+        if speaker_id in known_at_start or count > 1:
+            continue
+        similarity, margin = worst_evidence.get(speaker_id, (-1.0, 0.0))
+        uncertain.append(
+            UncertainSpeaker(
                 speaker_id=speaker_id,
                 reason=(
-                    "a suspect window separated this voice, but the run found only "
-                    f"{seconds:.1f}s of it, below the "
-                    f"{_IDENTITY_MIN_CONFIRMED_SECONDS:.1f}s needed to establish a "
-                    "character; its turns keep the attribution they had"
+                    "this voice is accounted for in one scene only; it keeps its own id "
+                    "and its own reference, but one appearance does not yet establish a "
+                    "recurring character"
                 ),
                 similarity=similarity,
                 margin=margin,
-                seconds=seconds,
+                seconds=seconds_by_identity.get(speaker_id, 0.0),
             )
         )
-    if names:
-        discovered = [speaker_id for speaker_id in discovered if speaker_id not in names]
-        reports = [
-            DiarizationWindow(
-                index=report.index,
-                start=report.start,
-                end=report.end,
-                turns=report.turns,
-                speakers=(
-                    tuple(
-                        sorted(
-                            {
-                                segment.speaker_id
-                                for index, segment in enumerate(turns)
-                                if index in affected_by_window.get(report.index, set())
-                            }
-                        )
-                    )
-                    if report.mode == "window"
-                    else report.speakers
-                ),
-                mode="kept" if report.mode == "window" else report.mode,
-                detail=(
-                    "the only character this window separated was not established; "
-                    "its turns keep the previous attribution"
-                    if report.mode == "window"
-                    else report.detail
-                ),
-            )
-            for report in reports
-        ]
 
     if not replacements:
         return (
             list(turns),
             tuple(reports),
             tuple(uncertain),
-            tuple(unresolved),
-            tuple(discovered),
+            tuple(dict.fromkeys(discovered)),
             accepted_vectors,
         )
 
-    merged: list[SpeakerSegment] = [
+    merged_turns: list[SpeakerSegment] = [
         segment for index, segment in enumerate(turns) if index not in replaced
     ]
-    for window in windows:
-        if window.index in replacements:
-            merged.extend(replacements[window.index])
-    merged.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
+    for scene in scenes:
+        if scene.index in replacements:
+            merged_turns.extend(replacements[scene.index])
+    merged_turns.sort(key=lambda segment: (segment.start, segment.end, segment.speaker_id))
     return (
-        merged,
+        merged_turns,
         tuple(reports),
         tuple(uncertain),
-        tuple(unresolved),
-        tuple(discovered),
+        tuple(dict.fromkeys(discovered)),
         accepted_vectors,
     )
 
@@ -2176,9 +2160,10 @@ def diarize_detailed(
        speakers, and whether any number of speakers is believable at all, comes from the
        film's own similarity scale (:mod:`app.pipeline.speaker_partition`). Every
        candidate and every rejection is reported.
-    4. **Suspect windows**: short windows around dialogue the re-partitioning could not
-       settle (ambiguous, or overlapping another speaker) are diarized on their own, and
-       may name a character the film-wide pass missed.
+    4. **Scenes**: the film is cut into scenes at its silences and each one is diarized on
+       its own, so every voice in it is accounted for however short its turn. A scene
+       names voices of its own, relabels them by voice, and splits one the film-wide
+       prototypes had merged; an identity seen in one scene only is reported as uncertain.
 
     Identities are rebuilt from the final partition and persisted once, so a character
     keeps one id and one voice for the whole film and across re-runs.
@@ -2323,26 +2308,32 @@ def diarize_detailed(
 
     windows: tuple[DiarizationWindow, ...] = ()
     uncertain_windows: tuple[UncertainSpeaker, ...] = ()
-    unresolved_windows: tuple[UnresolvedSpeaker, ...] = ()
     discovered_windows: tuple[str, ...] = ()
     window_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
-    if mode != "off" and units and resolved.diarization_split_mixed_speakers:
-        suspect = _suspect_windows(
-            turns, unit_groups, labels, voiceprints, calibration, crosstalk
+    if mode != "off" and turns and resolved.diarization_split_mixed_speakers:
+        # `all` accounts for every scene in the film; `suspect` only re-hears the scenes
+        # where something looks ambiguous, which is cheaper on a feature-length film.
+        scenes = _segment_scenes(
+            turns,
+            gap=resolved.diarization_scene_gap_seconds,
+            max_seconds=resolved.diarization_scene_max_seconds,
         )
-        if suspect:
+        if mode == "suspect":
+            scenes = _suspect_scenes(
+                turns, scenes, unit_groups, labels, voiceprints, calibration, crosstalk
+            )
+        if scenes:
             (
                 turns,
                 windows,
                 uncertain_windows,
-                unresolved_windows,
                 discovered_windows,
                 window_vectors,
-            ) = _reconcile_windows(
+            ) = _reconcile_scenes(
                 pipeline,
                 source,
                 turns,
-                suspect,
+                scenes,
                 identity_voiceprints,
                 calibration,
                 short_turn=short_turn,
@@ -2396,7 +2387,7 @@ def diarize_detailed(
         reassignments=reassignments,
         windows=windows,
         uncertain_speakers=uncertain_windows,
-        unresolved_speakers=unresolved_windows,
+        unresolved_speakers=(),
         undecided_performances=undecided_performances,
         undecided_seconds=undecided_seconds,
         merge_suspects=suspects,

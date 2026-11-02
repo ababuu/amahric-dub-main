@@ -704,13 +704,29 @@ def test_a_clipped_candidate_loses_to_a_clean_one(tmp_path: Path, ffmpeg: FakeFf
     assert "clipped" in profile.selection_reason
 
 
-def test_too_short_candidates_are_rejected(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
+def test_short_speech_is_stitched_rather_than_refused(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A character who never speaks four seconds in one go still has a voice.
+
+    The reference is their own short turn, padded with silence to the length the engine
+    clones from - never another character's audio and never a designed stand-in.
+    """
+
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 12.0, LOUD)])
 
-    with pytest.raises(NoUsableReferenceError, match="at least 4.00s is required"):
-        build_voice_profiles(
-            [SpeakerSegment("SPEAKER_00", 10.0, 12.0)], stem, settings=_settings(tmp_path)
-        )
+    profiles = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 12.0)], stem, settings=_settings(tmp_path)
+    )
+
+    profile = profiles["SPEAKER_00"]
+    assert profile.composite is True
+    assert profile.reference_speech_seconds == pytest.approx(2.0)
+    assert profile.reference_spans == ((10.0, 12.0),)
+    assert profile.reference_audio.is_file()
+    # Padded with silence to the clone floor: no borrowed voice anywhere in it.
+    assert profile.selection_reason.startswith("stitched from 1")
+    assert "no other voice is used" in profile.selection_reason
 
 
 def test_a_short_but_clean_reference_is_used_when_it_is_all_there_is(
@@ -853,18 +869,16 @@ def test_missing_reference_error_explains_the_requirement(
 ) -> None:
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 12.0, LOUD)])
 
-    try:
-        build_voice_profiles(
-            [SpeakerSegment("SPEAKER_03", 10.0, 12.0)], stem, settings=_settings(tmp_path)
-        )
-    except NoUsableReferenceError as error:
-        message = str(error)
-    else:  # pragma: no cover - the call above must fail
-        raise AssertionError("expected NoUsableReferenceError")
+    profiles = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_03", 10.0, 12.0)], stem, settings=_settings(tmp_path)
+    )
 
-    assert "SPEAKER_03" in message
-    assert "2.00s" in message
-    assert "VOICE_REFERENCE_MIN_DURATION" in message
+    # Two seconds is too short to cut a window from, and still enough to identify a
+    # person: the reference is stitched and padded, and the reason says so.
+    profile = profiles["SPEAKER_03"]
+    assert profile.composite is True
+    assert profile.reference_speech_seconds == pytest.approx(2.0)
+    assert "stitched" in profile.selection_reason
 
 
 def test_the_same_input_produces_the_same_profiles(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
@@ -1722,13 +1736,20 @@ def test_production_reference_rejects_missing_matching_transcript(
 ) -> None:
     stem = _write_stem(tmp_path / "speech.wav", [(10.0, 20.0, LOUD)])
 
-    with pytest.raises(NoUsableReferenceError, match="exact transcript"):
-        build_voice_profiles(
-            [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
-            stem,
-            settings=_settings(tmp_path),
-            require_reference_transcript=True,
-        )
+    profiles = build_voice_profiles(
+        [SpeakerSegment("SPEAKER_00", 10.0, 20.0)],
+        stem,
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+    )
+
+    # With no transcript covering the audio, the reference is still the actor's - and
+    # its text stays None so the engine transcribes it rather than being handed a
+    # transcript that describes only part of what it hears.
+    profile = profiles["SPEAKER_00"]
+    assert profile.composite is True
+    assert profile.reference_text is None
+    assert "the engine will transcribe it" in profile.selection_reason
 
 
 def test_vocal_presentation_is_a_tentative_pitch_estimate(tmp_path: Path) -> None:
@@ -1858,3 +1879,62 @@ def test_a_region_straddling_the_end_does_not_bound_the_padding() -> None:
     """A diarized turn that runs past the line is this speaker still talking."""
 
     assert voice_profiles._speech_limit_after(6.0, [(1.0, 7.0)]) == math.inf
+
+
+def test_a_character_with_only_short_turns_gets_a_stitched_reference(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """Three short lines make one reference, in the actor's own voice."""
+
+    stem = _write_stem(
+        tmp_path / "speech.wav",
+        [(10.0, 10.8, LOUD), (12.0, 12.8, LOUD), (14.0, 14.8, LOUD)],
+    )
+    segments = [
+        SpeakerSegment("SPEAKER_00", 10.0, 10.8),
+        SpeakerSegment("SPEAKER_00", 12.0, 12.8),
+        SpeakerSegment("SPEAKER_00", 14.0, 14.8),
+    ]
+
+    profiles = build_voice_profiles(
+        segments, stem, settings=_settings(tmp_path), require_reference_transcript=True
+    )
+
+    profile = profiles["SPEAKER_00"]
+    assert profile.composite is True
+    # Every short turn is used, in film order.
+    assert profile.reference_spans == ((10.0, 10.8), (12.0, 12.8), (14.0, 14.8))
+    assert profile.reference_speech_seconds == pytest.approx(2.4, abs=0.05)
+    # Silence covers the shortfall to the clone floor - not another voice.
+    assert "silence appended" in profile.selection_reason
+    assert profile.reference_audio.is_file()
+
+
+def test_a_stitched_reference_skips_turns_under_crosstalk(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A join across simultaneous speech would splice two voices into one identity."""
+
+    stem = _write_stem(
+        tmp_path / "speech.wav",
+        [(10.0, 10.8, LOUD), (12.0, 12.8, LOUD), (14.0, 14.8, LOUD)],
+    )
+    segments = [
+        SpeakerSegment("SPEAKER_00", 10.0, 10.8),
+        SpeakerSegment("SPEAKER_00", 12.0, 12.8),
+        SpeakerSegment("SPEAKER_00", 14.0, 14.8),
+    ]
+
+    profiles = build_voice_profiles(
+        segments,
+        stem,
+        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=11.9, end=12.9)],
+        settings=_settings(tmp_path),
+        require_reference_transcript=True,
+    )
+
+    profile = profiles["SPEAKER_00"]
+    assert (12.0, 12.8) not in profile.reference_spans
+    assert profile.reference_spans == ((10.0, 10.8), (14.0, 14.8))
+    assert "skipped because they overlap another speaker" in profile.selection_reason
+

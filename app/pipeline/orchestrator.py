@@ -12,7 +12,8 @@ The stage order is the one ``app/pipeline/__init__.py`` documents::
       -> voice_profiles.build_voice_profiles   one identity reference per speaker
                                         (per-character engines only)
       -> tts.synthesize_dialogue        Amharic speech clips
-      -> timing.align_dialogue          each line fitted to its original window
+      -> timing.align_dialogue          each line fitted to its original window,
+                                        left overlapping where the film was
       -> mixing.mix_track              dialogue over ducked music + effects
       -> video.mux_dub                  the Amharic mix back into the video
 
@@ -154,7 +155,7 @@ class PipelineResult:
     evidence_units: int = 0
     evidence_seconds: float = 0.0
     reassignments: tuple[diarization.SpeakerReassignment, ...] = ()
-    #: What each suspect window's own diarization found, and whether it was kept.
+    #: What each scene's own diarization found, and whether it was kept.
     windows: tuple[diarization.DiarizationWindow, ...] = ()
     #: Voices that could not be tied to an identity and were given their own.
     uncertain_speakers: tuple[diarization.UncertainSpeaker, ...] = ()
@@ -277,10 +278,15 @@ class PipelineResult:
                     }
                     for correction in self.speaker_corrections
                 ],
-                # Short windows diarized on their own, and what each one produced.
-                "windows": {
+                # Every scene diarized on its own, and what it produced. A scene is the
+                # unit of accounting: a character whose whole part is one short line in
+                # one conversation is found here and nowhere else.
+                "scenes": {
                     "total": len(self.windows),
-                    "diarized": sum(1 for item in self.windows if item.mode == "window"),
+                    "separated": sum(
+                        1 for item in self.windows if item.mode == "separated"
+                    ),
+                    "agreed": sum(1 for item in self.windows if item.mode == "agreed"),
                     "kept": sum(1 for item in self.windows if item.mode == "kept"),
                     "failed": sum(1 for item in self.windows if item.mode == "failed"),
                     "detail": [item.as_dict() for item in self.windows],
@@ -354,6 +360,16 @@ class PipelineResult:
             "timing": {
                 "lines": len(self.alignment),
                 "unfitted": len(self.unfitted_lines),
+                # Lines the dub deliberately leaves sounding under the line before them,
+                # because the film had those two characters speaking at once.
+                "deliberate_overlap": {
+                    "lines": sum(
+                        1 for line in self.alignment if line.deliberate_overlap > 0.0
+                    ),
+                    "seconds": round(
+                        sum(line.deliberate_overlap for line in self.alignment), 3
+                    ),
+                },
                 "segments": [line.to_dict() for line in self.alignment],
             },
             "mixing": self.mix.to_dict(),
@@ -368,6 +384,7 @@ class PipelineResult:
         speakers = sorted({turn.speaker_id for turn in self.turns})
         stretched = sum(1 for line in self.alignment if line.tempo != 1.0)
         drifted = [line for line in self.alignment if line.drift > 0.005]
+        overlapping = [line for line in self.alignment if line.deliberate_overlap > 0.0]
         lines = [
             f"source          {self.source}",
             f"output          {self.output_dir}",
@@ -375,14 +392,18 @@ class PipelineResult:
             f"diarization     {len(self.turns)} turn(s), {len(speakers)} speaker(s)",
             f"transcription   {len(self.lines)} line(s)",
             f"adaptation      {len(self.dialogue)} Amharic line(s)",
-            f"voice profiles  {len(self.profiles)} cloned, "
-            f"{len(self.designed_voices)} designed from a description",
+            f"voice profiles  {len(self.profiles)} in the actor's own voice "
+            f"({sum(1 for profile in self.profiles.values() if profile.composite)} "
+            "stitched from short turns)",
             f"tts             {len(self.clips)} clip(s)",
             f"timing          {len(self.alignment)} aligned, {stretched} stretched, "
             f"{len(self.unfitted_lines)} not fitted",
             f"placement       {len(drifted)} line(s) moved later to avoid speaking over "
             f"the line before them, worst "
-            f"{max((line.drift for line in drifted), default=0.0):.2f} s",
+            f"{max((line.drift for line in drifted), default=0.0):.2f} s; "
+            f"{len(overlapping)} line(s) left overlapping the one before them because the "
+            f"film had both voices at once "
+            f"({sum(line.deliberate_overlap for line in overlapping):.2f} s)",
             f"bleed           "
             f"{'not measured' if self.bleed is None else self.bleed.summary()}",
             f"dub bleed       "
@@ -700,15 +721,23 @@ def run_pipeline(
             f"({reassignment.seconds:.1f}s; similarity {reassignment.similarity:.2f}, "
             f"margin {reassignment.margin:.2f})"
         )
-    window_reports = tuple(diarized.windows)
-    if window_reports:
+    scene_reports = tuple(diarized.windows)
+    if scene_reports:
+        separated = sum(1 for item in scene_reports if item.mode == "separated")
+        discovered_here = diarized.discovered_speakers
         report(
-            f"  suspect windows: {len(window_reports)} diarized, "
-            f"{sum(1 for item in window_reports if item.mode == 'window')} corrected a "
-            "fragmented voice, "
-            f"{sum(1 for item in window_reports if item.mode == 'kept')} kept the "
-            "film-wide attribution"
+            f"  scenes: {len(scene_reports)} diarized on their own, {separated} placed "
+            f"the dialogue differently, "
+            f"{sum(1 for item in scene_reports if item.mode == 'agreed')} agreed with the "
+            f"film-wide attribution, "
+            f"{sum(1 for item in scene_reports if item.mode in ('kept', 'failed'))} "
+            "left the attribution alone"
         )
+        if discovered_here:
+            report(
+                f"  scenes: {len(discovered_here)} voice(s) the film-wide pass merged "
+                f"were accounted for in their own scene ({', '.join(discovered_here)})"
+            )
     for merge in diarized.merges:
         report(
             f"  speaker merge: {merge.from_speaker_id} into {merge.to_speaker_id} "
@@ -838,39 +867,30 @@ def run_pipeline(
         )
         profiles = build.profiles
         uncertain_ids = set(diarized.uncertain_speaker_ids)
-        uncertain_profiles = sorted(
-            speaker_id for speaker_id in profiles if speaker_id in uncertain_ids
-        )
-        if uncertain_profiles:
-            # A clone is a claim that this voice *is* a character. An identity the run
-            # could not establish must not get one: it is spoken in a designed voice
-            # instead, which is audible as "a character" without asserting which one.
-            profiles = {
-                speaker_id: profile
-                for speaker_id, profile in profiles.items()
-                if speaker_id not in uncertain_ids
-            }
-            for speaker_id in uncertain_profiles:
-                report(
-                    f"  {speaker_id}: designed voice, its identity was not established "
-                    "(no cloned reference is used for an uncertain speaker)"
-                )
-        for unusable in build.unusable:
-            # A character the film never gave four clean seconds is still in the dub;
-            # saying so is what keeps a designed voice from looking like a bug.
+        # An uncertain identity is still a real voice in the film, so it keeps its own
+        # stitched reference rather than a stand-in voice: the identity is what is in
+        # doubt, never the fact that those seconds are the actor's own.
+        for speaker_id in sorted(uncertain_ids & set(profiles)):
             report(
-                f"  {unusable.speaker_id}: designed voice, no actor reference "
-                f"({unusable.reason})"
+                f"  {speaker_id}: cloned from its own short performance, although its "
+                "identity is not established"
             )
-        if not profiles and not build.unusable and not uncertain_profiles:
+        for unusable in build.unusable:
+            report(
+                f"  {unusable.speaker_id}: no actor reference at all "
+                f"({unusable.reason}); the run will stop rather than speak them in "
+                "another voice"
+            )
+        if not profiles:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
             )
+        stitched = [item for item in profiles.values() if item.composite]
         report(
-            "  voice references: using clean, transcript-matched film-actor audio "
-            "(one continuous 4-10 second interval per character; "
-            "Amharic-tuned OmniVoice)"
+            "  voice references: every character is spoken in the actor's own voice - "
+            f"{len(profiles) - len(stitched)} from a continuous interval, "
+            f"{len(stitched)} stitched from their own short turns"
         )
         for speaker_id, profile in profiles.items():
             pitch = (
@@ -930,8 +950,18 @@ def run_pipeline(
             clips,
             output_dir=run_dir,
             settings=resolved,
+            crosstalk=diarized.crosstalk,
         )
     )
+
+    overlapping = [line for line in alignment if line.deliberate_overlap > 0.0]
+    if overlapping:
+        report(
+            f"  overlap: {len(overlapping)} line(s) deliberately sound under the line "
+            f"before them ({sum(line.deliberate_overlap for line in overlapping):.2f}s "
+            "in total) because the film had both characters speaking at once; each one is "
+            "recorded in the manifest"
+        )
 
     # Measured, because the one way the source language can survive into a finished
     # dub is the separator leaving it in the music or effects, which are re-mixed

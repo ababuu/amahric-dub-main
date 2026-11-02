@@ -201,8 +201,16 @@ def test_genuine_simultaneous_dialogue_is_preserved(tmp_path: Path) -> None:
 
     clips = [
         _clip(tmp_path, index=0, start=5.0, end=6.0, speech=1.0),
-        # Line 1 began 0.6s into line 0 in the source: two people talking at once.
-        _clip(tmp_path, index=1, start=5.6, end=6.6, speech=1.0),
+        # Line 1 began 0.6s into line 0 and is another character: two people talking at
+        # once in the source, so the dub keeps them overlapping.
+        _clip(
+            tmp_path,
+            index=1,
+            start=5.6,
+            end=6.6,
+            speech=1.0,
+            speaker_id="SPEAKER_01",
+        ),
     ]
 
     aligned = align_dialogue(clips, output_dir=tmp_path / "w", settings=_settings(tmp_path))

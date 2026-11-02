@@ -131,6 +131,7 @@ import math
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -164,6 +165,23 @@ PROFILE_FILENAME = "profile.json"
 MIN_REFERENCE_DURATION = 1.0
 MAX_REFERENCE_DURATION = 30.0
 AMHARIC_TUNED_MIN_REFERENCE_DURATION = 4.0
+
+#: How much reference audio the cloning engine wants before it will imitate a voice.
+#: Below it a reference is still the right person's voice, so it is not rejected: the
+#: stitched audio is padded with silence up to this length. Silence carries no voice, so
+#: it cannot make a clone sound like anybody else - which is the whole point of using the
+#: actor instead of a designed stand-in.
+REFERENCE_CLONE_FLOOR = 3.0
+
+#: Most separate stretches of one character's speech stitched into one reference. Every
+#: extra span adds a join, so a reference built from dozens of fragments would sound like
+#: a dozen takes rather than a person.
+MAX_COMPOSITE_SPANS = 12
+
+#: Within this many seconds of another turn, a stitch is not attempted: the join would
+#: land inside a word.
+_COMPOSITE_EDGE_TOLERANCE = 0.02
+
 
 #: Two turns by the same speaker closer together than this are one continuous
 #: stretch of speech. A different speaker always breaks the run, so this only
@@ -483,6 +501,15 @@ class VoiceProfile:
     selection_reason: str = ""
     estimated_vocal_presentation: str = "unknown"
     estimated_pitch_hz: float | None = None
+    #: ``True`` when the reference was stitched from several separate stretches of the
+    #: speaker's own speech rather than cut from one continuous performance. Done when a
+    #: character never speaks long enough in one go; the voice is still theirs.
+    composite: bool = False
+    #: The source stretches, in film order, when :attr:`composite` is set.
+    reference_spans: tuple[tuple[float, float], ...] = ()
+    #: Seconds of actual speech in the reference, excluding any silence padded on to
+    #: reach :data:`REFERENCE_CLONE_FLOOR`.
+    reference_speech_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
@@ -502,6 +529,17 @@ class VoiceProfile:
             )
 
         duration = end - start
+        if self.composite:
+            # A stitched reference comes from separate stretches of the film, so its
+            # timeline span says nothing about how much audio it holds: the audio length
+            # is what the engine sees, and that is what is bounded here.
+            duration = (
+                self.reference_speech_seconds
+                if self.reference_speech_seconds > 0.0
+                else sum(
+                    max(0.0, stop - begin) for begin, stop in self.reference_spans
+                )
+            )
         if not MIN_REFERENCE_DURATION <= duration <= MAX_REFERENCE_DURATION:
             raise InvalidProfileError(
                 f"the reference for {self.speaker_id!r} is {duration:.3f}s long; voice cloning "
@@ -596,6 +634,12 @@ class VoiceProfile:
             "selection_reason": self.selection_reason,
             "estimated_vocal_presentation": self.estimated_vocal_presentation,
             "estimated_pitch_hz": self.estimated_pitch_hz,
+            # A reloaded profile has to describe the same audio the file holds: a
+            # stitched reference's span and speech length are not derivable from the
+            # first stretch's timestamps.
+            "composite": self.composite,
+            "reference_spans": [list(span) for span in self.reference_spans],
+            "reference_speech_seconds": self.reference_speech_seconds,
         }
 
     @classmethod
@@ -633,6 +677,14 @@ class VoiceProfile:
                 "estimated_vocal_presentation", "unknown"
             ),  # type: ignore[arg-type]
             estimated_pitch_hz=payload.get("estimated_pitch_hz"),  # type: ignore[arg-type]
+            composite=bool(payload.get("composite", False)),
+            reference_spans=tuple(
+                (float(begin), float(stop))
+                for begin, stop in payload.get("reference_spans", ())  # type: ignore[union-attr]
+            ),
+            reference_speech_seconds=float(
+                payload.get("reference_speech_seconds", 0.0)  # type: ignore[arg-type]
+            ),
         )
 
 
@@ -1765,6 +1817,263 @@ def _estimate_vocal_presentation(reference_audio: Path) -> tuple[float | None, s
     return median_pitch, presentation
 
 
+@dataclass(frozen=True, slots=True)
+class _CompositeReference:
+    """A reference stitched from several separate stretches of one speaker's speech.
+
+    A character who never speaks for four continuous seconds still has a voice, and it is
+    the only voice that may be used for them. Instead of falling back to a voice that is
+    not theirs, their own clean turns are laid end to end until there is enough audio to
+    clone from, and silence covers any shortfall.
+    """
+
+    speaker_id: str
+    spans: tuple[tuple[float, float], ...]
+    speech_seconds: float
+    trailing_pad: float
+    text: str | None
+    skipped: int = 0
+
+    @property
+    def audio_seconds(self) -> float:
+        """Length of the reference file, speech plus padding."""
+
+        return self.speech_seconds + self.trailing_pad
+
+    def selection_reason(self) -> str:
+        """Explain, in one line, how the reference was assembled."""
+
+        reason = (
+            f"stitched from {len(self.spans)} separate stretch(es) of this speaker's own "
+            f"speech totalling {self.speech_seconds:.1f}s"
+        )
+        if self.trailing_pad > 0.0:
+            reason += (
+                f", {self.trailing_pad:.2f}s of silence appended to reach the "
+                f"{REFERENCE_CLONE_FLOOR:.1f}s the engine clones from - no other voice "
+                "is used"
+            )
+        if self.skipped:
+            reason += (
+                f", {self.skipped} turn(s) skipped because they overlap another speaker"
+            )
+        if self.text is None:
+            reason += ", no transcript describes the whole reference (the engine will transcribe it)"
+        return reason
+
+
+def _composite_reference(
+    speaker_id: str,
+    own: list[SpeakerSegment],
+    *,
+    reader: _StemReader,
+    transcript: list[TranscriptSegment],
+    contaminated: Iterable[tuple[float, float]],
+    target: float,
+    maximum: float,
+) -> _CompositeReference | None:
+    """Assemble the speaker's own turns into one reference, or ``None`` if impossible.
+
+    Turns that overlap another speaker are skipped: a stitch is a join, and a join
+    across crosstalk would splice two voices into one identity - the exact failure this
+    whole path exists to avoid. Turns with no speech in them are skipped too, because a
+    stitch of silence is not a reference to anybody. The remaining turns are taken in
+    film order until the target length is reached.
+    """
+
+    regions = list(contaminated)
+    chosen: list[tuple[float, float]] = []
+    total = 0.0
+    skipped = 0
+    silent = 0
+    for segment in sorted(own, key=lambda item: (item.start, item.end)):
+        if len(chosen) >= MAX_COMPOSITE_SPANS or total >= target:
+            break
+        if any(
+            segment.start < stop - _COMPOSITE_EDGE_TOLERANCE
+            and segment.end > begin + _COMPOSITE_EDGE_TOLERANCE
+            for begin, stop in regions
+        ):
+            skipped += 1
+            continue
+        if segment.duration <= _COMPOSITE_EDGE_TOLERANCE:
+            continue
+        room = maximum - total
+        if room <= _COMPOSITE_EDGE_TOLERANCE:
+            break
+        stop = min(segment.end, segment.start + room)
+        samples = reader.read(segment.start, stop)
+        if samples.size == 0:
+            silent += 1
+            continue
+        stats = _measure_window(samples, reader.sample_rate)
+        if stats.speech_ratio < MIN_SPEECH_RATIO:
+            silent += 1
+            continue
+        chosen.append((segment.start, stop))
+        total += stop - segment.start
+    if not chosen:
+        return None
+
+    # Cover the whole reference with one transcript only when every stretch is described
+    # exactly; a partial transcript would be a transcript that describes part of the
+    # audio, which the engine would then be asked to reconcile.
+    text = _window_text(speaker_id, chosen[0][0], chosen[-1][1], transcript)
+    if text is not None and len(chosen) > 1:
+        text = None if any(
+            _window_text(speaker_id, begin, stop, transcript) is None
+            for begin, stop in chosen
+        ) else text
+
+    speech = sum(stop - begin for begin, stop in chosen)
+    return _CompositeReference(
+        speaker_id=speaker_id,
+        spans=tuple(chosen),
+        speech_seconds=speech,
+        # Only ever silence: padding with anything else would be borrowing a voice.
+        trailing_pad=max(0.0, REFERENCE_CLONE_FLOOR - speech),
+        text=text,
+        skipped=skipped + silent,
+    )
+
+
+def _extract_composite_reference(
+    source: Path,
+    composite: _CompositeReference,
+    *,
+    destination: Path,
+) -> None:
+    """Cut each span, concatenate them in Python, normalise the peak, and pad.
+
+    The join is done here rather than in FFmpeg because the pieces are already PCM at the
+    reference rate: reading them, concatenating and writing once is exact, needs no
+    filter graph, and keeps the only subprocess to the cut FFmpeg is good at.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix=".voice-parts-", dir=str(destination.parent)
+    ) as work:
+        pieces: list[np.ndarray] = []
+        for index, (begin, stop) in enumerate(composite.spans):
+            part = Path(work) / f"part_{index:03d}.wav"
+            _run_ffmpeg(
+                [
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{begin:.6f}",
+                    "-t",
+                    f"{stop - begin:.6f}",
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-map_metadata",
+                    "-1",
+                    "-ac",
+                    str(REFERENCE_CHANNELS),
+                    "-ar",
+                    str(REFERENCE_SAMPLE_RATE),
+                    "-c:a",
+                    "pcm_s16le",
+                    str(part),
+                ]
+            )
+            samples, _ = sf.read(str(part), dtype="float32", always_2d=False)
+            if samples.size:
+                pieces.append(np.asarray(samples, dtype=np.float32).reshape(-1))
+
+    if not pieces:
+        raise ReferenceExtractionError(
+            f"none of the {len(composite.spans)} stretch(es) of speaker "
+            f"{composite.speaker_id!r} produced any audio"
+        )
+
+    joined = np.concatenate(pieces)
+    # Only attenuate: a reference that is already quiet must not be amplified, because
+    # that would raise its noise floor and change how it clones.
+    peak = float(np.max(np.abs(joined))) if joined.size else 0.0
+    if peak > 0.0:
+        peak_dbfs = 20.0 * math.log10(peak)
+        gain_db = min(0.0, REFERENCE_PEAK_DBFS - peak_dbfs)
+        if gain_db < -0.01:
+            joined = joined * (10.0 ** (gain_db / 20.0))
+
+    if composite.trailing_pad > 0.0:
+        # Silence is the only thing that may be appended: it carries no voice, so it
+        # cannot make this character sound like anybody else.
+        pad = int(round(composite.trailing_pad * REFERENCE_SAMPLE_RATE))
+        joined = np.concatenate([joined, np.zeros(pad, dtype=np.float32)])
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sf.write(
+            str(destination),
+            joined,
+            REFERENCE_SAMPLE_RATE,
+            subtype="PCM_16",
+        )
+    except (OSError, RuntimeError) as exc:
+        raise ReferenceExtractionError(
+            f"could not write the stitched voice reference for speaker "
+            f"{composite.speaker_id!r}: {exc}"
+        ) from exc
+
+    _verify_reference(
+        destination,
+        expected_duration=composite.audio_seconds,
+        speaker_id=composite.speaker_id,
+    )
+
+
+def _build_composite_profile(
+    composite: _CompositeReference,
+    *,
+    source: Path,
+    directory: Path,
+    clone_encoder: ClonePromptEncoder | None,
+) -> VoiceProfile:
+    """Extract a stitched reference and describe it as this speaker's own voice."""
+
+    speaker_id = composite.speaker_id
+    speaker_dir = _speaker_directory(directory, speaker_id)
+    try:
+        speaker_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ReferenceExtractionError(
+            f"could not create the voice-profile directory for speaker {speaker_id!r}: {exc}"
+        ) from exc
+
+    reference = speaker_dir / REFERENCE_FILENAME
+    _extract_composite_reference(source, composite, destination=reference)
+    pitch_hz, vocal_presentation = _estimate_vocal_presentation(reference)
+
+    return VoiceProfile(
+        speaker_id=speaker_id,
+        reference_audio=reference,
+        reference_start=composite.spans[0][0],
+        reference_end=composite.spans[0][1],
+        reference_text=composite.text,
+        clone_prompt_path=_clone_prompt(
+            speaker_dir / CLONE_PROMPT_FILENAME,
+            reference,
+            speaker_id=speaker_id,
+            encoder=clone_encoder,
+        ),
+        # A stitched reference is a real, honest reference - just one assembled from
+        # short turns - so it scores on how much of the speaker it covers.
+        quality_score=min(1.0, composite.speech_seconds / REFERENCE_CLONE_FLOOR),
+        selection_reason=composite.selection_reason(),
+        estimated_vocal_presentation=vocal_presentation,
+        estimated_pitch_hz=pitch_hz,
+        composite=True,
+        reference_spans=composite.spans,
+        reference_speech_seconds=composite.speech_seconds,
+    )
+
+
 def _build_profile(
     candidate: _ReferenceCandidate,
     *,
@@ -2023,9 +2332,30 @@ def _build_profiles(
                     require_reference_transcript=require_reference_transcript,
                 )
             except NoUsableReferenceError as error:
-                # One character the film cannot describe is not a reason to abandon the
-                # ones it can; the caller decides whether that is fatal.
-                failures.append((speaker_id, error))
+                # Nobody is spoken in a voice that is not theirs. When no single window
+                # is long enough, this speaker's own short turns are stitched together
+                # instead - a short performance still identifies a person, and silence
+                # covers whatever is missing to reach the engine's floor.
+                composite = _composite_reference(
+                    speaker_id,
+                    own,
+                    reader=reader,
+                    transcript=lines,
+                    contaminated=regions,
+                    target=target,
+                    maximum=maximum,
+                )
+                if composite is None:
+                    # One character the film cannot describe is not a reason to abandon
+                    # the ones it can; the caller decides whether that is fatal.
+                    failures.append((speaker_id, error))
+                    continue
+                profiles[speaker_id] = _build_composite_profile(
+                    composite,
+                    source=source,
+                    directory=directory,
+                    clone_encoder=clone_encoder,
+                )
                 continue
             profiles[speaker_id] = _build_profile(
                 best,
