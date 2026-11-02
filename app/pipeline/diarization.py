@@ -137,8 +137,9 @@ _UNMEASURED_INHERIT_SECONDS = 2.0
 _WINDOW_MAX_NEW_IDENTITIES = 1
 
 #: A window needs at least this much speech in a cluster before it may name a character
-#: a new character from it.
+#: from it.
 _WINDOW_MIN_CLUSTER_SECONDS = 1.0
+
 
 #: Shortest suspect window worth a diarization call, and the longest one allowed: these
 #: are windows around ambiguous dialogue, not scenes.
@@ -300,10 +301,12 @@ class DiarizationResult:
     so that a voice scattered over several clusters becomes one identity.
     ``raw_turns`` is pyannote's answer untouched, kept so the two can be compared.
 
-    Nothing about a character's identity is decided silently: ``reclustering`` reports
-    the partition chosen and every one refused, ``reassignments`` every performance that
-    moved, ``windows`` what each suspect window found, ``uncertain_speakers`` the voices
-    that could not be told apart, and ``merges`` the identities that were one person.
+    Nothing about a character's identity is decided silently: ``identities`` carries every
+    speaker and the measured evidence behind its state, ``reclustering`` the partition
+    chosen and every one refused, ``reassignments`` every performance that moved,
+    ``windows`` what each suspect window found, and ``unresolved_utterances`` every line
+    that could not be attributed. Identity state and voice-cloning eligibility are
+    separate: see :class:`SpeakerIdentity`.
     """
 
     turns: tuple[SpeakerSegment, ...]
@@ -324,8 +327,12 @@ class DiarizationResult:
     reassignments: tuple["SpeakerReassignment", ...] = ()
     #: Suspect windows diarized on their own, and what each one produced.
     windows: tuple["DiarizationWindow", ...] = ()
-    #: Voices that could not be tied to an identity with confidence.
-    uncertain_speakers: tuple["UncertainSpeaker", ...] = ()
+    #: Every speaker identity the run found, with its measured evidence and whether the
+    #: run considers it established.
+    identities: tuple["SpeakerIdentity", ...] = ()
+    #: Lines whose evidence could not attribute them to any identity. Preserved with the
+    #: attribution they already had and flagged for QC; nothing is guessed.
+    unresolved_utterances: tuple["UnresolvedUtterance", ...] = ()
     #: Identity pairs that are suspiciously alike but were not merged.
     merge_suspects: tuple["SpeakerMergeSuspect", ...] = ()
     #: Identity pairs that were merged as one person discovered twice.
@@ -344,6 +351,56 @@ class DiarizationResult:
         """Every speaker id that appears in ``turns``, sorted."""
 
         return tuple(sorted({segment.speaker_id for segment in self.turns}))
+
+    @property
+    def uncertain_speaker_ids(self) -> tuple[str, ...]:
+        """The identity ids that are not established.
+
+        Named for the stage that used to compute it; ``provisional_speaker_ids`` is the
+        same list under the current vocabulary.
+        """
+
+        return self.provisional_speaker_ids
+
+    @property
+    def provisional_speaker_ids(self) -> tuple[str, ...]:
+        """Identities that hold turns but are not yet established."""
+
+        provisional = {
+            item.speaker_id for item in self.identities if not item.confirmed
+        }
+        return tuple(
+            speaker_id for speaker_id in self.speaker_ids if speaker_id in provisional
+        )
+
+    @property
+    def confirmed_speaker_ids(self) -> tuple[str, ...]:
+        """The identities the run stands behind: turns *and* enough evidence.
+
+        This is the number a run should quote as its cast. ``speaker_ids`` is what the
+        turns use and is what downstream stages must key on; a provisional identity is
+        excluded here so a summary can never claim more established characters than the
+        evidence supports.
+        """
+
+        provisional = {
+            item.speaker_id for item in self.identities if not item.confirmed
+        }
+        return tuple(
+            speaker_id for speaker_id in self.speaker_ids if speaker_id not in provisional
+        )
+
+    @property
+    def undecided_performances(self) -> int:
+        """How many lines could not be attributed (kept for reporting compatibility)."""
+
+        return len(self.unresolved_utterances)
+
+    @property
+    def undecided_seconds(self) -> float:
+        """Speech covered by lines that could not be attributed."""
+
+        return sum(item.seconds for item in self.unresolved_utterances)
 
     @property
     def raw_speaker_ids(self) -> tuple[str, ...]:
@@ -405,29 +462,76 @@ class SpeakerReassignment:
 
 
 @dataclass(frozen=True, slots=True)
-class UncertainSpeaker:
-    """A voice that could not be tied to an identity with confidence.
+class SpeakerIdentity:
+    """One speaker identity the run found, and whether it is established.
 
-    It was given an id of its own rather than being assigned to a character it merely
-    resembled, because two characters sharing a cloned voice is worse than one
-    character being cloned from a voice of uncertain name.
+    ``state`` is :data:`~app.pipeline.speaker_identity.CONFIRMED` or
+    :data:`~app.pipeline.speaker_identity.PROVISIONAL`. A provisional identity is still a
+    real, persistent speaker: it keeps its id, its dialogue and its place in the film. It
+    is simply not yet established, so nothing downstream may *assert* who they are - in
+    particular nothing may clone a character's voice and call it theirs.
+
+    Identity state and voice-cloning eligibility are deliberately different things and
+    are reported separately: a confirmed character can still have no usable reference
+    (and is then spoken in a designed voice), and a provisional one can have plenty of
+    audio for a clone that must not be used as that character's.
     """
 
     speaker_id: str
-    reason: str
-    similarity: float
-    margin: float
-    seconds: float
+    state: str
+    evidence: identity.IdentityEvidence
+    score: float
+    reasons: tuple[str, ...]
+
+    @property
+    def confirmed(self) -> bool:
+        """``True`` when this identity is established."""
+
+        return self.state == identity.CONFIRMED
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-safe view of the uncertainty."""
+        """Return a JSON-safe view of the identity."""
 
         return {
             "speaker_id": self.speaker_id,
+            "state": self.state,
+            "score": round(self.score, 4),
+            "evidence": self.evidence.as_dict(),
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedUtterance:
+    """One stretch of speech the run could not attribute to a known or new speaker.
+
+    Unresolved is a property of the *line*, not of a voice: the film may contain only
+    well-established characters and still contain a line whose evidence cannot say which
+    of them said it. The line is preserved - it keeps the attribution it already had, so
+    its dialogue is still dubbed in its original slot - and flagged here so a QC pass can
+    find it. Nothing is guessed, and no identity is created from it.
+    """
+
+    start: float
+    end: float
+    seconds: float
+    #: The identity the turn keeps for downstream use. Not a claim about who spoke.
+    kept_speaker_id: str
+    reason: str
+    similarity: float
+    margin: float
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the unresolved line."""
+
+        return {
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+            "seconds": round(self.seconds, 3),
+            "kept_speaker_id": self.kept_speaker_id,
             "reason": self.reason,
             "similarity": round(self.similarity, 4),
             "margin": round(self.margin, 4),
-            "seconds": round(self.seconds, 3),
         }
 
 
@@ -1264,36 +1368,60 @@ def _apply_partition(
     list[SpeakerSegment],
     list[str],
     tuple[SpeakerReassignment, ...],
-    tuple[UncertainSpeaker, ...],
+    tuple[UnresolvedUtterance, ...],
 ]:
-    """Move each performance to the identity the evidence supports, or leave it alone.
+    """Move each performance to the identity the evidence supports, or flag it.
 
-    A performance only moves when the cluster it was put in beats the next best by
+    A performance moves only when the cluster it was put in beats the next best by
     ``calibration.margin``. That is the rule that stops a 0.6 s fragment being handed to
-    a character on the strength of one embedding: the ambiguity is reported and the turn
-    keeps the identity pyannote gave it.
+    a character on the strength of one embedding.
+
+    A performance is flagged when the evidence does not attribute it: either it is torn
+    between two identities (a move would be a guess), or it does not even support the
+    identity it is already filed under. In both cases it keeps that attribution, so its
+    dialogue is still spoken in its own slot, and it is recorded as an
+    :class:`UnresolvedUtterance`. Flagging is not assignment: `kept_speaker_id` is the
+    label the line carries for downstream stages, not a claim about who spoke.
     """
 
     assignments: list[str] = []
     reassignments: list[SpeakerReassignment] = []
-    uncertain_seconds: dict[str, float] = {}
-    uncertain_worst: dict[str, tuple[float, float]] = {}
+    unresolved: list[UnresolvedUtterance] = []
     updated = list(turns)
 
     for unit, label in zip(units, labels):
         target = assignment[label]
         scores = _cluster_scores(unit, voiceprints)
+        own_score = next((score for cluster, score in scores if cluster == label), -1.0)
         best_score = scores[0][1] if scores else -1.0
         rival = max((score for cluster, score in scores if cluster != label), default=-1.0)
         margin = best_score - rival
-        if target != unit.speaker_id and margin < calibration.margin:
+        torn = target != unit.speaker_id and margin < calibration.margin
+        unsupported = (
+            target == unit.speaker_id
+            and own_score < calibration.same_similarity
+        )
+        if torn or unsupported:
             assignments.append(unit.speaker_id)
-            uncertain_seconds[unit.speaker_id] = (
-                uncertain_seconds.get(unit.speaker_id, 0.0) + unit.speech_seconds
+            unresolved.append(
+                UnresolvedUtterance(
+                    start=unit.start,
+                    end=unit.end,
+                    seconds=unit.speech_seconds,
+                    kept_speaker_id=unit.speaker_id,
+                    reason=(
+                        "the evidence for this performance is not separated from "
+                        "another identity by enough to move it; it keeps the "
+                        "attribution it already had rather than being guessed at"
+                        if torn
+                        else "this performance does not sound like the identity it is "
+                        "filed under, and no other identity explains it better; it "
+                        "keeps its attribution and is flagged for review"
+                    ),
+                    similarity=own_score if unsupported else best_score,
+                    margin=margin,
+                )
             )
-            previous = uncertain_worst.get(unit.speaker_id)
-            if previous is None or margin < previous[1]:
-                uncertain_worst[unit.speaker_id] = (best_score, margin)
             continue
         assignments.append(target)
         if target == unit.speaker_id:
@@ -1337,21 +1465,7 @@ def _apply_partition(
         if nearest is not None:
             updated[index] = SpeakerSegment(nearest[1], segment.start, segment.end)
 
-    uncertain = tuple(
-        UncertainSpeaker(
-            speaker_id=speaker_id,
-            reason=(
-                "the evidence did not separate this voice from another one; the "
-                "performance keeps pyannote's identity rather than being moved on a "
-                "guess"
-            ),
-            similarity=uncertain_worst[speaker_id][0],
-            margin=uncertain_worst[speaker_id][1],
-            seconds=seconds,
-        )
-        for speaker_id, seconds in sorted(uncertain_seconds.items())
-    )
-    return updated, assignments, tuple(reassignments), uncertain
+    return updated, assignments, tuple(reassignments), tuple(unresolved)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1411,10 +1525,15 @@ def _suspect_windows(
         scores = _cluster_scores(unit, voiceprints)
         if not scores:
             continue
+        own = next((score for cluster, score in scores if cluster == label), -1.0)
         rival = max(
             (score for cluster, score in scores if cluster != label), default=-1.0
         )
-        if scores[0][1] - rival < calibration.margin:
+        # Two different reasons to look again: the performance is torn between two
+        # identities, or it does not sound like the identity it was given at all. The
+        # second is what a voice the film-wide partition absorbed into a neighbour
+        # looks like from here, and it is the one a margin test cannot see.
+        if scores[0][1] - rival < calibration.margin or own < calibration.same_similarity:
             suspect_indexes.update(unit.indexes)
     for index, segment in enumerate(turns):
         if _is_crosstalk_turn(segment, crosstalk):
@@ -1672,7 +1791,7 @@ def _reconcile_windows(
 ) -> tuple[
     list[SpeakerSegment],
     tuple[DiarizationWindow, ...],
-    tuple[UncertainSpeaker, ...],
+    tuple[UnresolvedUtterance, ...],
     tuple[str, ...],
     dict[tuple[float, float], tuple[float, ...]],
 ]:
@@ -1684,12 +1803,16 @@ def _reconcile_windows(
     character the current attribution lacks, and *move* dialogue from one existing
     identity to another when its own diarization separates them.
 
-    A local cluster that matches no identity closely enough becomes a new one, reported
-    as uncertain rather than folded into whichever identity it most resembles.
+    A character a window names is not automatically an established character of the
+    film: a window is the noisiest evidence in the pipeline. It is, however, a real
+    speaker. The identity keeps its id and its dialogue, and the run's evidence scoring
+    decides afterwards whether it is confirmed - never a duration test, and never by
+    folding it back into the neighbour it was separated from.
     """
 
     reports: list[DiarizationWindow] = []
-    uncertain: list[UncertainSpeaker] = []
+
+    unresolved: list[UnresolvedUtterance] = []
     replacements: dict[int, list[SpeakerSegment]] = {}
     replaced: set[int] = set()
     accepted_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
@@ -1760,19 +1883,6 @@ def _reconcile_windows(
             mapping[label] = new_id
             minted += 1
             discovered.append(new_id)
-            uncertain.append(
-                UncertainSpeaker(
-                    speaker_id=new_id,
-                    reason=(
-                        "a suspect window separates this voice but no identity in the "
-                        "film matches it closely enough; it keeps its own id rather "
-                        "than being assigned to one it merely resembles"
-                    ),
-                    similarity=best_score,
-                    margin=margin,
-                    seconds=cluster.seconds,
-                )
-            )
 
         affected = [
             index
@@ -1831,6 +1941,24 @@ def _reconcile_windows(
                 ):
                     changes.add((index, mapped))
 
+        if undecided:
+            for index in affected:
+                segment = turns[index]
+                unresolved.append(
+                    UnresolvedUtterance(
+                        start=segment.start,
+                        end=segment.end,
+                        seconds=segment.duration,
+                        kept_speaker_id=segment.speaker_id,
+                        reason=(
+                            "a suspect window separates two voices inside this line but "
+                            "could not say which identity it belongs to"
+                        ),
+                        similarity=-1.0,
+                        margin=0.0,
+                    )
+                )
+
         if not replacement or undecided or not changes:
             reports.append(
                 DiarizationWindow(
@@ -1872,7 +2000,7 @@ def _reconcile_windows(
         return (
             list(turns),
             tuple(reports),
-            tuple(uncertain),
+            tuple(unresolved),
             tuple(discovered),
             accepted_vectors,
         )
@@ -1887,7 +2015,7 @@ def _reconcile_windows(
     return (
         merged,
         tuple(reports),
-        tuple(uncertain),
+        tuple(unresolved),
         tuple(discovered),
         accepted_vectors,
     )
@@ -1991,6 +2119,140 @@ def _effective_calibration(
         same_similarity=settings.diarization_identity_min_similarity,
         margin=settings.diarization_identity_min_margin,
     )
+
+
+#: Two turns further apart than a twentieth of the film belong to different parts of it.
+#: Derived from the film's own length, so a two-minute clip and a two-hour film are judged
+#: by the same rule rather than by a constant that only suits one of them.
+_APPEARANCE_SPAN_DIVISOR = 20.0
+_APPEARANCE_GAP_MIN_SECONDS = 1.0
+_APPEARANCE_GAP_MAX_SECONDS = 120.0
+
+
+def _appearance_gap(span: float) -> float:
+    """Return the silence that makes two of one speaker's turns separate appearances."""
+
+    return min(
+        _APPEARANCE_GAP_MAX_SECONDS,
+        max(_APPEARANCE_GAP_MIN_SECONDS, span / _APPEARANCE_SPAN_DIVISOR),
+    )
+
+
+def _identity_evidence(
+    turns: Sequence[SpeakerSegment],
+    vectors: Mapping[tuple[float, float], tuple[float, ...]],
+    prototypes: Mapping[str, tuple[tuple[float, ...], float, int]],
+) -> list[identity.IdentityEvidence]:
+    """Measure every identity's evidence from the final attribution.
+
+    Each signal is computed from the run's own data - no per-film constants beyond the
+    appearance gap that is derived from the film's pacing - so a two-minute clip and a
+    two-hour film are judged the same way, and a cast of three and a cast of thirty are
+    judged by the same rules.
+    """
+
+    order = sorted({segment.speaker_id for segment in turns})
+    span = (
+        max(segment.end for segment in turns) - min(segment.start for segment in turns)
+        if turns
+        else 0.0
+    )
+    gap = _appearance_gap(span)
+    measured: dict[str, list[tuple[SpeakerSegment, tuple[float, ...]]]] = {
+        speaker_id: [] for speaker_id in order
+    }
+    totals: dict[str, int] = {speaker_id: 0 for speaker_id in order}
+    for segment in turns:
+        totals[segment.speaker_id] = totals.get(segment.speaker_id, 0) + 1
+        vector = vectors.get((round(segment.start, 6), round(segment.end, 6)))
+        if vector is not None:
+            measured.setdefault(segment.speaker_id, []).append((segment, vector))
+
+    evidence: list[identity.IdentityEvidence] = []
+    for speaker_id in order:
+        entries = measured.get(speaker_id, [])
+        others = {
+            other: prototype[0]
+            for other, prototype in prototypes.items()
+            if other != speaker_id
+        }
+        own = prototypes.get(speaker_id)
+        cohesion = 0.0
+        if own is not None and entries:
+            cohesion = sum(
+                identity.cosine_similarity(vector, own[0]) for _, vector in entries
+            ) / len(entries)
+        margins: list[float] = []
+        if own is not None:
+            for _, vector in entries:
+                own_score = identity.cosine_similarity(vector, own[0])
+                rival = max(
+                    (
+                        identity.cosine_similarity(vector, prototype)
+                        for prototype in others.values()
+                    ),
+                    default=-1.0,
+                )
+                margins.append(own_score - rival)
+
+        observations = 0
+        previous_end: float | None = None
+        for segment, _ in sorted(entries, key=lambda entry: entry[0].start):
+            if previous_end is None or segment.start - previous_end > _EVIDENCE_GROUP_GAP_SECONDS:
+                observations += 1
+            previous_end = segment.end
+
+        appearances = 0
+        previous_end = None
+        for segment in sorted(
+            (segment for segment, _ in entries), key=lambda item: item.start
+        ):
+            if previous_end is None or segment.start - previous_end > gap:
+                appearances += 1
+            previous_end = segment.end
+
+        evidence.append(
+            identity.IdentityEvidence(
+                speaker_id=speaker_id,
+                observations=observations,
+                turns=totals.get(speaker_id, 0),
+                seconds=sum(segment.duration for segment, _ in entries),
+                cohesion=cohesion,
+                margin=(sum(margins) / len(margins)) if margins else 0.0,
+                appearances=appearances,
+                measured_fraction=(
+                    len(entries) / totals[speaker_id] if totals.get(speaker_id) else 0.0
+                ),
+            )
+        )
+    return evidence
+
+
+def _assess_identities(
+    evidence: Sequence[identity.IdentityEvidence],
+    calibration: partition.Calibration,
+) -> tuple[SpeakerIdentity, ...]:
+    """Turn measured evidence into confirmed or provisional identities.
+
+    The margin floor comes from the film's own scale, so "separated enough" means the
+    same thing in a film where two voices sit far apart as in one where they nearly
+    touch.
+    """
+
+    floor = calibration.margin if calibration.reliable else identity.DEFAULT_MATCH_MIN_MARGIN
+    assessed: list[SpeakerIdentity] = []
+    for item in evidence:
+        assessment = identity.assess_identity(item, margin_floor=floor)
+        assessed.append(
+            SpeakerIdentity(
+                speaker_id=item.speaker_id,
+                state=assessment.state,
+                evidence=item,
+                score=assessment.score,
+                reasons=assessment.reasons,
+            )
+        )
+    return tuple(assessed)
 
 
 def diarize_detailed(
@@ -2143,7 +2405,12 @@ def diarize_detailed(
         if assignment[cluster] not in provisional_ids
     ]
 
-    turns, _unit_assignments, reassignments, uncertain_partition = _apply_partition(
+    (
+        turns,
+        _unit_assignments,
+        reassignments,
+        unresolved_partition,
+    ) = _apply_partition(
         turns,
         unit_groups,
         labels,
@@ -2157,7 +2424,7 @@ def diarize_detailed(
         identity_voiceprints[assignment[cluster]] = voiceprint
 
     windows: tuple[DiarizationWindow, ...] = ()
-    uncertain_windows: tuple[UncertainSpeaker, ...] = ()
+    unresolved_windows: tuple[UnresolvedUtterance, ...] = ()
     discovered_windows: tuple[str, ...] = ()
     window_vectors: dict[tuple[float, float], tuple[float, ...]] = {}
     if mode != "off" and units and resolved.diarization_split_mixed_speakers:
@@ -2168,7 +2435,7 @@ def diarize_detailed(
             (
                 turns,
                 windows,
-                uncertain_windows,
+                unresolved_windows,
                 discovered_windows,
                 window_vectors,
             ) = _reconcile_windows(
@@ -2191,6 +2458,9 @@ def diarize_detailed(
         {speaker_id: entry[0] for speaker_id, entry in prototypes.items()},
         {speaker_id: entry[1] for speaker_id, entry in prototypes.items()},
         calibration,
+    )
+    identities = _assess_identities(
+        _identity_evidence(turns, timed_vectors, prototypes), calibration
     )
 
     for merge in merges:
@@ -2222,7 +2492,8 @@ def diarize_detailed(
         unit_seconds=sum(unit.seconds for unit in units),
         reassignments=reassignments,
         windows=windows,
-        uncertain_speakers=uncertain_partition + uncertain_windows,
+        identities=identities,
+        unresolved_utterances=unresolved_partition + unresolved_windows,
         merge_suspects=suspects,
         merges=merges,
         discovered_speakers=tuple(dict.fromkeys(discovered + list(discovered_windows))),
@@ -2341,7 +2612,8 @@ __all__ = [
     "SpeakerMergeSuspect",
     "SpeakerReassignment",
     "SpeakerSegment",
-    "UncertainSpeaker",
+    "SpeakerIdentity",
+    "UnresolvedUtterance",
     "UnsupportedOutputError",
     "diarize",
     "diarize_detailed",

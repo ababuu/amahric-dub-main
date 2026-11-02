@@ -55,6 +55,49 @@ DEFAULT_SUSPECT_SIMILARITY = 0.75
 #: Bumped when the persisted shape changes so an old file is rejected, not misread.
 REGISTRY_VERSION = 1
 
+#: The two states a *speaker identity* can be in. A third state - "unresolved" - belongs
+#: to an utterance, not to an identity: it means "this line cannot be attributed", which
+#: is a property of the line rather than of a voice. See
+#: :class:`app.pipeline.diarization.UnresolvedUtterance`.
+CONFIRMED = "confirmed"
+PROVISIONAL = "provisional"
+
+#: How much each independent signal contributes to an identity's evidence score. The
+#: weights are the point of this model: speaking time is one signal of six, so a
+#: character who says four short lines in three different places outranks one who says a
+#: single long line, and neither is *decided* by seconds alone.
+EVIDENCE_WEIGHTS = {
+    "independence": 0.30,
+    "consistency": 0.20,
+    "separation": 0.20,
+    "persistence": 0.10,
+    "quality": 0.10,
+    "duration": 0.10,
+}
+
+#: Score an identity must reach to be confirmed.
+CONFIRM_SCORE = 0.60
+
+#: Observations (separate bursts of speech) that earn full independence marks.
+INDEPENDENCE_TARGET = 3
+
+#: Appearances across the film that earn full persistence marks.
+PERSISTENCE_TARGET = 2
+
+#: Speech that earns full duration marks. Deliberately small: this is the weakest signal.
+DURATION_TARGET_SECONDS = 3.0
+
+#: Cohesion below this is not a voiceprint at all; above ``FLOOR + SPAN`` it is exemplary.
+CONSISTENCY_FLOOR = 0.30
+CONSISTENCY_SPAN = 0.45
+
+#: A single observation cannot be corroborated, so on its own it must be substantial
+#: *and* consistent *and* clearly separated before it may confirm an identity. All three
+#: are required; none of them is a duration test on its own.
+SINGLE_OBSERVATION_SECONDS = 4.0
+SINGLE_OBSERVATION_STRENGTH = 0.50
+
+
 
 class IdentityError(RuntimeError):
     """Base class for every error raised by this module."""
@@ -202,6 +245,163 @@ class GlobalSpeaker:
 MATCHED = "matched"
 AMBIGUOUS = "ambiguous"
 UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityEvidence:
+    """What a run knows about one speaker identity, measured rather than assumed.
+
+    Every field is an independent signal, because no single one of them answers "is this
+    a character?": a voice heard once for eight seconds, a voice heard six times for
+    half a second each, and a voice heard once for half a second are three different
+    situations, and a seconds-only rule cannot tell them apart.
+
+    * ``observations`` - separate bursts of speech. Two independent observations are far
+      stronger evidence than one long one, because a single turn can be a mislabel.
+    * ``cohesion`` - how tightly the run's own voiceprints for this identity agree. A
+      cluster holding two people has low cohesion whatever its total duration.
+    * ``margin`` - mean distance to the best *other* identity. A voice that is close to
+      its neighbour is not established, however long it talks.
+    * ``appearances`` - how many separated parts of the film it turns up in. A character
+      recurs; a stray fragment does not.
+    * ``measured_fraction`` - of its turns, how many produced a usable voiceprint. This
+      is the audio-quality signal: heavily overlapped or very short speech measures low.
+    * ``seconds`` - speech the voiceprint actually stands on.
+    """
+
+    speaker_id: str
+    observations: int = 0
+    turns: int = 0
+    seconds: float = 0.0
+    cohesion: float = 0.0
+    margin: float = 0.0
+    appearances: int = 0
+    measured_fraction: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
+            raise InvalidVoiceprintError("speaker_id must be a non-empty string")
+        for name in ("observations", "turns", "appearances"):
+            if getattr(self, name) < 0:
+                raise InvalidVoiceprintError(f"{name} must not be negative")
+        if self.seconds < 0:
+            raise InvalidVoiceprintError("seconds must not be negative")
+        if not 0.0 <= self.measured_fraction <= 1.0:
+            raise InvalidVoiceprintError(
+                f"measured_fraction must be between 0 and 1, got {self.measured_fraction}"
+            )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the evidence."""
+
+        return {
+            "speaker_id": self.speaker_id,
+            "observations": self.observations,
+            "turns": self.turns,
+            "seconds": round(self.seconds, 3),
+            "cohesion": round(self.cohesion, 4),
+            "margin": round(self.margin, 4),
+            "appearances": self.appearances,
+            "measured_fraction": round(self.measured_fraction, 4),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityAssessment:
+    """Whether an identity is established, and the arithmetic behind that answer."""
+
+    state: str
+    score: float
+    components: Mapping[str, float]
+    reasons: tuple[str, ...]
+
+    @property
+    def confirmed(self) -> bool:
+        """``True`` when the identity may be treated as a character."""
+
+        return self.state == CONFIRMED
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the assessment."""
+
+        return {
+            "state": self.state,
+            "score": round(self.score, 4),
+            "components": {
+                name: round(float(value), 4) for name, value in self.components.items()
+            },
+            "reasons": list(self.reasons),
+        }
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def assess_identity(
+    evidence: IdentityEvidence,
+    *,
+    margin_floor: float = DEFAULT_MATCH_MIN_MARGIN,
+) -> IdentityAssessment:
+    """Decide whether ``evidence`` establishes a character, and say why.
+
+    The decision is a weighted score over six independent signals plus one guard for the
+    degenerate case of a single observation. No signal is a veto on its own, and speech
+    duration carries the smallest weight of the six - it is evidence, not the criterion.
+    """
+
+    floor = margin_floor if margin_floor > 0 else DEFAULT_MATCH_MIN_MARGIN
+    components = {
+        "independence": _clamp(evidence.observations / INDEPENDENCE_TARGET),
+        "consistency": _clamp(
+            (evidence.cohesion - CONSISTENCY_FLOOR) / CONSISTENCY_SPAN
+        ),
+        "separation": _clamp(evidence.margin / (2.0 * floor)),
+        "persistence": _clamp(evidence.appearances / PERSISTENCE_TARGET),
+        "quality": _clamp(evidence.measured_fraction),
+        "duration": _clamp(evidence.seconds / DURATION_TARGET_SECONDS),
+    }
+    score = sum(
+        EVIDENCE_WEIGHTS[name] * value for name, value in components.items()
+    )
+
+    reasons: list[str] = []
+    if evidence.observations < 1:
+        reasons.append("nothing measurable was heard from this identity")
+    if evidence.turns and not evidence.observations:
+        reasons.append(
+            f"none of its {evidence.turns} turn(s) produced a usable voiceprint"
+        )
+    if evidence.cohesion <= CONSISTENCY_FLOOR:
+        reasons.append(
+            f"its voiceprints agree with each other only {evidence.cohesion:.2f}, which "
+            "is not one voice"
+        )
+    if evidence.margin <= 0.0:
+        reasons.append(
+            "it is not separated from another identity by its own evidence"
+        )
+
+    if evidence.observations == 1:
+        substantial = evidence.seconds >= SINGLE_OBSERVATION_SECONDS
+        consistent = components["consistency"] >= SINGLE_OBSERVATION_STRENGTH
+        separate = components["separation"] >= SINGLE_OBSERVATION_STRENGTH
+        if not (substantial and consistent and separate):
+            reasons.append(
+                "it was heard once, and one observation is confirmed only when it is "
+                f"at least {SINGLE_OBSERVATION_SECONDS:.0f}s of consistently separated "
+                "speech"
+            )
+
+    if not reasons and score >= CONFIRM_SCORE:
+        return IdentityAssessment(CONFIRMED, score, components, ())
+    if not reasons:
+        reasons.append(
+            f"its evidence scores {score:.2f}, below the {CONFIRM_SCORE:.2f} needed to "
+            "establish a character"
+        )
+    return IdentityAssessment(PROVISIONAL, score, components, tuple(reasons))
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,20 +680,34 @@ class SpeakerRegistry:
 
 __all__ = [
     "AMBIGUOUS",
+    "CONFIRM_SCORE",
+    "CONFIRMED",
+    "CONSISTENCY_FLOOR",
+    "CONSISTENCY_SPAN",
     "DEFAULT_MATCH_MIN_MARGIN",
     "DEFAULT_MATCH_MIN_SIMILARITY",
     "DEFAULT_MERGE_MIN_SIMILARITY",
     "DEFAULT_REGISTRY_FILENAME",
     "DEFAULT_SUSPECT_SIMILARITY",
+    "DURATION_TARGET_SECONDS",
+    "EVIDENCE_WEIGHTS",
     "GlobalSpeaker",
+    "IdentityAssessment",
     "IdentityDecision",
     "IdentityError",
+    "IdentityEvidence",
+    "INDEPENDENCE_TARGET",
     "InvalidVoiceprintError",
     "MATCHED",
+    "PERSISTENCE_TARGET",
+    "PROVISIONAL",
     "REGISTRY_VERSION",
+    "SINGLE_OBSERVATION_SECONDS",
+    "SINGLE_OBSERVATION_STRENGTH",
     "SpeakerRegistry",
     "UNKNOWN",
     "UnreadableRegistryError",
+    "assess_identity",
     "blend",
     "cosine_similarity",
     "normalise",

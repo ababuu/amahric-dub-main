@@ -156,8 +156,18 @@ class PipelineResult:
     reassignments: tuple[diarization.SpeakerReassignment, ...] = ()
     #: What each suspect window's own diarization found, and whether it was kept.
     windows: tuple[diarization.DiarizationWindow, ...] = ()
-    #: Voices that could not be tied to an identity and were given their own.
-    uncertain_speakers: tuple[diarization.UncertainSpeaker, ...] = ()
+    #: Every speaker identity, with the measured evidence behind its state.
+    identities: tuple[diarization.SpeakerIdentity, ...] = ()
+    #: The identities the run stands behind, and the ones it keeps but cannot establish.
+    confirmed_speakers: tuple[str, ...] = ()
+    provisional_speakers: tuple[str, ...] = ()
+    #: Lines whose evidence attributed them to nobody. Preserved and flagged for QC.
+    unresolved_utterances: tuple[diarization.UnresolvedUtterance, ...] = ()
+    #: Speakers a clone was withheld from because their identity is provisional, and the
+    #: speakers that were given a designed voice for want of a usable reference. Recorded
+    #: apart, because identity confidence and cloning eligibility are different things.
+    provisional_voice_ids: tuple[str, ...] = ()
+    designed_voice_ids: tuple[str, ...] = ()
     #: Identity pairs that are suspiciously alike but were deliberately not merged.
     merge_suspects: tuple[diarization.SpeakerMergeSuspect, ...] = ()
     #: Identity pairs merged as one person discovered twice.
@@ -213,6 +223,25 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
+                # Every speaker and the measured evidence behind its state. `speakers` is
+                # what the turns use; the two lists below are what a reader should quote.
+                "confirmed_speakers": list(self.confirmed_speakers),
+                "provisional_speakers": list(self.provisional_speakers),
+                "identities": [item.as_dict() for item in self.identities],
+                # Lines that could not be attributed. Preserved, never guessed.
+                "unresolved": {
+                    "lines": len(self.unresolved_utterances),
+                    "seconds": round(
+                        sum(item.seconds for item in self.unresolved_utterances), 3
+                    ),
+                    "detail": [item.as_dict() for item in self.unresolved_utterances],
+                },
+                # Identity state and cloning eligibility, kept apart on purpose.
+                "voices": {
+                    "cloned": sorted(self.profiles),
+                    "designed": list(self.designed_voice_ids),
+                    "withheld_while_provisional": list(self.provisional_voice_ids),
+                },
                 # How the count was arrived at: discovered by the model and scene pass,
                 # or bounded by a configured hint. Never assumed.
                 "speaker_count_source": (
@@ -266,9 +295,6 @@ class PipelineResult:
                     "detail": [item.as_dict() for item in self.windows],
                 },
                 "discovered_speakers": list(self.discovered_speakers),
-                "uncertain_speakers": [
-                    item.as_dict() for item in self.uncertain_speakers
-                ],
                 "merge_suspects": [item.as_dict() for item in self.merge_suspects],
                 "merges": [item.as_dict() for item in self.speaker_merges],
                 "registry": (
@@ -641,11 +667,42 @@ def run_pipeline(
             )
     raw = diarized.raw_speaker_ids
     final = diarized.speaker_ids
-    if raw != final:
-        report(
-            f"  identities: pyannote reported {len(raw)} ({', '.join(raw)}), the evidence "
-            f"supports {len(final)} ({', '.join(final)})"
+    confirmed = diarized.confirmed_speaker_ids
+    provisional = diarized.provisional_speaker_ids
+    if raw != final or provisional:
+        detail = (
+            f"; {len(provisional)} provisional ({', '.join(provisional)})"
+            if provisional
+            else ""
         )
+        report(
+            f"  identities: pyannote reported {len(raw)} ({', '.join(raw)}); "
+            f"{len(confirmed)} established ({', '.join(confirmed) or 'none'}){detail}"
+        )
+    for item in diarized.identities:
+        if item.confirmed:
+            continue
+        evidence = item.evidence
+        report(
+            f"  provisional speaker: {item.speaker_id} "
+            f"({evidence.observations} observation(s), {evidence.seconds:.1f}s, "
+            f"{evidence.appearances} appearance(s), cohesion "
+            f"{evidence.cohesion:.2f}, margin {evidence.margin:.2f}, score "
+            f"{item.score:.2f}); kept as its own speaker - "
+            + "; ".join(item.reasons)
+        )
+    if diarized.unresolved_utterances:
+        report(
+            f"  unresolved: {len(diarized.unresolved_utterances)} line(s) / "
+            f"{diarized.undecided_seconds:.1f}s could not be attributed to a speaker; "
+            "each keeps the attribution it had and is flagged for QC"
+        )
+        for utterance in diarized.unresolved_utterances:
+            report(
+                f"    {utterance.start:.2f}-{utterance.end:.2f}s kept as "
+                f"{utterance.kept_speaker_id} (similarity "
+                f"{utterance.similarity:.2f}, margin {utterance.margin:.2f})"
+            )
     for reassignment in diarized.reassignments:
         report(
             f"  reassigned {reassignment.start:.2f}-{reassignment.end:.2f}s from "
@@ -662,13 +719,6 @@ def run_pipeline(
             "fragmented voice, "
             f"{sum(1 for item in window_reports if item.mode == 'kept')} kept the "
             "film-wide attribution"
-        )
-    for uncertain_speaker in diarized.uncertain_speakers:
-        report(
-            f"  uncertain voice: {uncertain_speaker.speaker_id} "
-            f"({uncertain_speaker.seconds:.1f}s; best similarity "
-            f"{uncertain_speaker.similarity:.2f}, margin "
-            f"{uncertain_speaker.margin:.2f}); left as it was rather than reassigned"
         )
     for merge in diarized.merges:
         report(
@@ -776,6 +826,11 @@ def run_pipeline(
     # TTS stage's own contract, asked rather than assumed here.
     needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
     profiles: Mapping[str, VoiceProfile] = {}
+    #: Speakers a clone was withheld from because their identity is provisional, and the
+    #: speakers with no usable reference at all. Kept apart: the first is an identity
+    #: decision, the second an audio decision, and a manifest must not conflate them.
+    withheld_voices: list[str] = []
+    build_unusable: tuple[Any, ...] = ()
     if not needs_profiles:
         seconds["voice_profiles"] = 0.0
         report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
@@ -798,6 +853,34 @@ def run_pipeline(
             require_reference_transcript=True,
         )
         profiles = build.profiles
+        build_unusable = build.unusable
+        provisional_ids = set(diarized.provisional_speaker_ids)
+        # Two different questions, answered separately and reported separately:
+        #   * is this voice a character?   -> identity state
+        #   * is there audio to clone it?  -> build.profiles / build.unusable
+        # A provisional speaker may well have a usable reference - the cluster is its own
+        # audio - but a clone is a claim that this voice *is* that character, and a
+        # provisional identity is precisely one whose separation from its neighbours is
+        # not established. Cloning it would risk putting a neighbour's voice in the dub
+        # under a new name, so it is spoken in a designed voice instead: audible as a
+        # character, asserting nothing about who. Confirmed characters without a usable
+        # reference keep the same designed-voice fallback they already had.
+        provisional_profiles = sorted(
+            speaker_id for speaker_id in profiles if speaker_id in provisional_ids
+        )
+        if provisional_profiles:
+            profiles = {
+                speaker_id: profile
+                for speaker_id, profile in profiles.items()
+                if speaker_id not in provisional_ids
+            }
+            for speaker_id in provisional_profiles:
+                withheld_voices.append(speaker_id)
+                report(
+                    f"  {speaker_id}: designed voice (identity still provisional); a "
+                    "usable reference exists but cloning an unestablished speaker could "
+                    "give it a neighbour's voice"
+                )
         for unusable in build.unusable:
             # A character the film never gave four clean seconds is still in the dub;
             # saying so is what keeps a designed voice from looking like a bug.
@@ -805,7 +888,7 @@ def run_pipeline(
                 f"  {unusable.speaker_id}: designed voice, no actor reference "
                 f"({unusable.reason})"
             )
-        if not profiles and not build.unusable:
+        if not profiles and not build.unusable and not provisional_profiles:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
@@ -957,7 +1040,17 @@ def run_pipeline(
         evidence_seconds=diarized.unit_seconds,
         reassignments=tuple(diarized.reassignments),
         windows=tuple(diarized.windows),
-        uncertain_speakers=tuple(diarized.uncertain_speakers),
+        identities=tuple(diarized.identities),
+        confirmed_speakers=diarized.confirmed_speaker_ids,
+        provisional_speakers=diarized.provisional_speaker_ids,
+        unresolved_utterances=tuple(diarized.unresolved_utterances),
+        provisional_voice_ids=tuple(withheld_voices),
+        designed_voice_ids=tuple(
+            sorted(
+                {unusable.speaker_id for unusable in build_unusable}
+                | set(withheld_voices)
+            )
+        ),
         merge_suspects=tuple(diarized.merge_suspects),
         speaker_merges=tuple(diarized.merges),
         discovered_speakers=tuple(diarized.discovered_speakers),

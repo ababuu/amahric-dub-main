@@ -172,6 +172,7 @@ class Stages:
         profiles: dict[str, VoiceProfile] | None = None,
         unusable: list[object] | None = None,
         designed: list[object] | None = None,
+        identities: list[object] | None = None,
         failures: dict[str, Exception] | None = None,
     ) -> None:
         self.root = root
@@ -183,6 +184,7 @@ class Stages:
         self.profiles = {SPEAKER: _profile(root)} if profiles is None else profiles
         self.unusable = [] if unusable is None else unusable
         self.designed = [] if designed is None else designed
+        self.identities = [] if identities is None else identities
         self.failures = failures or {}
         self.received: dict[str, tuple[object, ...]] = {}
         self.order: list[str] = []
@@ -225,7 +227,11 @@ class Stages:
 
         self._record("diarization", speech, settings)
         self.registry_path = registry_path
-        return DiarizationResult(turns=tuple(self.turns), crosstalk=tuple(self.crosstalk))
+        return DiarizationResult(
+            turns=tuple(self.turns),
+            crosstalk=tuple(self.crosstalk),
+            identities=tuple(self.identities),
+        )
 
     def transcribe(
         self, speech: Path, turns: object, *, settings: Settings
@@ -521,9 +527,18 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     # Nothing about character identity is decided quietly: an empty QC block means the
     # run had nothing to report, not that the checks were skipped.
     assert diarization_block["speaker_corrections"] == []
-    assert diarization_block["uncertain_speakers"] == []
     assert diarization_block["merge_suspects"] == []
     assert diarization_block["merges"] == []
+    # Identity state, unresolved lines, and voice decisions are three separate records.
+    assert diarization_block["confirmed_speakers"] == [SPEAKER]
+    assert diarization_block["provisional_speakers"] == []
+    assert diarization_block["identities"] == []
+    assert diarization_block["unresolved"] == {"lines": 0, "seconds": 0.0, "detail": []}
+    assert diarization_block["voices"] == {
+        "cloned": [SPEAKER],
+        "designed": [],
+        "withheld_while_provisional": [],
+    }
     # The model's own answer, the film's similarity scale, and the partition chosen from
     # it are all recorded, so a merge can be argued with without re-running the film.
     assert diarization_block["original"] == {"speakers": [], "identity_count": 0}
@@ -1060,3 +1075,74 @@ def test_a_sentence_report_is_not_printed_when_nothing_was_joined(
     run_pipeline(_source(tmp_path), settings=_settings(tmp_path), progress=messages.append)
 
     assert "assembled into" not in " ".join(messages)
+
+def _identity(speaker_id: str, *, state: str, observations: int, seconds: float):
+    from app.pipeline.diarization import SpeakerIdentity
+    from app.pipeline.speaker_identity import IdentityEvidence
+
+    return SpeakerIdentity(
+        speaker_id=speaker_id,
+        state=state,
+        evidence=IdentityEvidence(
+            speaker_id=speaker_id,
+            observations=observations,
+            turns=observations,
+            seconds=seconds,
+            cohesion=0.9,
+            margin=0.4,
+            appearances=observations,
+            measured_fraction=1.0,
+        ),
+        score=0.9,
+        reasons=() if state == "confirmed" else ("heard once",),
+    )
+
+
+def _profile_for(root: Path, speaker_id: str):
+    from app.pipeline.voice_profiles import VoiceProfile
+
+    return VoiceProfile(
+        speaker_id=speaker_id,
+        reference_audio=root / "voices" / speaker_id / "reference.wav",
+        reference_start=0.0,
+        reference_end=5.0,
+        quality_score=0.9,
+        selection_reason="cleanest turn",
+    )
+
+
+def test_a_provisional_speaker_is_never_cloned(tmp_path: Path, monkeypatch) -> None:
+    """A clone asserts who a voice *is*; a provisional identity cannot make that claim."""
+
+    other = "SPEAKER_01"
+    stages = Stages(
+        tmp_path,
+        turns=[_turn(1.0, 4.0), _turn(5.0, 6.2, speaker_id=other)],
+        identities=[
+            _identity(SPEAKER, state="confirmed", observations=4, seconds=9.0),
+            _identity(other, state="provisional", observations=1, seconds=1.2),
+        ],
+        profiles={
+            SPEAKER: _profile_for(tmp_path, SPEAKER),
+            other: _profile_for(tmp_path, other),
+        },
+    )
+    _wire(monkeypatch, stages)
+    messages: list[str] = []
+    result = run_pipeline(
+        _source(tmp_path), settings=_settings(tmp_path), progress=messages.append
+    )
+
+    # A usable reference existed for both; only the established one is cloned.
+    assert result.provisional_voice_ids == (other,)
+    assert other not in result.profiles
+    assert SPEAKER in result.profiles
+    reported = " ".join(messages)
+    assert "identity still provisional" in reported
+    # Identity state and cloning eligibility are recorded apart.
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    voices = payload["run"]["diarization"]["voices"]
+    assert voices["withheld_while_provisional"] == [other]
+    assert voices["cloned"] == [SPEAKER]
+    assert payload["run"]["diarization"]["provisional_speakers"] == [other]
+    assert payload["run"]["diarization"]["confirmed_speakers"] == [SPEAKER]

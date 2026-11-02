@@ -1832,82 +1832,198 @@ def test_empty_amharic_from_the_model_is_rejected(monkeypatch):
         adapt_dialogue([_segment()], settings=_settings())
 
 
-def test_empty_delivery_from_the_model_is_rejected(monkeypatch):
+def _salvaged(monkeypatch, transform, *, segments=None, text="?? ??? ??"):
+    """Run one adaptation whose answer is malformed, and return it plus the report."""
+
     _patch(monkeypatch)
+    FakeOpenAI.transform = transform
+    messages: list[str] = []
+    adapted = adapt_dialogue(
+        segments if segments is not None else [_segment()],
+        settings=_settings(),
+        on_progress=messages.append,
+    )
+    return adapted, " ".join(messages)
+
+
+def test_a_malformed_beat_does_not_cost_the_batch_its_text(monkeypatch):
+    """The reported failure: a beat outside the line used to end the whole stage."""
 
     def transform(body):
         body["lines"][0]["delivery"] = ""
         return body
 
-    FakeOpenAI.transform = transform
+    (line,), report = _salvaged(monkeypatch, transform)
 
-    with pytest.raises(InvalidModelOutputError, match="delivery"):
-        adapt_dialogue([_segment()], settings=_settings())
+    # The translated text and the line's own timing survive untouched.
+    assert line.amharic
+    assert line.start == 12.43 and line.end == 16.82
+    # Only the direction the model got wrong is replaced, and the run says so.
+    assert line.delivery == "neutral"
+    assert line.emotion == "neutral"
+    assert line.intensity == 0.5
+    assert line.pause_before == 0.0 and line.pause_after == 0.0
+    assert line.beats == ()
+    assert "kept its translated text and original timing" in report
 
 
-def test_invalid_intensity_from_the_model_is_rejected(monkeypatch):
-    _patch(monkeypatch)
-
+def test_an_impossible_intensity_is_replaced_not_fatal(monkeypatch):
     def transform(body):
         body["lines"][0]["intensity"] = 1.5
         return body
 
-    FakeOpenAI.transform = transform
+    (line,), report = _salvaged(monkeypatch, transform)
 
-    with pytest.raises(InvalidModelOutputError, match="intensity"):
-        adapt_dialogue([_segment()], settings=_settings())
+    assert 0.0 <= line.intensity <= 1.0
+    assert line.amharic
+    assert "intensity" in report
 
 
-def test_non_numeric_intensity_from_the_model_is_rejected(monkeypatch):
-    _patch(monkeypatch)
-
+def test_a_non_numeric_intensity_is_replaced_not_fatal(monkeypatch):
     def transform(body):
         body["lines"][0]["intensity"] = "loud"
         return body
 
-    FakeOpenAI.transform = transform
+    (line,), report = _salvaged(monkeypatch, transform)
 
-    with pytest.raises(InvalidModelOutputError, match="intensity"):
-        adapt_dialogue([_segment()], settings=_settings())
+    assert 0.0 <= line.intensity <= 1.0
+    assert "intensity" in report
 
 
-def test_negative_pause_from_the_model_is_rejected(monkeypatch):
-    _patch(monkeypatch)
-
+def test_a_negative_pause_is_replaced_not_fatal(monkeypatch):
     def transform(body):
         body["lines"][0]["pause_after"] = -2.0
         return body
 
-    FakeOpenAI.transform = transform
+    (line,), report = _salvaged(monkeypatch, transform)
 
-    with pytest.raises(InvalidModelOutputError, match="pause_after"):
-        adapt_dialogue([_segment()], settings=_settings())
+    assert line.pause_after >= 0.0
+    assert "pause_after" in report
 
 
-def test_non_numeric_pause_from_the_model_is_rejected(monkeypatch):
-    _patch(monkeypatch)
-
+def test_a_non_numeric_pause_is_replaced_not_fatal(monkeypatch):
     def transform(body):
         body["lines"][0]["pause_before"] = "a while"
         return body
 
-    FakeOpenAI.transform = transform
+    (line,), report = _salvaged(monkeypatch, transform)
 
-    with pytest.raises(InvalidModelOutputError, match="pause_before"):
-        adapt_dialogue([_segment()], settings=_settings())
+    assert line.pause_before >= 0.0
+    assert "pause_before" in report
 
 
-def test_bad_model_output_names_the_offending_dialogue_id(monkeypatch):
-    _patch(monkeypatch)
-
+def test_a_malformed_line_is_named_in_the_report(monkeypatch):
     def transform(body):
         body["lines"][0]["intensity"] = "loud"
         return body
 
+    _, report = _salvaged(monkeypatch, transform)
+
+    assert "dialogue_000001" in report
+
+
+def test_only_the_malformed_line_is_retried(monkeypatch):
+    """A batch with one bad line asks again for that line alone."""
+
+    _patch(monkeypatch)
+    segments = [_segment(start=0.0, end=2.0), _segment(start=2.5, end=4.0)]
+
+    def transform(body):
+        if len(body["lines"]) == 2:
+            body["lines"][0]["intensity"] = 4.0
+        return body
+
+    FakeOpenAI.transform = transform
+    adapted = adapt_dialogue(segments, settings=_settings())
+
+    assert len(adapted) == 2
+    # First request: the batch. Second: the repair request, carrying one line.
+    assert len(FakeOpenAI.requests) == 2
+    assert len(_sent_lines(FakeOpenAI.requests[1])) == 1
+    assert _sent_lines(FakeOpenAI.requests[1])[0]["id"] == "dialogue_000001"
+    # The good line was never re-sent, and both lines are present and in order.
+    assert [line.amharic for line in adapted] != ["", ""]
+
+
+def test_a_recovered_line_keeps_the_retry_answer(monkeypatch):
+    """When the repair request is good, its direction is used, not the fallback."""
+
+    _patch(monkeypatch)
+    calls = {"n": 0}
+
+    def transform(body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            body["lines"][0]["delivery"] = ""
+        else:
+            body["lines"][0]["delivery"] = "quietly certain"
+        return body
+
+    FakeOpenAI.transform = transform
+    (line,) = adapt_dialogue([_segment()], settings=_settings())
+
+    assert line.delivery == "quietly certain"
+    assert line.beats == ()
+
+
+def test_a_malformed_amharic_still_stops_the_run(monkeypatch):
+    """There is no safe substitute for missing translated text."""
+
+    def transform(body):
+        del body["lines"][0]["amharic"]
+        return body
+
+    _patch(monkeypatch)
     FakeOpenAI.transform = transform
 
-    with pytest.raises(InvalidModelOutputError, match="dialogue_000001"):
+    with pytest.raises(InvalidModelOutputError, match="amharic"):
         adapt_dialogue([_segment()], settings=_settings())
+
+
+def test_an_unknown_part_number_does_not_cost_the_batch(monkeypatch):
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="one"),
+        _segment(start=1.6, end=3.0, text="two"),
+    )
+
+    def bad_beats(body):
+        body["lines"][0]["beats"] = [
+            {"part": 7, "emotion": "angry", "intensity": 0.9, "delivery": "raised"},
+        ]
+        return body
+
+    FakeOpenAI.transform = bad_beats
+    messages: list[str] = []
+    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
+
+    assert line.start == 0.0 and line.end == 3.0
+    assert line.amharic
+    assert line.beats == ()
+    assert "part 7" in " ".join(messages)
+
+
+def test_a_repeated_part_number_does_not_cost_the_batch(monkeypatch):
+    _patch(monkeypatch)
+    sentence = _sentence(
+        _segment(start=0.0, end=1.5, text="one"),
+        _segment(start=1.6, end=3.0, text="two"),
+    )
+
+    def repeated(body):
+        body["lines"][0]["beats"] = [
+            {"part": 1, "emotion": "angry", "intensity": 0.5, "delivery": "raised"},
+            {"part": 1, "emotion": "sad", "intensity": 0.5, "delivery": "quiet"},
+        ]
+        return body
+
+    FakeOpenAI.transform = repeated
+    messages: list[str] = []
+    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
+
+    assert line.source_text == "one two"
+    assert line.beats == ()
+    assert "more than once" in " ".join(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -2210,45 +2326,6 @@ def test_a_missing_beat_inherits_the_sentence_direction(monkeypatch):
     assert [beat.emotion for beat in adapted.beats] == ["stern", "angry"]
 
 
-def test_an_unknown_part_number_is_reported(monkeypatch):
-    _patch(monkeypatch)
-    sentence = _sentence(
-        _segment(start=0.0, end=1.5, text="one"),
-        _segment(start=1.6, end=3.0, text="two"),
-    )
-
-    def bad_beats(body):
-        body["lines"][0]["beats"] = [
-            {"part": 7, "emotion": "angry", "intensity": 0.9, "delivery": "raised"},
-        ]
-        return body
-
-    FakeOpenAI.transform = bad_beats
-
-    with pytest.raises(InvalidModelOutputError, match="part 7"):
-        adapt_dialogue([sentence], settings=_settings())
-
-
-def test_a_repeated_part_number_is_reported(monkeypatch):
-    _patch(monkeypatch)
-    sentence = _sentence(
-        _segment(start=0.0, end=1.5, text="one"),
-        _segment(start=1.6, end=3.0, text="two"),
-    )
-
-    def repeated(body):
-        body["lines"][0]["beats"] = [
-            {"part": 1, "emotion": "angry", "intensity": 0.5, "delivery": "raised"},
-            {"part": 1, "emotion": "sad", "intensity": 0.5, "delivery": "quiet"},
-        ]
-        return body
-
-    FakeOpenAI.transform = repeated
-
-    with pytest.raises(InvalidModelOutputError, match="more than once"):
-        adapt_dialogue([sentence], settings=_settings())
-
-
 def test_a_whole_number_part_index_is_accepted(monkeypatch):
     """JSON has one number type; 1.0 means part 1, not a malformed response."""
 
@@ -2270,3 +2347,96 @@ def test_a_whole_number_part_index_is_accepted(monkeypatch):
     (adapted,) = adapt_dialogue([sentence], settings=_settings())
 
     assert [beat.emotion for beat in adapted.beats] == ["calm", "angry"]
+
+# ---------------------------------------------------------------------------
+# a beat may not describe audio outside the line it belongs to
+# ---------------------------------------------------------------------------
+
+
+def _mismatched_sentence():
+    """A sentence whose last part reaches past the line's own end.
+
+    This is the reported shape: dialogue_000007 covered 13.429-14.630s while a part of
+    it - and therefore the beat built from that part - ran to 14.929s. Nothing in the
+    data model enforces that a sentence's span covers its parts, so the adaptation stage
+    has to be the place that keeps a beat inside the line.
+    """
+
+    from app.pipeline.transcription import DialogueSentence
+
+    parts = (
+        _segment(start=13.429, end=14.0, text="I mean, you're"),
+        _segment(start=14.0, end=14.929, text="sitting on a gold mine"),
+    )
+    return DialogueSentence(
+        speaker_id="SPEAKER_00",
+        start=13.429,
+        end=14.630,
+        text="I mean, you're sitting on a gold mine",
+        parts=parts,
+    )
+
+
+def test_a_beat_is_clipped_to_the_line_it_belongs_to(monkeypatch):
+    _patch(monkeypatch)
+    sentence = _mismatched_sentence()
+    FakeOpenAI.transform = lambda body: body
+
+    messages: list[str] = []
+    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
+
+    # The line keeps its exact, application-owned interval.
+    assert line.start == 13.429
+    assert line.end == 14.630
+    # No beat describes audio after the line ends.
+    assert line.beats
+    assert all(beat.end <= line.end + translation.TIMESTAMP_TOLERANCE for beat in line.beats)
+    assert all(beat.start >= line.start - translation.TIMESTAMP_TOLERANCE for beat in line.beats)
+    # The correction is reported rather than silent.
+    assert "narrowed to the line's own interval" in " ".join(messages)
+
+
+def test_a_part_wholly_outside_the_line_is_dropped_not_misplaced(monkeypatch):
+    _patch(monkeypatch)
+    from app.pipeline.transcription import DialogueSentence
+
+    parts = (
+        _segment(start=13.429, end=14.0, text="I mean, you're"),
+        _segment(start=14.7, end=14.929, text="sitting"),
+    )
+    sentence = DialogueSentence(
+        speaker_id="SPEAKER_00",
+        start=13.429,
+        end=14.630,
+        text="I mean, you're sitting",
+        parts=parts,
+    )
+
+    def beats_for_both(body):
+        body["lines"][0]["beats"] = [
+            {"part": 1, "emotion": "even", "intensity": 0.4, "delivery": "level"},
+            {"part": 2, "emotion": "warm", "intensity": 0.5, "delivery": "soft"},
+        ]
+        return body
+
+    FakeOpenAI.transform = beats_for_both
+    messages: list[str] = []
+    (line,) = adapt_dialogue([sentence], settings=_settings(), on_progress=messages.append)
+
+    # The part after the line ends has no moment of this line to describe.
+    assert len(line.beats) == 1
+    assert line.beats[0].end <= 14.0 + translation.TIMESTAMP_TOLERANCE
+    assert line.amharic
+    assert line.end == 14.630
+
+
+def test_the_line_timing_is_never_taken_from_the_parts(monkeypatch):
+    """App timing wins even when the parts disagree with the span."""
+
+    _patch(monkeypatch)
+    sentence = _mismatched_sentence()
+    FakeOpenAI.transform = lambda body: body
+
+    (line,) = adapt_dialogue([sentence], settings=_settings())
+
+    assert (line.start, line.end) == (13.429, 14.630)

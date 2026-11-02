@@ -993,11 +993,32 @@ def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
     return found
 
 
+def _clip_beat(
+    start: float, end: float, *, line_start: float, line_end: float
+) -> tuple[float, float] | None:
+    """Return ``(start, end)`` narrowed to the line's own interval, or ``None``.
+
+    A beat is performance metadata on the line's timeline, and the line's timeline is
+    the application's: whatever a part's own timestamps say, a beat may not describe
+    audio outside the line. A part that overlaps the line only partly keeps the
+    overlapping part of itself; a part that lies wholly outside the line describes
+    nothing and is dropped. ``None`` means "drop this beat".
+    """
+
+    clipped_start = max(start, line_start)
+    clipped_end = min(end, line_end)
+    if clipped_end - clipped_start <= TIMESTAMP_TOLERANCE:
+        return None
+    return clipped_start, clipped_end
+
+
 def _beats_from(
     raw: Any,
     parts: Sequence[Any],
     *,
     fallback: tuple[str, float, str],
+    line_start: float,
+    line_end: float,
 ) -> tuple[PerformanceBeat, ...]:
     """Return the model's per-part direction on the parts' own timeline.
 
@@ -1008,20 +1029,31 @@ def _beats_from(
     inherits the line's direction rather than failing a whole run, but a structural
     error (an unknown or repeated part number) is reported as invalid model output:
     the application will not guess which part was meant.
+
+    Every beat is clipped to the line's own interval before it is built. The parts are
+    meant to be inside the line, but nothing enforces that, and a part that reaches
+    past the line's end used to produce a beat ``AdaptedDialogue`` then rejected -
+    which failed the whole batch over metadata nobody listens to. The line's text and
+    timing are the application's and are never changed here.
     """
 
     if len(parts) < 2:
         return ()
     if raw is None:
+        clipped = (
+            _clip_beat(part.start, part.end, line_start=line_start, line_end=line_end)
+            for part in parts
+        )
         return tuple(
             PerformanceBeat(
-                start=part.start,
-                end=part.end,
+                start=interval[0],
+                end=interval[1],
                 emotion=fallback[0],
                 intensity=fallback[1],
                 delivery=fallback[2],
             )
-            for part in parts
+            for interval in clipped
+            if interval is not None
         )
     if not isinstance(raw, list):
         raise InvalidModelOutputError(
@@ -1056,10 +1088,17 @@ def _beats_from(
                 f"the model returned part {number} more than once"
             )
         part = parts[number - 1]
+        interval = _clip_beat(
+            part.start, part.end, line_start=line_start, line_end=line_end
+        )
+        if interval is None:
+            # The whole part is outside the line: there is no moment of this line for
+            # the direction to apply to, so it is dropped rather than misplaced.
+            continue
         try:
             by_part[number] = PerformanceBeat(
-                start=part.start,
-                end=part.end,
+                start=interval[0],
+                end=interval[1],
                 emotion=entry.get("emotion"),
                 intensity=entry.get("intensity"),
                 delivery=entry.get("delivery"),
@@ -1070,19 +1109,26 @@ def _beats_from(
                 f"{number}: {exc}"
             ) from exc
 
-    return tuple(
-        by_part.get(
-            number,
+    beats: list[PerformanceBeat] = []
+    for number, part in enumerate(parts, start=1):
+        if number in by_part:
+            beats.append(by_part[number])
+            continue
+        interval = _clip_beat(
+            part.start, part.end, line_start=line_start, line_end=line_end
+        )
+        if interval is None:
+            continue
+        beats.append(
             PerformanceBeat(
-                start=part.start,
-                end=part.end,
+                start=interval[0],
+                end=interval[1],
                 emotion=fallback[0],
                 intensity=fallback[1],
                 delivery=fallback[2],
-            ),
+            )
         )
-        for number, part in enumerate(parts, start=1)
-    )
+    return tuple(beats)
 
 
 def _build(
@@ -1105,6 +1151,8 @@ def _build(
                 _finite_number("intensity", line.get("intensity")),
                 _required_text("delivery", line.get("delivery")),
             ),
+            line_start=segment.start,
+            line_end=segment.end,
         )
         return AdaptedDialogue(
             speaker_id=segment.speaker_id,
@@ -1157,6 +1205,50 @@ def describe_fallback(settings: Settings) -> str:
     return "disabled; each batch makes one request and failures stop the run"
 
 
+def _salvage_adaptation(
+    segment: TranscriptSegment | DialogueSentence,
+    line_id: str,
+    payload: Any,
+    *,
+    reason: str,
+) -> AdaptedDialogue:
+    """Build the safest dialogue line possible from a malformed model answer.
+
+    The translated text and the original timing are the two things a dub cannot
+    invent, so they are kept: ``amharic`` comes from the model (it is the part that was
+    asked for), and identity, ``start`` and ``end`` come from the transcript as they
+    always do. What is dropped is the performance direction the model got wrong, which
+    is metadata - a neutral delivery is honest, and the line is still spoken with its
+    translated text in its original slot.
+
+    Raises:
+        InvalidModelOutputError: the model returned nothing usable to say. There is no
+            safe substitute for missing translated text, so this is reported instead
+            of putting English (or silence) into an Amharic dub.
+    """
+
+    text = payload.get("amharic") if isinstance(payload, dict) else None
+    try:
+        return AdaptedDialogue(
+            speaker_id=segment.speaker_id,
+            start=segment.start,
+            end=segment.end,
+            source_text=segment.text,
+            amharic=text,
+            emotion=NEUTRAL_EMOTION,
+            intensity=NEUTRAL_INTENSITY,
+            delivery=NEUTRAL_DELIVERY,
+            pause_before=NEUTRAL_PAUSE,
+            pause_after=NEUTRAL_PAUSE,
+            beats=(),
+        )
+    except InvalidSegmentError as exc:
+        raise InvalidModelOutputError(
+            f"the model returned an unusable adaptation for {line_id!r} ({reason}) and "
+            f"nothing could be salvaged from it: {exc}"
+        ) from exc
+
+
 def _adapt_batch(
     failover: _SingleRequest,
     batch: list[TranscriptSegment | DialogueSentence],
@@ -1172,7 +1264,90 @@ def _adapt_batch(
     The ids are supplied by the caller rather than derived from a start position,
     because a retry sends a *subset* of a batch and each line must keep the id it
     was given the first time.
+
+    One line the model answered badly must not cost the run the whole batch: the
+    offending lines are retried once on their own, and a line that is still malformed
+    after that is salvaged (translated text, original timing, neutral direction) and
+    reported. The result always holds exactly one line per input line, so every caller
+    that indexes it by position keeps working.
     """
+
+    lines = _request_lines(
+        failover,
+        batch,
+        ids,
+        context=context,
+        budgets=budgets,
+        rewrite=rewrite,
+        on_progress=on_progress,
+    )
+
+    produced: list[AdaptedDialogue | None] = []
+    failures: list[tuple[int, Exception]] = []
+    for index, (segment, line_id) in enumerate(zip(batch, ids)):
+        try:
+            produced.append(_build(segment, line_id, lines[line_id]))
+        except InvalidModelOutputError as exc:
+            produced.append(None)
+            failures.append((index, exc))
+    if not failures:
+        repaired = [line for line in produced if line is not None]
+    else:
+        repaired = _repair_adaptations(
+            failover,
+            batch,
+            ids,
+            produced,
+            failures,
+            lines,
+            context=context,
+            budgets=budgets,
+            on_progress=on_progress,
+        )
+    adjusted = sum(
+        1
+        for segment, line in zip(batch, repaired)
+        if _beats_were_adjusted(segment, line.beats)
+    )
+    if adjusted and on_progress is not None:
+        on_progress(
+            f"  translation: {adjusted} line(s) had a performance beat narrowed to the "
+            "line's own interval; the text and the line's timing are unchanged"
+        )
+    return repaired
+
+
+def _beats_were_adjusted(
+    segment: TranscriptSegment | DialogueSentence, beats: Sequence[PerformanceBeat]
+) -> bool:
+    """Return whether any beat differs from its part's own timestamps.
+
+    True means either a beat was narrowed into the line's interval or one that fell
+    wholly outside it was dropped - both of which are reported so a manifest reader
+    knows the performance metadata was corrected rather than silently trusted.
+    """
+
+    parts = getattr(segment, "parts", ())
+    if len(parts) != len(beats):
+        return True
+    return any(
+        abs(part.start - beat.start) > TIMESTAMP_TOLERANCE
+        or abs(part.end - beat.end) > TIMESTAMP_TOLERANCE
+        for part, beat in zip(parts, beats)
+    )
+
+
+def _request_lines(
+    failover: _SingleRequest,
+    batch: list[TranscriptSegment | DialogueSentence],
+    ids: list[str],
+    *,
+    context: str | None,
+    budgets: Sequence[SyllableBudget] | None,
+    rewrite: str | None,
+    on_progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Send one request and return the model's raw line objects keyed by id."""
 
     request_kind = "rewrite" if rewrite is not None else "initial"
     provider = failover.current[1].translation_provider
@@ -1210,8 +1385,90 @@ def _adapt_batch(
             f"{time.perf_counter() - request_started:.1f}s"
         )
 
-    lines = _parse_response(_response_content(response), ids)
-    return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
+    return _parse_response(_response_content(response), ids)
+
+
+def _repair_adaptations(
+    failover: _SingleRequest,
+    batch: list[TranscriptSegment | DialogueSentence],
+    ids: list[str],
+    produced: list[AdaptedDialogue | None],
+    failures: list[tuple[int, Exception]],
+    lines: dict[str, Any],
+    *,
+    context: str | None,
+    budgets: Sequence[SyllableBudget] | None,
+    on_progress: Callable[[str], None] | None,
+) -> list[AdaptedDialogue]:
+    """Retry only the malformed lines once, then salvage whatever is still wrong."""
+
+    offenders = [index for index, _ in failures]
+    reasons = {index: exc for index, exc in failures}
+    if on_progress is not None:
+        on_progress(
+            f"  translation: {len(offenders)} of {len(batch)} line(s) came back "
+            "malformed (" + "; ".join(str(reasons[index])[:160] for index in offenders[:3])
+            + (")" if len(offenders) <= 3 else "; ...)")
+        )
+
+    instructions = "\n".join(
+        f"- {ids[index]}: the previous answer was not usable - {reasons[index]}. "
+        "Return the same line again, following the schema exactly: performance beats "
+        "describe the line's parts, and no field may be empty, out of range, or "
+        "outside the line's own timing."
+        for index in offenders
+    )
+    try:
+        retried = _request_lines(
+            failover,
+            [batch[index] for index in offenders],
+            [ids[index] for index in offenders],
+            context=context,
+            budgets=(
+                [budgets[index] for index in offenders] if budgets is not None else None
+            ),
+            rewrite=(
+                "Rewrite each of these lines to fix the problem described against it, "
+                "keeping the meaning, tone and character:\n" + instructions
+            ),
+            on_progress=on_progress,
+        )
+    except Exception as exc:
+        # The retry itself failed (network, ids, malformed body). The original answers
+        # are still readable, so salvage from those rather than lose the batch.
+        if on_progress is not None:
+            on_progress(
+                "  translation: the repair request failed "
+                f"({type(exc).__name__}: {exc}); salvaging from the first answer"
+            )
+        retried = {}
+
+    for index in offenders:
+        segment = batch[index]
+        line_id = ids[index]
+        reason = str(reasons[index])
+        if line_id in retried:
+            try:
+                produced[index] = _build(segment, line_id, retried[line_id])
+                if on_progress is not None:
+                    on_progress(
+                        f"  translation: {line_id} recovered on the repair request"
+                    )
+                continue
+            except InvalidModelOutputError as exc:
+                reason = f"retry also unusable: {exc}"
+        produced[index] = _salvage_adaptation(
+            segment,
+            line_id,
+            retried.get(line_id, lines.get(line_id)),
+            reason=reason,
+        )
+        if on_progress is not None:
+            on_progress(
+                f"  translation: {line_id} kept its translated text and original "
+                f"timing with a neutral delivery ({reason})"
+            )
+    return [line for line in produced if line is not None]
 
 
 #: Maximum number of rewrite requests per original batch. Lines that do not improve
