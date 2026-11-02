@@ -659,10 +659,11 @@ def run_pipeline(
     raw = diarized.raw_speaker_ids
     final = diarized.speaker_ids
     confirmed = diarized.confirmed_speaker_ids
-    provisional = diarized.provisional_speaker_ids
+    provisional = diarized.uncertain_speaker_ids
     if raw != final or provisional:
         detail = (
-            f"; {len(provisional)} provisional ({', '.join(provisional)})"
+            f"; {len(provisional)} uncertain, not counted "
+            f"({', '.join(provisional)})"
             if provisional
             else ""
         )
@@ -670,30 +671,27 @@ def run_pipeline(
             f"  identities: pyannote reported {len(raw)} ({', '.join(raw)}); "
             f"{len(confirmed)} established ({', '.join(confirmed) or 'none'}){detail}"
         )
-    for item in diarized.identities:
-        if item.confirmed:
-            continue
-        evidence = item.evidence
+    for uncertain_speaker in diarized.uncertain_speakers:
         report(
-            f"  provisional speaker: {item.speaker_id} "
-            f"({evidence.observations} observation(s), {evidence.seconds:.1f}s, "
-            f"{evidence.appearances} appearance(s), cohesion "
-            f"{evidence.cohesion:.2f}, margin {evidence.margin:.2f}, score "
-            f"{item.score:.2f}); kept as its own speaker - "
-            + "; ".join(item.reasons)
+            f"  uncertain speaker: {uncertain_speaker.speaker_id} "
+            f"({uncertain_speaker.seconds:.1f}s; best similarity "
+            f"{uncertain_speaker.similarity:.2f}, margin "
+            f"{uncertain_speaker.margin:.2f}); keeps its turns but is not counted as an "
+            "established character - " + uncertain_speaker.reason
         )
-    if diarized.unresolved_utterances:
+    for unresolved in diarized.unresolved_speakers:
         report(
-            f"  unresolved: {len(diarized.unresolved_utterances)} line(s) / "
-            f"{diarized.undecided_seconds:.1f}s could not be attributed to a speaker; "
-            "each keeps the attribution it had and is flagged for QC"
+            f"  not established: {unresolved.speaker_id} "
+            f"({unresolved.seconds:.1f}s; best similarity "
+            f"{unresolved.similarity:.2f}, margin {unresolved.margin:.2f}); its turns "
+            "keep the attribution they had - " + unresolved.reason
         )
-        for utterance in diarized.unresolved_utterances:
-            report(
-                f"    {utterance.start:.2f}-{utterance.end:.2f}s kept as "
-                f"{utterance.kept_speaker_id} (similarity "
-                f"{utterance.similarity:.2f}, margin {utterance.margin:.2f})"
-            )
+    if diarized.undecided_performances:
+        report(
+            f"  undecided: {diarized.undecided_performances} performance(s) / "
+            f"{diarized.undecided_seconds:.1f}s could not be separated between two "
+            "identities; each keeps the attribution it had and is flagged for QC"
+        )
     for reassignment in diarized.reassignments:
         report(
             f"  reassigned {reassignment.start:.2f}-{reassignment.end:.2f}s from "

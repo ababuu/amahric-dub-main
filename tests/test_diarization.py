@@ -1213,14 +1213,9 @@ def test_an_undecidable_performance_keeps_pyannotes_identity(monkeypatch, tmp_pa
     result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
 
     assert result.turns[-1].speaker_id == "SPEAKER_00"
-    # The ambiguity belongs to the *line*, not to a speaker: the identity it stayed with
-    # is the one thing about it that is not in doubt.
-    assert result.uncertain_speaker_ids == ()
-    assert len(result.unresolved_utterances) == 1
-    unresolved = result.unresolved_utterances[0]
-    assert unresolved.kept_speaker_id == "SPEAKER_00"
-    assert unresolved.seconds == pytest.approx(2.0)
-    assert unresolved.reason
+    # The ambiguity is counted, not attached to the speaker it stayed with: that speaker
+    # is the one identity the evidence is *not* in doubt about.
+    assert result.uncertain_speakers == ()
     assert result.undecided_performances == 1
     assert result.undecided_seconds == pytest.approx(2.0)
 
@@ -1412,12 +1407,13 @@ def test_the_artifact_scene_keeps_character_c_in_one_identity(monkeypatch, tmp_p
     assert {by_start[start] for start in (3.0, 14.97, 112.23, 114.09, 116.67)} == {"SPEAKER_01"}
     assert len(result.reassignments) == 6
 
-def test_a_short_window_discovery_is_kept_as_a_provisional_speaker(monkeypatch, tmp_path):
-    """The regression this replaces a duration threshold for.
 
-    A suspect window separates a voice it hears for 1.8s. That is not enough to establish
-    a character, and it is also not grounds to hand the voice back to its neighbour. The
-    speaker keeps a persistent id and their own dialogue, and is reported provisional.
+def test_a_thin_window_discovery_is_not_counted_as_a_character(monkeypatch, tmp_path):
+    """The reported regression: two speakers chosen, a third identity reported on 1.8 s.
+
+    A window that separates a voice it cannot corroborate must not add a character the
+    film-wide evidence declined. Its turns go back where they were, and the candidate is
+    reported as unresolved rather than counted.
     """
 
     _patch(monkeypatch)
@@ -1428,9 +1424,9 @@ def test_a_short_window_discovery_is_kept_as_a_provisional_speaker(monkeypatch, 
         (26.0, 31.0, "SPEAKER_01"),
         (40.0, 45.0, "SPEAKER_00"),
         (46.0, 51.0, "SPEAKER_01"),
-        (60.0, 64.5, "SPEAKER_00"),
+        (60.0, 62.0, "SPEAKER_00"),
     ]
-    third = [0.0, 0.0, 1.0, 0.0]
+    thin = [0.5, 0.5, 0.6, 0.3]
     vectors = {
         (0.0, 5.0): _VA,
         (6.0, 11.0): _VB,
@@ -1438,25 +1434,30 @@ def test_a_short_window_discovery_is_kept_as_a_provisional_speaker(monkeypatch, 
         (26.0, 31.0): _VB,
         (40.0, 45.0): _VA,
         (46.0, 51.0): _VB,
-        (60.0, 64.5): [0.5, 0.5, 0.0, 0.0],
-        (61.0, 62.8): third,
+        (60.0, 62.0): [0.5, 0.5, 0.0, 0.0],
+        # The window hears 1.8 s of a third voice inside the ambiguous turn.
+        (60.0, 61.8): thin,
     }
-    _scripted(turns, [[(61.0, 62.8, "SPEAKER_00")]], vectors)
+    _scripted(turns, [[(60.0, 61.8, "SPEAKER_00")]], vectors)
     _install_fake_pyannote_core(monkeypatch)
 
     result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
 
-    # pyannote's own answer is unchanged, and the film now has three identities.
     assert result.raw_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    assert "SPEAKER_02" in result.speaker_ids
-    # The new one is a real speaker with its own dialogue, not a fragment to discard.
-    provisional = [item for item in result.identities if item.state == identity.PROVISIONAL]
-    assert [item.speaker_id for item in provisional] == ["SPEAKER_02"]
-    assert any(segment.speaker_id == "SPEAKER_02" for segment in result.turns)
-    # It is not counted among the established cast, and the reason is recorded.
-    assert result.provisional_speaker_ids == ("SPEAKER_02",)
-    assert "SPEAKER_02" not in result.confirmed_speaker_ids
-    assert provisional[0].reasons
+    # Two identities, and both of them confirmed.
+    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.confirmed_speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert result.uncertain_speaker_ids == ()
+    assert result.discovered_speakers == ()
+    # The candidate is reported, with the reason and the evidence it did not have.
+    assert len(result.unresolved_speakers) == 1
+    unresolved = result.unresolved_speakers[0]
+    assert unresolved.speaker_id.startswith("SPEAKER_")
+    assert unresolved.seconds == pytest.approx(1.8)
+    assert "needed to establish a character" in unresolved.reason
+    # Its turn went back to the identity it had before the window ran.
+    assert result.turns[-1].speaker_id == "SPEAKER_00"
+    assert all(item.mode != "window" for item in result.windows)
 
 
 def test_a_window_discovery_with_enough_evidence_is_a_character(monkeypatch, tmp_path):
@@ -1489,195 +1490,6 @@ def test_a_window_discovery_with_enough_evidence_is_a_character(monkeypatch, tmp
     result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
 
     assert "SPEAKER_02" in result.speaker_ids
-    assert result.unresolved_utterances == ()
+    assert result.unresolved_speakers == ()
     assert any(item.mode == "window" for item in result.windows)
-    # Window-discovered speakers are real speakers; whether they are established is a
-    # separate question answered by the evidence, not by a duration threshold.
-    assert any(item.speaker_id == "SPEAKER_02" for item in result.identities)
 
-# ---------------------------------------------------------------------------
-# three-state identities: confirmed, provisional, unresolved
-# ---------------------------------------------------------------------------
-
-
-def _three_state_film(short_turn_vector, distant: bool = True):
-    """A, B and a third voice that speaks briefly - optionally in two places."""
-
-    third_at = 120.0 if distant else 60.5
-    turns = [
-        (0.0, 5.0, "SPEAKER_00"),
-        (6.0, 11.0, "SPEAKER_01"),
-        (30.0, 35.0, "SPEAKER_00"),
-        (36.0, 41.0, "SPEAKER_01"),
-        (60.0, 60.9, "SPEAKER_00"),
-        (third_at, third_at + 0.9, "SPEAKER_00"),
-        (150.0, 155.0, "SPEAKER_00"),
-        (156.0, 161.0, "SPEAKER_01"),
-    ]
-    vectors = {
-        (0.0, 5.0): _VA,
-        (6.0, 11.0): _VB,
-        (30.0, 35.0): _VA,
-        (36.0, 41.0): _VB,
-        (60.0, 60.9): short_turn_vector,
-        (third_at, third_at + 0.9): short_turn_vector,
-        (150.0, 155.0): _VA,
-        (156.0, 161.0): _VB,
-    }
-    return turns, vectors
-
-
-def test_a_short_speaker_heard_twice_is_confirmed(monkeypatch, tmp_path):
-    """Two 0.9s turns in different parts of the film establish a character.
-
-    Under the old rule this speaker was dropped for having under three seconds. The
-    evidence says otherwise: two independent observations, cohesive and well separated.
-    """
-
-    _patch(monkeypatch)
-    third = [0.0, 0.0, 1.0, 0.0]
-    turns, vectors = _three_state_film(third)
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    by_id = {item.speaker_id: item for item in result.identities}
-    third_id = next(
-        speaker_id for speaker_id, item in by_id.items() if item.evidence.observations == 2
-    )
-    assert by_id[third_id].confirmed is True
-    assert third_id in result.confirmed_speaker_ids
-    assert by_id[third_id].evidence.seconds < 3.0
-    assert by_id[third_id].evidence.appearances == 2
-
-
-def test_the_same_short_speaker_heard_once_is_provisional(monkeypatch, tmp_path):
-    """Identical audio in one place only: kept, named, not yet established."""
-
-    _patch(monkeypatch)
-    third = [0.0, 0.0, 1.0, 0.0]
-    turns, vectors = _three_state_film(third, distant=False)
-    # One appearance only: the second copy is unreachable, so remove its evidence.
-    vectors.pop((120.0, 120.9), None)
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    by_id = {item.speaker_id: item for item in result.identities}
-    third_id = next(
-        speaker_id for speaker_id, item in by_id.items() if item.evidence.observations == 1
-    )
-    assert by_id[third_id].confirmed is False
-    assert third_id in result.provisional_speaker_ids
-    # Provisional but real: it keeps its id and its line.
-    assert any(segment.speaker_id == third_id for segment in result.turns)
-
-
-def test_an_emotionally_split_voice_is_not_promoted_to_a_character(monkeypatch, tmp_path):
-    """Two deliveries of one voice that do not agree stay one provisional identity."""
-
-    _patch(monkeypatch)
-    calm = [0.0, 1.0, 0.0, 0.0]
-    shouted = [0.0, 0.0, 1.0, 0.0]
-    turns = [
-        (0.0, 5.0, "SPEAKER_00"),
-        (6.0, 11.0, "SPEAKER_01"),
-        (60.0, 61.0, "SPEAKER_00"),
-        (62.0, 63.0, "SPEAKER_00"),
-        (120.0, 121.0, "SPEAKER_00"),
-        (122.0, 123.0, "SPEAKER_00"),
-    ]
-    vectors = {
-        (0.0, 5.0): _VA,
-        (6.0, 11.0): _VB,
-        (60.0, 61.0): calm,
-        (62.0, 63.0): shouted,
-        (120.0, 121.0): calm,
-        (122.0, 123.0): shouted,
-    }
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    # Whatever the clustering decides, nothing it creates is confirmed on the strength of
-    # a delivery change alone.
-    for item in result.identities:
-        if item.speaker_id not in {"SPEAKER_00", "SPEAKER_01"}:
-            assert item.confirmed is False
-    assert "SPEAKER_00" in result.confirmed_speaker_ids
-
-
-def test_a_noisy_fragment_becomes_an_unresolved_line_not_a_speaker(monkeypatch, tmp_path):
-    """A line whose evidence points nowhere is preserved and flagged, not assigned."""
-
-    _patch(monkeypatch)
-    turns = [
-        (0.0, 5.0, "SPEAKER_00"),
-        (6.0, 11.0, "SPEAKER_01"),
-        (60.0, 60.6, "SPEAKER_00"),
-    ]
-    vectors = {
-        (0.0, 5.0): _VA,
-        (6.0, 11.0): _VB,
-        # A fragment that matches neither established voice, and is too short to be a
-        # candidate of its own: exactly what "unresolved" exists for.
-        (60.0, 60.6): [0.0, 0.0, 1.0, 0.0],
-    }
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    assert result.speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    assert len(result.unresolved_utterances) == 1
-    unresolved = result.unresolved_utterances[0]
-    assert unresolved.start == pytest.approx(60.0)
-    assert unresolved.kept_speaker_id == "SPEAKER_00"
-    # Preserved: the line is still in the run, in its own slot.
-    assert any(segment.start == pytest.approx(60.0) for segment in result.turns)
-
-
-def test_a_provisional_speaker_is_never_folded_into_a_confirmed_one(monkeypatch, tmp_path):
-    """Insufficient evidence leaves the speaker separate, not merged into a neighbour."""
-
-    _patch(monkeypatch)
-    third = [0.0, 0.0, 1.0, 0.0]
-    turns, vectors = _three_state_film(third, distant=False)
-    vectors.pop((120.0, 120.9), None)
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-
-    result = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    provisional = set(result.provisional_speaker_ids)
-    assert provisional
-    # Its dialogue is still attributed to it, not handed back to a confirmed speaker.
-    for speaker_id in provisional:
-        turns_for = [seg for seg in result.turns if seg.speaker_id == speaker_id]
-        assert turns_for
-        assert speaker_id not in result.confirmed_speaker_ids
-
-
-def test_identity_state_is_independent_of_movie_length(monkeypatch, tmp_path):
-    """The same evidence in a four-minute film and a twenty-minute one scores alike."""
-
-    _patch(monkeypatch)
-    short = [0.0, 0.0, 1.0, 0.0]
-    turns, vectors = _three_state_film(short)
-    _scripted(turns, [], vectors)
-    _install_fake_pyannote_core(monkeypatch)
-    first = diarize_detailed(_audio(tmp_path), settings=_settings(tmp_path))
-
-    _patch(monkeypatch)
-    stretched = [(start * 5.0, end * 5.0, label) for start, end, label in turns]
-    stretched_vectors = {
-        (start * 5.0, end * 5.0): vector for (start, end), vector in vectors.items()
-    }
-    _scripted(stretched, [], stretched_vectors)
-    _install_fake_pyannote_core(monkeypatch)
-    second = diarize_detailed(_audio(tmp_path, "speech_b.wav"), settings=_settings(tmp_path))
-
-    assert first.confirmed_speaker_ids == second.confirmed_speaker_ids

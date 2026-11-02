@@ -446,76 +446,87 @@ class SpeakerReassignment:
 
 
 @dataclass(frozen=True, slots=True)
-class SpeakerIdentity:
-    """One speaker identity the run found, and whether it is established.
+class DiarizationWindow:
+    """What one suspect window's own diarization produced, and what was done with it."""
 
-    ``state`` is :data:`~app.pipeline.speaker_identity.CONFIRMED` or
-    :data:`~app.pipeline.speaker_identity.PROVISIONAL`. A provisional identity is still a
-    real, persistent speaker: it keeps its id, its dialogue and its place in the film. It
-    is simply not yet established, so nothing downstream may *assert* who they are - in
-    particular nothing may clone a character's voice and call it theirs.
-
-    Identity state and voice-cloning eligibility are deliberately different things and
-    are reported separately: a confirmed character can still have no usable reference
-    (and is then spoken in a designed voice), and a provisional one can have plenty of
-    audio for a clone that must not be used as that character's.
-    """
-
-    speaker_id: str
-    state: str
-    evidence: identity.IdentityEvidence
-    score: float
-    reasons: tuple[str, ...]
-
-    @property
-    def confirmed(self) -> bool:
-        """``True`` when this identity is established."""
-
-        return self.state == identity.CONFIRMED
+    index: int
+    start: float
+    end: float
+    turns: int
+    speakers: tuple[str, ...]
+    #: ``window`` when the window's own labels were kept, ``kept`` when the current
+    #: attribution was kept, ``failed`` when the window could not be diarized at all.
+    mode: str
+    detail: str = ""
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-safe view of the identity."""
+        """Return a JSON-safe view of the window."""
 
         return {
-            "speaker_id": self.speaker_id,
-            "state": self.state,
-            "score": round(self.score, 4),
-            "evidence": self.evidence.as_dict(),
-            "reasons": list(self.reasons),
+            "index": self.index,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+            "turns": self.turns,
+            "speakers": list(self.speakers),
+            "mode": self.mode,
+            "detail": self.detail,
         }
 
 
 @dataclass(frozen=True, slots=True)
-class UnresolvedUtterance:
-    """One stretch of speech the run could not attribute to a known or new speaker.
+class UncertainSpeaker:
+    """An identity that holds dialogue but was never established.
 
-    Unresolved is a property of the *line*, not of a voice: the film may contain only
-    well-established characters and still contain a line whose evidence cannot say which
-    of them said it. The line is preserved - it keeps the attribution it already had, so
-    its dialogue is still dubbed in its original slot - and flagged here so a QC pass can
-    find it. Nothing is guessed, and no identity is created from it.
+    It keeps its id and its turns - it is a real voice in the film - but nothing
+    downstream may *assert* who it is, so it is excluded from the confirmed cast and
+    must not be given a cloned character reference.
     """
 
-    start: float
-    end: float
-    seconds: float
-    #: The identity the turn keeps for downstream use. Not a claim about who spoke.
-    kept_speaker_id: str
+    speaker_id: str
     reason: str
     similarity: float
     margin: float
+    seconds: float
 
     def as_dict(self) -> dict[str, object]:
-        """Return a JSON-safe view of the unresolved line."""
+        """Return a JSON-safe view of the uncertainty."""
 
         return {
-            "start": round(self.start, 3),
-            "end": round(self.end, 3),
-            "seconds": round(self.seconds, 3),
-            "kept_speaker_id": self.kept_speaker_id,
+            "speaker_id": self.speaker_id,
             "reason": self.reason,
             "similarity": round(self.similarity, 4),
             "margin": round(self.margin, 4),
+            "seconds": round(self.seconds, 3),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedSpeaker:
+    """A voice a suspect window separated but the run could not establish.
+
+    It is *not* an identity: its turns were put back where they were, and it is not
+    counted among the film's speakers. It is reported because "a window heard a third
+    voice here and the evidence was too thin to name it" is exactly the thing a reader
+    of a run needs to know, and because the alternative - quietly promoting it to a
+    character, or quietly discarding it - hides a diarization problem rather than
+    recording one.
+    """
+
+    speaker_id: str
+    reason: str
+    similarity: float
+    margin: float
+    seconds: float
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the unresolved candidate."""
+
+        return {
+            "speaker_id": self.speaker_id,
+            "reason": self.reason,
+            "similarity": round(self.similarity, 4),
+            "margin": round(self.margin, 4),
+            "seconds": round(self.seconds, 3),
         }
 
 
@@ -540,7 +551,6 @@ class SpeakerMergeSuspect:
 @dataclass(frozen=True, slots=True)
 class SpeakerIdentityMerge:
     """Two identities that were merged as one person discovered twice."""
-
     from_speaker_id: str
     to_speaker_id: str
     similarity: float
@@ -1295,7 +1305,6 @@ def _name_clusters(
         assignment[cluster] = new_id
 
     return assignment
-    return assignment, plans
 
 
 def _cluster_scores(
