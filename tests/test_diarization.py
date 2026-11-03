@@ -1713,9 +1713,57 @@ def test_a_scene_that_cannot_separate_its_voices_is_reported_as_unresolved(
 def test_two_identities_at_or_above_the_films_same_voice_level_are_flagged():
     """The guard for "two characters spoken in one cloned voice".
 
-    When two identities' voiceprints are at the level this film itself calls the same
+    When two identities' *performances* are at the level this film itself calls the same
     voice, the run says what that means instead of describing them as merely similar:
-    their lines will share a cloned voice.
+    their lines will share a cloned voice. The likeness is measured over performances,
+    because a prototype similarity cannot be compared with the film's own scale.
+    """
+
+    calibration = partition.Calibration(
+        within=0.6,
+        between=0.0,
+        same_similarity=0.31,
+        margin=0.15,
+        min_silhouette=0.30,
+        reliable=True,
+        units=40,
+        clean_units=20,
+    )
+    near = (0.6, 0.8, 0.0, 0.0)
+    turns = [
+        SpeakerSegment("SPEAKER_00", 0.0, 3.0),
+        SpeakerSegment("SPEAKER_01", 10.0, 13.0),
+        SpeakerSegment("SPEAKER_02", 20.0, 23.0),
+    ]
+    vectors = {
+        (0.0, 3.0): tuple(_VA),
+        (10.0, 13.0): near,
+        (20.0, 23.0): tuple(_VC),
+    }
+    voiceprints = {
+        "SPEAKER_00": tuple(_VA),
+        "SPEAKER_01": near,
+        "SPEAKER_02": tuple(_VC),
+    }
+
+    suspects = diarization._suspect_pairs(
+        voiceprints, {}, calibration, turns=turns, vectors=vectors
+    )
+
+    flagged = [item for item in suspects if item.same_voice]
+    assert flagged, "0.8-alike voices must be flagged against a 0.31 same-voice level"
+    assert flagged[0].speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert "share" in flagged[0].reason or "cloned voice" in flagged[0].reason
+    # An unrelated voice is not swept into the report.
+    assert all("SPEAKER_02" not in item.speaker_ids for item in suspects)
+
+
+def test_a_smoothed_prototype_is_never_reported_as_the_same_voice():
+    """Without performances to measure, a prototype likeness is not a same-voice claim.
+
+    Averaging a speaker's turns into one voiceprint removes their noise, so two different
+    people can look 0.6 alike while none of their performances are. Reporting that as
+    "these two are one voice" is how a correct split gets blamed on diarization.
     """
 
     calibration = partition.Calibration(
@@ -1730,18 +1778,13 @@ def test_two_identities_at_or_above_the_films_same_voice_level_are_flagged():
     )
     voiceprints = {
         "SPEAKER_00": tuple(_VA),
-        "SPEAKER_01": tuple([0.6, 0.8, 0.0, 0.0]),
-        "SPEAKER_02": tuple(_VC),
+        "SPEAKER_01": (0.6, 0.8, 0.0, 0.0),
     }
 
     suspects = diarization._suspect_pairs(voiceprints, {}, calibration)
 
-    flagged = [item for item in suspects if item.same_voice]
-    assert flagged, "0.6-alike voices must be flagged against a 0.31 same-voice level"
-    assert flagged[0].speaker_ids == ("SPEAKER_00", "SPEAKER_01")
-    assert "share" in flagged[0].reason or "cloned voice" in flagged[0].reason
-    # An unrelated voice is not swept into the report.
-    assert all("SPEAKER_02" not in item.speaker_ids for item in suspects)
+    assert suspects, "the resemblance is still worth reporting"
+    assert not any(item.same_voice for item in suspects)
 
 
 def test_a_voice_seen_in_two_scenes_is_confirmed(monkeypatch, tmp_path):

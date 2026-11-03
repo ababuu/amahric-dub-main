@@ -57,11 +57,15 @@ FALLBACK_MIN_SILHOUETTE = 0.10
 MIN_STABILITY = 0.75
 
 #: How much of a coarser partition's silhouette a finer one has to keep. Silhouette
-#: always falls as clusters are added - that is arithmetic, not evidence - so comparing
-#: it against a constant punishes the third speaker in a film by construction. A genuine
-#: extra speaker keeps most of the fit; a cluster sliced out of a homogeneous voice
-#: collapses it.
-SILHOUETTE_RETENTION = 0.6
+#: always falls as clusters are added - that is arithmetic, not evidence - so a finer
+#: partition is judged against the fit it replaces rather than against a constant. A
+#: genuine extra voice barely dents the fit (a third character scored 0.90 of the
+#: two-speaker fit in the fixture below); a split the evidence does not really support
+#: costs a quarter of it or more. Three quarters is the line, and it is set high on
+#: purpose: inventing a character splits one actor's dialogue into two identities, which
+#: a listener hears as two people sharing a voice, while missing one only leaves the
+#: dub exactly as good as it was before.
+SILHOUETTE_RETENTION = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,27 +385,43 @@ def identity_cosine(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 def speaker_separation(vectors: np.ndarray, labels: np.ndarray, k: int) -> float | None:
-    """Return how alike the two most similar speakers of a partition are.
+    """Return how alike the performances of *different* clusters are.
 
-    This is the question a speaker count actually has to answer: with ``k`` clusters, are
-    all ``k`` of them different voices? Two clusters whose centroids sit closer than the
-    film's own same-voice similarity are one character wearing two labels, whatever the
-    silhouette says. ``None`` for a single cluster, which has nothing to compare.
+    This is the question a speaker count actually has to answer: with ``k`` clusters, do
+    the clusters hold different voices? It is measured the way the film's own calibration
+    is measured - the **median similarity between two performances** - so the number can
+    honestly be compared with ``Calibration.same_similarity``. Two things would break
+    that, and both did:
+
+    * measuring in the cohort-centred space while the threshold came from the raw one.
+      Centring removes the component every performance shares, which pushes different
+      voices towards zero *by construction*, so a centred distance compared against an
+      uncentred threshold accepts nearly any split;
+    * comparing cluster *centroids*. Averaging many performances removes their noise, so
+      two centroids always look more alike than any two of the performances that built
+      them - a different statistic, on a different scale.
+
+    ``None`` when there is nothing to compare (one cluster, or no cross-cluster pair).
     """
 
     if k < 2:
         return None
-    centroids = [
-        vectors[labels == cluster].mean(axis=0)
-        for cluster in range(k)
-        if np.any(labels == cluster)
-    ]
-    if len(centroids) < 2:
-        return None
-    matrix = _matrix(np.asarray(centroids))
-    similarity = matrix @ matrix.T
-    order = similarity.shape[0]
-    return float(max(similarity[i, j] for i in range(order) for j in range(i + 1, order)))
+    matrix = _matrix(vectors)
+    cluster_of = np.asarray(labels)
+    worst: float | None = None
+    for first in range(k):
+        for second in range(first + 1, k):
+            left = np.where(cluster_of == first)[0]
+            right = np.where(cluster_of == second)[0]
+            if left.size == 0 or right.size == 0:
+                continue
+            # The same statistic the film was calibrated with - the median similarity of
+            # two performances - asked of one pair of clusters at a time. The worst pair
+            # is what the partition is judged on, because one pair that is really the
+            # same voice is enough to make two characters share a voice.
+            pair = float(np.median(matrix[left] @ matrix[right].T))
+            worst = pair if worst is None else max(worst, pair)
+    return worst
 
 
 def calibrate(units: Sequence[Unit]) -> Calibration:
@@ -510,6 +530,10 @@ def repartition(
 
     provisional, provisional_k = _provisional_labels(units)
     vectors = centre([unit.vector for unit in units])
+    # The same performances in the space the film's own thresholds were measured in.
+    # Clustering works on the centred matrix; every comparison against `same_similarity`
+    # has to use this one, or the two numbers are not on the same scale.
+    raw = _matrix([unit.vector for unit in units])
     candidates: list[Candidate] = []
     accepted: list[tuple[Candidate, np.ndarray]] = []
 
@@ -523,7 +547,7 @@ def repartition(
         stability_score = float(stability(vectors, k, repeats=repeats))
         smallest_units = int(min(counts))
         smallest_seconds = float(min(seconds))
-        separation = speaker_separation(vectors, labels, k)
+        separation = speaker_separation(raw, labels, k)
 
         # The speakers of this partition are different voices by the film's own scale.
         # When the film can calibrate itself, that is the test that decides whether a

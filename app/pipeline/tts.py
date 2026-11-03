@@ -76,6 +76,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 import numpy as np
@@ -949,6 +950,27 @@ OMNIVOICE_AMHARIC = "Amharic"
 #: The rate OmniVoice generates at.
 OMNIVOICE_SAMPLE_RATE = 24_000
 
+#: How far a take's median pitch may sit from its character's reference before the clone
+#: is treated as not having taken. Speech is not a metronome, but a clone of a 172 Hz
+#: actor that comes back at 148 Hz is not that actor: the prompt was not followed, and
+#: every other character cloned the same way will land in the same place. That is what a
+#: dub sounds like when "all the characters share one voice".
+VOICE_MATCH_TOLERANCE = 0.20
+
+#: The two ways a reference can be handed to OmniVoice, and they are not interchangeable.
+#: With a transcript the reference is used exactly as cut (no silence removal), so the
+#: transcript has to describe every word of it. Without one, the engine first removes the
+#: silences and then transcribes what is left itself, which is the mode its own
+#: documentation recommends for a short or pause-riddled reference.
+REFERENCE_TEXT_STRATEGY = "reference-text"
+PREPROCESSED_STRATEGY = "reference-preprocessed"
+
+#: Analysis window and hop for the pitch tracker, in seconds. The window is short enough
+#: to follow a syllable and long enough to hold several periods of a low male voice.
+_PITCH_FRAME_SECONDS = 0.04
+_PITCH_HOP_SECONDS = 0.02
+_PITCH_WINDOW_SECONDS = 1.2
+
 #: Characters that already end a reference transcript as a complete sentence.
 _SENTENCE_END = (".", "!", "?", "…", "。", "！", "？", "።", "፧")
 
@@ -1473,6 +1495,69 @@ class OmniVoiceEngine(VoiceCloningEngine):
 
         samples = _first_waveform(produced, engine="OmniVoice", text=text)
         return _write_mono(target, samples, self.sample_rate, label="OmniVoice take")
+
+
+def median_pitch(path: str | Path) -> float | None:
+    """Return the median fundamental frequency of one recording, in Hz.
+
+    A plain autocorrelation tracker, chosen because it needs nothing but numpy. Its job
+    is to notice that a generated voice is not the one it should be, and a gross error in
+    pitch is exactly that: it is the one identity cue that can be measured on every run,
+    on any engine, without a second model.
+
+    Frames below the recording's own loudness are ignored, so silence and pause padding
+    do not enter the median. ``None`` means "not measurable", never "zero".
+    """
+
+    import numpy as np
+    import soundfile as sf
+
+    try:
+        samples, rate = sf.read(str(path), always_2d=False)
+    except (OSError, RuntimeError):
+        return None
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    samples = np.asarray(samples, dtype=np.float64)
+    if rate <= 0 or samples.size < rate * 0.1:
+        return None
+
+    frame = int(_PITCH_FRAME_SECONDS * rate)
+    hop = int(_PITCH_HOP_SECONDS * rate)
+    limit = int(_PITCH_WINDOW_SECONDS * rate)
+    window = samples[: min(samples.size, limit)]
+    if window.size < frame * 2:
+        return None
+
+    lowest = max(2, int(rate / 400.0))
+    highest = min(frame - 1, int(rate / 60.0))
+    if highest <= lowest:
+        return None
+
+    measured: list[float] = []
+    for start in range(0, window.size - frame, hop):
+        piece = window[start : start + frame]
+        if float(np.sqrt(np.mean(piece**2))) < 0.01:
+            continue
+        centred = piece - piece.mean()
+        correlation = np.correlate(centred, centred, mode="full")[frame - 1 :]
+        if correlation[0] <= 0:
+            continue
+        lag = lowest + int(np.argmax(correlation[lowest:highest]))
+        if correlation[lag] < 0.4 * correlation[0]:
+            continue
+        measured.append(rate / lag)
+    if len(measured) < 5:
+        return None
+    return float(median(measured))
+
+
+def _pitch_error(measured: float | None, reference: float | None) -> float | None:
+    """Return how far ``measured`` is from ``reference`` as a fraction of it."""
+
+    if not measured or not reference or reference <= 0:
+        return None
+    return abs(measured - reference) / reference
 
 
 def _first_waveform(produced: Any, *, engine: str, text: str) -> np.ndarray:
@@ -2054,6 +2139,177 @@ def pacing_plan_for(
     )
 
 
+def _clone_take_name(name: str, strategy: str) -> str:
+    """Return the artifact stem for one cloning strategy.
+
+    The two strategies produce different audio from the same reference, so they must not
+    share a file: a take left behind by one would be reused for the other.
+    """
+
+    return name if strategy == REFERENCE_TEXT_STRATEGY else f"{name}~pre"
+
+
+def _clone_request(
+    dialogue: AdaptedDialogue,
+    profile: VoiceProfile,
+    *,
+    strategy: str,
+    destination: Path,
+    engine: VoiceCloningEngine,
+    settings: Settings,
+    pacing: PacingPlan,
+) -> dict[str, Any]:
+    """Build the engine request for one line, in the chosen cloning strategy."""
+
+    request: dict[str, Any] = {
+        "text": dialogue.amharic,
+        "voice_reference": profile.resolve_reference_audio(),
+        "destination": destination,
+    }
+    reference_text = (profile.reference_text or "").strip()
+    if reference_text and strategy == REFERENCE_TEXT_STRATEGY:
+        request["reference_text"] = reference_text
+
+    # Ask for a length only when the engine can honour one: an engine that cannot would
+    # either ignore the request or fail on it, and the timing stage still fits whatever
+    # comes back. See :data:`DEFAULT_TTS_REQUEST_RATE`.
+    if settings.tts_request_rate and engine.supports_speaking_rate:
+        rate = requested_speaking_rate(dialogue, plan=pacing)
+        if rate is not None:
+            request["speaking_rate"] = rate
+    return request
+
+
+def _clone_take(
+    dialogue: AdaptedDialogue,
+    profile: VoiceProfile,
+    *,
+    name: str,
+    strategy: str,
+    directories: _TtsDirectories,
+    engine: VoiceCloningEngine,
+    settings: Settings,
+    pacing: PacingPlan,
+) -> tuple[Path, str]:
+    """Return ``(take, name)`` for one line, generating it only when it is missing."""
+
+    stem = _clone_take_name(name, strategy)
+    take = directories.takes / f"{stem}.wav"
+    if not _usable_audio(take):
+        engine.synthesize(
+            **_clone_request(
+                dialogue,
+                profile,
+                strategy=strategy,
+                destination=take,
+                engine=engine,
+                settings=settings,
+                pacing=pacing,
+            )
+        )
+        _require_output(take, what="take", engine=engine.name)
+    return take, stem
+
+
+def _probe_clone_strategy(
+    dialogue: AdaptedDialogue,
+    profile: VoiceProfile,
+    *,
+    name: str,
+    directories: _TtsDirectories,
+    engine: VoiceCloningEngine,
+    settings: Settings,
+    pacing: PacingPlan,
+) -> tuple[str, float | None, float | None]:
+    """Find the cloning strategy that actually reproduces this character.
+
+    A clone is only worth having if the voice that comes back is the actor's. This speaks
+    the character's first line, measures the pitch of what the engine produced, and
+    compares it with the pitch of the reference it was given. When the reference's own
+    transcript did not carry the voice, the same line is cloned once more in the engine's
+    other mode - reference untouched by our transcript, the engine trimming its own
+    silences and transcribing what remains - and whichever attempt is closer wins.
+
+    The cost is one extra generation per character at most, paid once, and it is the only
+    check in the pipeline that looks at the audio a cloning engine actually returns.
+
+    Returns ``(strategy, error, reference_pitch)``: the better strategy, how far its take
+    is from the reference as a fraction of it (``None`` when it could not be measured),
+    and the reference pitch used.
+    """
+
+    reference_pitch = profile.estimated_pitch_hz
+    strategies = [REFERENCE_TEXT_STRATEGY]
+    if (profile.reference_text or "").strip():
+        # Only meaningful as an alternative: without a transcript the first strategy
+        # already is the engine-preprocessed one.
+        strategies.append(PREPROCESSED_STRATEGY)
+
+    best: tuple[str, Path, float | None, float | None] | None = None
+    for strategy in strategies:
+        take, _stem = _clone_take(
+            dialogue,
+            profile,
+            name=name,
+            strategy=strategy,
+            directories=directories,
+            engine=engine,
+            settings=settings,
+            pacing=pacing,
+        )
+        measured = median_pitch(take)
+        error = _pitch_error(measured, reference_pitch)
+        if best is None or (
+            error is not None and (best[3] is None or error < best[3])
+        ):
+            best = (strategy, take, measured, error)
+        if error is not None and error <= VOICE_MATCH_TOLERANCE:
+            break
+        if reference_pitch is None:
+            # Nothing to compare against, so there is nothing to choose between.
+            break
+
+    assert best is not None
+    return best[0], best[3], reference_pitch
+
+
+def _describe_probe(
+    speaker_id: str,
+    strategy: str,
+    error: float | None,
+    reference_pitch: float | None,
+) -> str | None:
+    """Say what the voice probe found, when there is something worth saying.
+
+    A clone that took on the first attempt is the normal case and stays silent. A clone
+    that only took in the engine's other mode, or that did not take at all, is reported:
+    the second is the one a listener hears as "everyone sounds the same".
+    """
+
+    if reference_pitch is None:
+        # A profile without a pitch estimate is a normal state, and the run already
+        # reports that the measurement was not available. Nothing is claimed either way.
+        return None
+    if error is None:
+        return (
+            f"{speaker_id}: the line spoken to test its clone has no measurable pitch, "
+            "so the clone could not be checked against the actor's voice"
+        )
+    if error <= VOICE_MATCH_TOLERANCE:
+        if strategy == REFERENCE_TEXT_STRATEGY:
+            return None
+        return (
+            f"{speaker_id}: reproduced in the engine's own preprocessing mode "
+            f"({error:.0%} from the actor's {reference_pitch:.0f} Hz) - the reference "
+            "transcript did not carry the voice when it was used as given"
+        )
+    return (
+        f"{speaker_id}: NOT reproduced from its reference - the closest attempt is "
+        f"{error:.0%} from the actor's {reference_pitch:.0f} Hz. Its lines use that "
+        "attempt, and nothing else in the film is given this voice"
+    )
+
+
 def _synthesize_line_cloned(
     index: int,
     dialogue: AdaptedDialogue,
@@ -2064,6 +2320,7 @@ def _synthesize_line_cloned(
     profile: VoiceProfile,
     settings: Settings,
     pacing: PacingPlan,
+    strategy: str = REFERENCE_TEXT_STRATEGY,
 ) -> TtsClip:
     """Speak one line as its character, cloning the voice from their reference.
 
@@ -2072,37 +2329,26 @@ def _synthesize_line_cloned(
     the property the performance-prompt-and-convert path approximates from the other
     direction.
 
-    ``VoiceProfile.reference_text`` is passed along when it is known, so the engine does
-    not have to transcribe a clip the project already has a transcript for - which is
-    both a saved model download and a better prompt.
+    ``strategy`` is the one :func:`_probe_clone_strategy` found to reproduce this
+    character; every line of the character uses it, so a character does not change voice
+    halfway through the film.
     """
 
-    take = directories.takes / f"{name}.wav"
-    if not _usable_audio(take):
-        request: dict[str, Any] = {
-            "text": dialogue.amharic,
-            "voice_reference": profile.resolve_reference_audio(),
-            "destination": take,
-        }
-        reference_text = (profile.reference_text or "").strip()
-        if reference_text:
-            request["reference_text"] = reference_text
-
-        # Ask for a length only when the engine can honour one: an engine that cannot
-        # would either ignore the request or fail on it, and the timing stage still
-        # fits whatever comes back. See :data:`DEFAULT_TTS_REQUEST_RATE`.
-        if settings.tts_request_rate and engine.supports_speaking_rate:
-            rate = requested_speaking_rate(dialogue, plan=pacing)
-            if rate is not None:
-                request["speaking_rate"] = rate
-
-        engine.synthesize(**request)
-        _require_output(take, what="take", engine=engine.name)
+    take, stem = _clone_take(
+        dialogue,
+        profile,
+        name=name,
+        strategy=strategy,
+        directories=directories,
+        engine=engine,
+        settings=settings,
+        pacing=pacing,
+    )
 
     return _clip_from_take(
         index,
         dialogue,
-        name=name,
+        name=stem,
         take=take,
         directories=directories,
         engine=engine,
@@ -2403,6 +2649,10 @@ def synthesize_dialogue_detailed(
     clips: list[TtsClip] = []
     skipped: list[SkippedLine] = []
     short_windows: list[int] = []
+    #: The cloning strategy that reproduced each character, decided once on their first
+    #: line so a character never changes voice halfway through the film.
+    strategies: dict[str, str] = {}
+    voice_notes: list[str] = []
     for index, line in enumerate(lines):
         reason = _skip_reason(line)
         if reason is None and line.speaker_id in unprofiled:
@@ -2456,6 +2706,31 @@ def synthesize_dialogue_detailed(
                 )
                 continue
 
+            if line.speaker_id not in strategies:
+                # One line per character is spoken and measured before the rest, so a
+                # clone that did not take is found on the first line rather than heard
+                # across the whole film.
+                strategies[line.speaker_id] = REFERENCE_TEXT_STRATEGY
+                strategy, error, reference_pitch = _probe_clone_strategy(
+                    line,
+                    profiles[line.speaker_id],
+                    name=_line_artifact_name(
+                        line,
+                        model=artifact_model,
+                        voice_identity=voice_identities[line.speaker_id],
+                    ),
+                    directories=directories,
+                    engine=cloning_engine,
+                    settings=resolved,
+                    pacing=pacing,
+                )
+                strategies[line.speaker_id] = strategy
+                note = _describe_probe(
+                    line.speaker_id, strategy, error, reference_pitch
+                )
+                if note is not None:
+                    voice_notes.append(note)
+
             clips.append(
                 _synthesize_line_cloned(
                     index,
@@ -2470,6 +2745,7 @@ def synthesize_dialogue_detailed(
                     profile=profiles[line.speaker_id],
                     settings=resolved,
                     pacing=pacing,
+                    strategy=strategies[line.speaker_id],
                 )
             )
         except TtsError as exc:
@@ -2493,6 +2769,7 @@ def synthesize_dialogue_detailed(
             )
 
     notes: list[str] = []
+    notes.extend(voice_notes)
     if short_windows:
         shown = ", ".join(str(index) for index in short_windows[:10])
         if len(short_windows) > 10:

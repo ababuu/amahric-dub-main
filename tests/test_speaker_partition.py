@@ -148,6 +148,59 @@ def test_a_third_character_is_kept_when_the_silhouette_floor_rejects_it():
     }) == 3
 
 
+def test_a_finer_partition_must_keep_the_fit_it_replaces():
+    """Inventing a character costs the fit; finding one barely dents it.
+
+    This is the guard that keeps the speaker count honest in a film whose evidence is
+    borderline. On the reported run, three speakers scored 0.28 against the two-speaker
+    fit of 0.39 - a quarter of the fit, for a count the model had not proposed - and
+    taking it split one actor's dialogue into two identities. A third voice that is
+    really there keeps almost all of the fit, as this fixture does.
+    """
+
+    import numpy as np
+    from dataclasses import replace
+
+    def unit(provisional: str, seconds: float, axis: int, seed: int,
+             noise: float = 0.4) -> Unit:
+        rng = np.random.default_rng(seed)
+        vector = np.zeros(16)
+        vector[axis] = 1.0
+        vector += rng.normal(0.0, noise, size=16)
+        return Unit(provisional_id=provisional, seconds=seconds,
+                    vector=tuple(vector), tag=seed)
+
+    units: list[Unit] = []
+    seed = 0
+    for _ in range(30):
+        units.append(unit("SPEAKER_00", 2.5, 0, seed))
+        seed += 1
+    for _ in range(16):
+        units.append(unit("SPEAKER_01", 2.5, 1, seed))
+        seed += 1
+    for _ in range(12):
+        units.append(unit("SPEAKER_00", 1.2, 2, seed, noise=0.48))
+        seed += 1
+
+    calibration = replace(calibrate(units), min_silhouette=0.30)
+    result = repartition(units, calibration, max_extra=3)
+
+    by_k = {candidate.k: candidate for candidate in result.candidates}
+    assert result.k == 3
+    assert (
+        by_k[3].silhouette >= partition.SILHOUETTE_RETENTION * by_k[2].silhouette
+    )
+
+    # The reported film's shape: a quarter of the fit gone, and the count refused.
+    reported = replace(
+        by_k[3],
+        silhouette=0.2799,
+        accepted=True,
+    )
+    coarser = replace(by_k[2], silhouette=0.394)
+    assert reported.silhouette < partition.SILHOUETTE_RETENTION * coarser.silhouette
+
+
 def test_a_third_voice_is_not_invented_when_the_evidence_is_two_voices():
     units = [
         _unit("SPEAKER_00", 2.5, 0, 0.18, seed)

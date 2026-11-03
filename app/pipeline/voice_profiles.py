@@ -846,6 +846,13 @@ class _ReferenceCandidate:
     #: source offered less than :data:`REFERENCE_TRAIL_SILENCE_SECONDS` after the
     #: last word. It carries no words, so the transcript still describes the audio.
     trailing_pad: float = 0.0
+    #: ``True`` when the window is one uninterrupted stretch of this speaker talking,
+    #: rather than several lines with pauses between them. A cloning engine is asked to
+    #: reproduce the reference from its audio and its transcript together, and a long
+    #: pause in the middle is a place where the two can disagree: OmniVoice's own
+    #: silence removal is disabled when a transcript is supplied, so the pause stays in
+    #: the audio with no words for it. Given the choice, a window without one is used.
+    gap_free: bool = False
 
     @property
     def duration(self) -> float:
@@ -933,6 +940,11 @@ class _ReferenceCandidate:
             f"{self.stats.rms_dbfs:.1f} dBFS, "
             f"{self.stats.clipped_fraction:.1%} clipped"
         )
+        if self.gap_free and self.text is not None:
+            reason += (
+                ", one uninterrupted stretch of the speaker's own speech, so the "
+                "transcript describes every word of the audio"
+            )
         if self.edge_silence > 0.0:
             reason += (
                 f", {self.edge_silence:.1f}s of silence after the speech so the "
@@ -1446,6 +1458,7 @@ def _candidates_for(
     ] + [(line.start, line.end) for line in transcript] + list(contaminated)
 
     spans: list[tuple[float, float]] = []
+    run_spans: set[tuple[float, float]] = set()
     if own_lines:
         spans.extend(
             _aligned_windows(own_lines, minimum=minimum, target=target, maximum=maximum)
@@ -1453,10 +1466,35 @@ def _candidates_for(
         # A run-based window is still worth offering for a speaker whose lines are
         # too short to reach the minimum on their own.
         for run in _continuous_runs(own):
-            spans.extend(_windows(run, target=target, maximum=maximum))
+            for span in _windows(run, target=target, maximum=maximum):
+                spans.append(span)
+                run_spans.add(span)
     else:
         for run in _continuous_runs(own):
-            spans.extend(_windows(run, target=target, maximum=maximum))
+            for span in _windows(run, target=target, maximum=maximum):
+                spans.append(span)
+                run_spans.add(span)
+
+    def uninterrupted(start: float, end: float) -> bool:
+        """Whether the speaker's own speech inside the window has no pause in it.
+
+        Measured from the lines themselves rather than from which generator produced the
+        span: two windows of the same length can be equally free of pauses, and only the
+        content decides that.
+        """
+
+        if not own_lines:
+            return (start, end) in run_spans
+        inside = [
+            line
+            for line in own_lines
+            if line.start >= start - TIMESTAMP_TOLERANCE
+            and line.end <= end + TIMESTAMP_TOLERANCE
+        ]
+        return all(
+            later.start - earlier.end <= CONTIGUOUS_GAP_SECONDS
+            for earlier, later in zip(inside, inside[1:])
+        )
 
     candidates: list[_ReferenceCandidate] = []
     seen: set[tuple[float, float]] = set()
@@ -1494,6 +1532,7 @@ def _candidates_for(
                 speech_start=start,
                 speech_end=spoken_end,
                 trailing_pad=edge.pad_seconds,
+                gap_free=uninterrupted(start, end),
             )
         )
     return candidates
@@ -2509,6 +2548,16 @@ def _select_candidate(
 
     chosen_tier = min(tier(item) for item in usable)
     pool = [item for item in usable if tier(item) == chosen_tier]
+
+    # Given windows of the same quality, prefer one with no pause in the middle. The
+    # engine receives the reference audio and its transcript together, and a pause is
+    # exactly where the two can disagree: preprocessing is disabled when a transcript is
+    # supplied, so a long silence stays in the audio with no words for it. A reference
+    # where every word is the speaker's own uninterrupted speech is the one a cloning
+    # engine reproduces most faithfully.
+    uninterrupted = [item for item in pool if item.gap_free]
+    if uninterrupted:
+        pool = uninterrupted
 
     # Prefer the shortest clean prompt that still provides enough voice
     # identity. Longer reference transcripts give the generator more source

@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import logging
 import math
+from statistics import median
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -2084,10 +2085,57 @@ def _reconcile_scenes(
     )
 
 
+def _pair_likeness(
+    turns: Sequence[SpeakerSegment],
+    vectors: Mapping[tuple[float, float], tuple[float, ...]],
+    first: str,
+    second: str,
+) -> float | None:
+    """Return the median similarity between two identities' own performances.
+
+    This is the number the film's calibration is built from - a median over *performances*,
+    not over voiceprints - so it is the only honest way to compare a pair against
+    ``same_similarity``. Averaging a speaker's turns into one prototype first removes
+    their noise and makes any two people look alike, which is how a correct three-way
+    split once got reported as "two of these are one voice".
+
+    Only turns long enough to carry a clean voiceprint take part, for the same reason the
+    prototypes use them: padded short turns drift in a common direction and would make two
+    clearly different people look alike.
+    """
+
+    left = [
+        vector
+        for segment in turns
+        if segment.speaker_id == first and segment.duration >= partition.CLEAN_UNIT_SECONDS
+        for vector in [vectors.get((segment.start, segment.end))]
+        if vector is not None
+    ]
+    right = [
+        vector
+        for segment in turns
+        if segment.speaker_id == second and segment.duration >= partition.CLEAN_UNIT_SECONDS
+        for vector in [vectors.get((segment.start, segment.end))]
+        if vector is not None
+    ]
+    if not left or not right:
+        return None
+    return float(
+        median(
+            identity.cosine_similarity(one, other)
+            for one in left
+            for other in right
+        )
+    )
+
+
 def _suspect_pairs(
     voiceprints: Mapping[str, tuple[float, ...]],
     seconds: Mapping[str, float],
     calibration: partition.Calibration,
+    *,
+    turns: Sequence[SpeakerSegment] = (),
+    vectors: Mapping[tuple[float, float], tuple[float, ...]] | None = None,
 ) -> tuple[SpeakerMergeSuspect, ...]:
     """Report identities that are suspiciously alike but were deliberately kept apart.
 
@@ -2095,6 +2143,11 @@ def _suspect_pairs(
     or left alone because the evidence for one voice was not decisive. The second case
     is exactly what a listener hears as two characters sharing a voice, so it is
     reported even though nothing is done about it.
+
+    The likeness is measured over the pair's own performances when they are available,
+    because that is what the threshold was calibrated on. The prototype similarity is
+    kept only when they are not - and it is then reported as what it is, a smoothed
+    figure that cannot be compared with the film's own scale.
     """
 
     threshold = calibration.same_similarity - calibration.margin
@@ -2102,12 +2155,21 @@ def _suspect_pairs(
     suspects: list[SpeakerMergeSuspect] = []
     for position, first in enumerate(identifiers):
         for second in identifiers[position + 1 :]:
-            similarity = identity.cosine_similarity(
-                voiceprints[first], voiceprints[second]
+            measured = (
+                _pair_likeness(turns, vectors, first, second)
+                if vectors is not None
+                else None
+            )
+            similarity = (
+                measured
+                if measured is not None
+                else identity.cosine_similarity(
+                    voiceprints[first], voiceprints[second]
+                )
             )
             if similarity < threshold:
                 continue
-            same_voice = similarity >= calibration.same_similarity
+            same_voice = measured is not None and similarity >= calibration.same_similarity
             suspects.append(
                 SpeakerMergeSuspect(
                     speaker_ids=(first, second),
@@ -2413,6 +2475,8 @@ def diarize_detailed(
         {speaker_id: entry[0] for speaker_id, entry in clean_prototypes.items()},
         {speaker_id: entry[1] for speaker_id, entry in clean_prototypes.items()},
         calibration,
+        turns=turns,
+        vectors=timed_vectors,
     )
 
     for merge in merges:

@@ -292,8 +292,110 @@ def rig(tmp_path: Path, shared_stem: Path, monkeypatch: pytest.MonkeyPatch) -> R
 
 
 # ---------------------------------------------------------------------------
-# Adapter contract
+# a clone that does not reproduce the character
 # ---------------------------------------------------------------------------
+
+
+class _PitchAwareEngine(FakeOmnivoice):
+    """An engine whose clone only works in one of its two modes.
+
+    With a reference transcript it speaks at ``wrong_hz``; when the transcript is
+    withheld - so the engine preprocesses and transcribes the reference itself - it
+    speaks at ``right_hz``. That is the failure the probe exists to catch: a reference
+    whose transcript did not carry the voice.
+    """
+
+    def __init__(self, *, wrong_hz: float, right_hz: float, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.wrong_hz = wrong_hz
+        self.right_hz = right_hz
+
+    def synthesize(self, **kwargs: object) -> Path:
+        self.calls.append(dict(kwargs))
+        hz = self.wrong_hz if kwargs.get("reference_text") else self.right_hz
+        destination = Path(str(kwargs["destination"]))
+        times = np.arange(int(self.seconds * self.rate), dtype=np.float64) / self.rate
+        tone = (0.4 * np.sin(2.0 * np.pi * hz * times)).astype(np.float32)
+        _write_wav(destination, tone, self.rate)
+        self.events.append((self.name, destination.name))
+        return destination
+
+
+def test_a_clone_that_does_not_take_is_re_cloned_the_other_way(
+    rig: Rig, tmp_path: Path
+) -> None:
+    """The guarantee: a character is spoken in the actor's voice, or the run says not."""
+
+    profile = VoiceProfile(
+        speaker_id="SPEAKER_00",
+        reference_audio=rig.profile.reference_audio,
+        reference_start=10.0,
+        reference_end=15.0,
+        reference_text="a reference line",
+        estimated_pitch_hz=150.0,
+    )
+    rig.engine = _PitchAwareEngine(wrong_hz=230.0, right_hz=150.0, events=rig.events)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line(), _line(start=8.0, end=12.0)],
+        rig.stem,
+        {"SPEAKER_00": profile},
+        settings=rig.settings(),
+    )
+
+    # The transcript-free attempt reproduced the actor; the first one did not, and was
+    # abandoned rather than used for the whole film.
+    assert [call.get("reference_text") for call in rig.engine.calls][:2] == [
+        "a reference line",
+        None,
+    ]
+    assert all(clip.index in (0, 1) for clip in result.clips)
+    assert any("preprocessing mode" in note for note in result.notes)
+    # Both lines went through the strategy that worked, so the character keeps one voice.
+    assert [call.get("reference_text") for call in rig.engine.calls][2:] == [None]
+
+
+def test_a_character_that_cannot_be_reproduced_is_named(rig: Rig) -> None:
+    """Neither mode matches: the run must not pretend the actor was reproduced."""
+
+    profile = VoiceProfile(
+        speaker_id="SPEAKER_00",
+        reference_audio=rig.profile.reference_audio,
+        reference_start=10.0,
+        reference_end=15.0,
+        reference_text="a reference line",
+        estimated_pitch_hz=150.0,
+    )
+    rig.engine = _PitchAwareEngine(wrong_hz=300.0, right_hz=90.0, events=rig.events)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line()], rig.stem, {"SPEAKER_00": profile}, settings=rig.settings()
+    )
+
+    assert any("NOT reproduced" in note for note in result.notes)
+    assert result.clips, "the line is still spoken, in the closest attempt"
+
+
+def test_a_clone_that_takes_first_time_is_not_chattered_about(rig: Rig) -> None:
+    profile = VoiceProfile(
+        speaker_id="SPEAKER_00",
+        reference_audio=rig.profile.reference_audio,
+        reference_start=10.0,
+        reference_end=15.0,
+        reference_text="a reference line",
+        estimated_pitch_hz=150.0,
+    )
+    rig.engine = _PitchAwareEngine(wrong_hz=150.0, right_hz=150.0, events=rig.events)
+
+    result = tts.synthesize_dialogue_detailed(
+        [_line()], rig.stem, {"SPEAKER_00": profile}, settings=rig.settings()
+    )
+
+    assert all("reproduced" not in note for note in result.notes)
+    assert [call.get("reference_text") for call in rig.engine.calls] == ["a reference line"]
+
+
+
 
 
 def test_the_cloning_interface_cannot_be_instantiated() -> None:
