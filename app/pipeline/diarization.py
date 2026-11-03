@@ -522,6 +522,12 @@ class SpeakerMergeSuspect:
     speaker_ids: tuple[str, str]
     similarity: float
     reason: str
+    #: ``True`` when the pair is at or above the film's own same-voice similarity, which
+    #: means these two labels describe one voice: either one character was discovered
+    #: twice, or the film holds one more character than the partition allows. It is the
+    #: one condition under which two characters can be spoken in the same cloned voice,
+    #: so a run never passes over it in silence.
+    same_voice: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-safe view of the suspect pair."""
@@ -529,6 +535,7 @@ class SpeakerMergeSuspect:
         return {
             "speakers": list(self.speaker_ids),
             "similarity": round(self.similarity, 4),
+            "same_voice": self.same_voice,
             "reason": self.reason,
         }
 
@@ -1418,6 +1425,11 @@ class _LocalCluster:
     indexes: tuple[int, ...]
     seconds: float
     vector: tuple[float, ...] | None
+    #: How alike the cluster's own turns are to each other, in the same cosine scale as
+    #: everything else. A cluster holding one voice scores high; a cluster that is really
+    #: two characters the model could not separate scores low, and is then not a voice
+    #: that may be given an identity of its own.
+    cohesion: float = 1.0
 
 
 def _window_mode(value: str) -> str:
@@ -1729,16 +1741,26 @@ def _local_clusters(
     clusters: dict[str, _LocalCluster] = {}
     for speaker_id, indexes in grouped.items():
         embeddable = [index for index in indexes if index in vectors]
+        members = [vectors[index] for index in embeddable]
+        centre = (
+            _weighted_mean(members, [segments[index].duration for index in embeddable])
+            if embeddable
+            else None
+        )
+        cohesion = 1.0
+        if centre is not None and len(members) > 1:
+            cohesion = float(
+                min(
+                    identity.cosine_similarity(member, centre)
+                    for member in members
+                )
+            )
         clusters[speaker_id] = _LocalCluster(
             speaker_id=speaker_id,
             indexes=tuple(indexes),
             seconds=sum(segments[index].duration for index in embeddable),
-            vector=_weighted_mean(
-                [vectors[index] for index in embeddable],
-                [segments[index].duration for index in embeddable],
-            )
-            if embeddable
-            else None,
+            vector=centre,
+            cohesion=cohesion,
         )
     return clusters
 
@@ -1910,9 +1932,23 @@ def _reconcile_scenes(
                 and best_score >= calibration.same_similarity
                 and margin >= calibration.margin
             )
+            # Three things can happen to a scene's cluster.
+            #
+            # It matches one identity decisively: assign it.
+            #
+            # It resembles *more than one* identity without settling on either. That is
+            # a mixture - two characters the scene could not separate, or a turn spoken
+            # across both - and giving a mixture an identity of its own invents a
+            # character out of a blend. It is left alone and the scene is reported as
+            # unresolved.
+            #
+            # It matches nothing (and is a coherent voice on its own): this is the
+            # character the film-wide pass merged, and it gets an id of its own.
+            single_voice = cluster.cohesion >= calibration.same_similarity
+            unexplained = bool(best_id) and best_score < calibration.same_similarity
             if decisive and label in established:
                 mapping[label] = best_id
-            elif minted < budget:
+            elif minted < budget and (surplus > 0 or (unexplained and single_voice)):
                 new_id = _next_speaker_id(set(catalogue) | set(mapping.values()))
                 catalogue[new_id] = cluster.vector
                 mapping[label] = new_id
@@ -1956,6 +1992,12 @@ def _reconcile_scenes(
             or (separate == len(current) and changes)
         )
         if not adopt:
+            # A scene that hears fewer voices than the identities it holds could not
+            # separate them; saying "agreed" there would report accounting for a
+            # conversation it never resolved. It is not an error - a short scene with one
+            # word from someone is genuinely hard - but it must be visible, because it is
+            # where a film with one character too many shows up.
+            unresolved = separate < len(current)
             reports.append(
                 DiarizationWindow(
                     index=scene.index,
@@ -1963,10 +2005,16 @@ def _reconcile_scenes(
                     end=scene.end,
                     turns=len(scene_turns),
                     speakers=tuple(sorted(current)),
-                    mode="agreed",
+                    mode="unresolved" if unresolved else "agreed",
                     detail=(
-                        f"the scene separates {separate} voice(s), which the film-wide "
-                        "attribution already accounts for"
+                        f"the scene's own diarization separates {separate} voice(s) "
+                        f"where the film-wide attribution holds {len(current)}; the "
+                        "attribution stands, but this scene could not confirm it"
+                        if unresolved
+                        else (
+                            f"the scene separates {separate} voice(s), which the "
+                            "film-wide attribution already accounts for"
+                        )
                     ),
                 )
             )
@@ -2059,13 +2107,23 @@ def _suspect_pairs(
             )
             if similarity < threshold:
                 continue
+            same_voice = similarity >= calibration.same_similarity
             suspects.append(
                 SpeakerMergeSuspect(
                     speaker_ids=(first, second),
                     similarity=similarity,
+                    same_voice=same_voice,
                     reason=(
-                        "the two voiceprints are close but not close enough to merge; "
-                        "one of them may be a fragment of the other's voice"
+                        f"these two are {similarity:.2f} alike, at or above the "
+                        f"{calibration.same_similarity:.2f} this film calls the same "
+                        "voice: either one character was found twice, or the film has "
+                        "one more character than the partition allowed and their "
+                        "dialogue shares a voice"
+                        if same_voice
+                        else (
+                            "the two voiceprints are close but not close enough to "
+                            "merge; one of them may be a fragment of the other's voice"
+                        )
                     ),
                 )
             )

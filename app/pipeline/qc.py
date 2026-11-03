@@ -44,7 +44,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import fmean
+from statistics import fmean, median
 from typing import Any
 
 from app.pipeline.amharic_text import (
@@ -76,6 +76,29 @@ PLAUSIBLE_SYLLABLES_PER_SECOND = (1.5, 9.0)
 
 #: The name this module has always exposed for the comparison form of a string.
 normalise_for_comparison = syllable_sequence
+
+#: How far a generated line's median pitch may sit from its character's reference before
+#: the clone is called into question. Translation and a new language move pitch a little;
+#: a quarter of the reference's own pitch is far beyond that and is what a clone that
+#: never took the reference looks like.
+VOICE_PITCH_DRIFT = 0.25
+
+#: Two references at least this far apart are two different voices. Ten percent is about
+#: the distance between two adult voices of the same sex that a listener would still call
+#: different people.
+DISTINCT_REFERENCE_PITCH = 0.10
+
+#: Two characters whose generated voices are closer than this, while their references
+#: were further apart, were spoken by one voice.
+COLLAPSED_VOICE_PITCH = 0.04
+
+#: Longest analysis window per line, in seconds: enough to measure a pitch, short enough
+#: that a film's worth of lines stays cheap.
+_PITCH_WINDOW_SECONDS = 1.2
+
+#: Analysis frame and hop for the pitch tracker, in seconds.
+_PITCH_FRAME_SECONDS = 0.04
+_PITCH_HOP_SECONDS = 0.02
 
 
 class QcError(RuntimeError):
@@ -298,6 +321,81 @@ class PronunciationReport:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceIdentityReport:
+    """Whether each character actually sounds like the actor they were cloned from.
+
+    Everything upstream can be right about *who* is speaking and still produce a dub in
+    which every character shares one voice: a cloning engine that ignores its reference
+    does exactly that, and nothing else in the pipeline looks at the audio it returns.
+    This compares the pitch of a character's generated lines with the pitch of the
+    reference they were cloned from - the pipeline already estimates that for every
+    profile - and with each other, so the failure is reported instead of heard.
+    """
+
+    #: Median pitch of the generated lines, per speaker. ``None`` when unmeasurable.
+    generated_pitch: dict[str, float | None]
+    #: The reference pitch each character was cloned from.
+    reference_pitch: dict[str, float]
+    #: Speakers whose generated pitch is far from their own reference.
+    drifted: tuple[str, ...] = ()
+    #: Pairs of characters with different references whose generated voices match.
+    collapsed: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """``True`` when every character sounds like the actor they were cloned from."""
+
+        return not self.drifted and not self.collapsed
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe view of the measurement."""
+
+        return {
+            "generated_pitch_hz": {
+                speaker_id: (
+                    None if pitch is None else round(pitch, 1)
+                )
+                for speaker_id, pitch in sorted(self.generated_pitch.items())
+            },
+            "reference_pitch_hz": {
+                speaker_id: round(pitch, 1)
+                for speaker_id, pitch in sorted(self.reference_pitch.items())
+            },
+            "drifted": list(self.drifted),
+            "collapsed": [list(pair) for pair in self.collapsed],
+        }
+
+    def summary(self) -> str:
+        """Return the one-line summary a run prints."""
+
+        if not self.generated_pitch:
+            return "voice identity not measured (no generated audio)"
+        measured = sum(
+            1 for pitch in self.generated_pitch.values() if pitch is not None
+        )
+        if self.ok:
+            return (
+                f"{measured} character(s) match the pitch of the actor they were cloned "
+                "from, and no two of them share a voice"
+            )
+        parts: list[str] = []
+        if self.collapsed:
+            shown = ", ".join(
+                f"{first} and {second}" for first, second in self.collapsed
+            )
+            parts.append(
+                f"{shown} have different reference voices but were generated with the "
+                "same one - their lines sound like one character"
+            )
+        if self.drifted:
+            parts.append(
+                f"{', '.join(self.drifted)} do not sound like the reference they were "
+                "cloned from"
+            )
+        return "; ".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
 class QcReport:
     """Everything quality control could say about one run."""
 
@@ -312,6 +410,8 @@ class QcReport:
     #: exclusive view had to arbitrate. Reported rather than acted on: a dub must still
     #: say the line, and dropping it would leave a hole in the dialogue.
     attribution_uncertain: tuple[int, ...] = ()
+    #: Whether the generated voices are the actors' own, measured from the audio itself.
+    voice_identity: VoiceIdentityReport | None = None
 
     @property
     def worst_lines(self) -> tuple[LineMetrics, ...]:
@@ -341,6 +441,9 @@ class QcReport:
                 "attribution_uncertain": list(self.attribution_uncertain),
             },
             "lines": [line.as_dict() for line in self.lines],
+            "voice_identity": (
+                None if self.voice_identity is None else self.voice_identity.as_dict()
+            ),
         }
 
     def summary(self) -> str:
@@ -380,6 +483,8 @@ class QcReport:
                 f"pronunciation CER {self.pronunciation.mean_cer:.3f} over "
                 f"{self.pronunciation.measured} line(s)"
             )
+        if self.voice_identity is not None:
+            parts.append(f"voice identity {self.voice_identity.summary()}")
         return ", ".join(parts)
 
 
@@ -512,6 +617,130 @@ def measure_pronunciation(
     )
 
 
+def measure_voice_identity(
+    clips: Iterable[TtsClip],
+    *,
+    reference_pitch: dict[str, float],
+) -> VoiceIdentityReport:
+    """Compare the generated voices with the references they were cloned from.
+
+    Pitch is measured on the generated audio itself, not taken from the engine's own
+    metadata: the question is what the dub sounds like. It is the one identity cue that
+    needs no model and no GPU, which is why it is the check that can run on every film.
+
+    Two failures are reported. A character whose generated pitch is far from its own
+    reference was not cloned from it. Two characters whose references are far apart but
+    whose generated voices match were cloned into one voice - the failure a listener
+    hears as "everyone sounds the same".
+    """
+
+    pitches: dict[str, list[float]] = {}
+    for clip in clips:
+        speaker_id = clip.clip.speaker_id if hasattr(clip, "clip") else clip.speaker_id
+        pitch = _median_pitch(clip.audio_path)
+        if pitch is None:
+            continue
+        pitches.setdefault(speaker_id, []).append(pitch)
+
+    generated: dict[str, float | None] = {
+        speaker_id: (float(median(values)) if values else None)
+        for speaker_id, values in pitches.items()
+    }
+    for speaker_id in reference_pitch:
+        generated.setdefault(speaker_id, None)
+
+    drifted: list[str] = []
+    for speaker_id, pitch in generated.items():
+        reference = reference_pitch.get(speaker_id)
+        if pitch is None or reference is None or reference <= 0:
+            continue
+        if abs(pitch - reference) / reference > VOICE_PITCH_DRIFT:
+            drifted.append(speaker_id)
+
+    collapsed: list[tuple[str, str]] = []
+    identifiers = sorted(generated)
+    for position, first in enumerate(identifiers):
+        for second in identifiers[position + 1 :]:
+            first_pitch = generated[first]
+            second_pitch = generated[second]
+            first_reference = reference_pitch.get(first)
+            second_reference = reference_pitch.get(second)
+            if None in (first_pitch, second_pitch):
+                continue
+            if not first_reference or not second_reference:
+                continue
+            reference_gap = abs(first_reference - second_reference) / min(
+                first_reference, second_reference
+            )
+            generated_gap = abs(first_pitch - second_pitch) / min(
+                first_pitch, second_pitch
+            )
+            if (
+                reference_gap >= DISTINCT_REFERENCE_PITCH
+                and generated_gap < COLLAPSED_VOICE_PITCH
+            ):
+                collapsed.append((first, second))
+
+    return VoiceIdentityReport(
+        generated_pitch=generated,
+        reference_pitch=dict(reference_pitch),
+        drifted=tuple(drifted),
+        collapsed=tuple(collapsed),
+    )
+
+
+def _median_pitch(path: str | Path) -> float | None:
+    """Return the median fundamental frequency of one generated line, in Hz.
+
+    A plain autocorrelation tracker, chosen because it needs nothing but numpy: the
+    measurement's job is to notice a voice that is not the one it should be, and a
+    gross error in pitch is exactly that. Frames below the line's own loudness are
+    ignored, so silence and pause padding do not enter the median.
+    """
+
+    import numpy as np
+    import soundfile as sf
+
+    try:
+        samples, rate = sf.read(str(path), always_2d=False)
+    except (OSError, RuntimeError):
+        return None
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    samples = np.asarray(samples, dtype=np.float64)
+    if rate <= 0 or samples.size < rate * 0.1:
+        return None
+
+    frame = int(_PITCH_FRAME_SECONDS * rate)
+    hop = int(_PITCH_HOP_SECONDS * rate)
+    limit = int(_PITCH_WINDOW_SECONDS * rate)
+    window = samples[: min(samples.size, limit)]
+    if window.size < frame * 2:
+        return None
+
+    lowest = max(2, int(rate / 400.0))
+    highest = min(frame - 1, int(rate / 60.0))
+    if highest <= lowest:
+        return None
+
+    measured: list[float] = []
+    for start in range(0, window.size - frame, hop):
+        piece = window[start : start + frame]
+        if float(np.sqrt(np.mean(piece**2))) < 0.01:
+            continue
+        centred = piece - piece.mean()
+        correlation = np.correlate(centred, centred, mode="full")[frame - 1 :]
+        if correlation[0] <= 0:
+            continue
+        lag = lowest + int(np.argmax(correlation[lowest:highest]))
+        if correlation[lag] < 0.4 * correlation[0]:
+            continue
+        measured.append(rate / lag)
+    if len(measured) < 5:
+        return None
+    return float(median(measured))
+
+
 def build_qc_report(
     alignment: Iterable[AlignedClip],
     *,
@@ -520,30 +749,41 @@ def build_qc_report(
     crosstalk: Iterable[CrosstalkRegion] = (),
     transcribe: Callable[[Path], str] | None = None,
     transcription_model: str = "unknown",
+    reference_pitch: dict[str, float] | None = None,
 ) -> QcReport:
     """Build the model-free report, measuring pronunciation when asked to.
 
     ``transcribe`` is the only thing that needs a model; without it the report is
     complete except for pronunciation, which is then reported as not measured
-    rather than silently omitted.
+    rather than silently omitted. ``reference_pitch`` - each character's reference
+    pitch, from their voice profile - turns on the check that the generated voices are
+    the actors' own.
     """
 
-    lines = measure_lines(alignment)
+    line_metrics = measure_lines(alignment)
     regions = tuple(crosstalk)
+    clip_list = tuple(clips)
 
     pronunciation: PronunciationReport | None = None
     if transcribe is not None:
         pronunciation = measure_pronunciation(
-            dialogue, clips, transcribe=transcribe, model=transcription_model
+            dialogue, clip_list, transcribe=transcribe, model=transcription_model
+        )
+
+    voice_identity: VoiceIdentityReport | None = None
+    if reference_pitch:
+        voice_identity = measure_voice_identity(
+            clip_list, reference_pitch=reference_pitch
         )
 
     return QcReport(
-        duration=summarise_duration(lines),
-        lines=lines,
+        duration=summarise_duration(line_metrics),
+        lines=line_metrics,
         crosstalk_regions=len(regions),
         crosstalk_seconds=sum(region.duration for region in regions),
         pronunciation=pronunciation,
         attribution_uncertain=_attribution_uncertain(alignment, regions),
+        voice_identity=voice_identity,
     )
 
 
@@ -575,7 +815,9 @@ def _attribution_uncertain(
 
 
 __all__ = [
-    "CLOSE_FIT_RATIO",
+    "COLLAPSED_VOICE_PITCH",
+    "DISTINCT_REFERENCE_PITCH",
+    "VOICE_PITCH_DRIFT",
     # Re-exported from ``amharic_text``: the syllable is the unit of *both* a
     # delivery rate here and a timing budget in ``dialogue_context``, and it would
     # be surprising for a caller measuring a run to reach into another module for it.
@@ -591,6 +833,7 @@ __all__ = [
     "PronunciationReport",
     "QcError",
     "QcReport",
+    "VoiceIdentityReport",
     "build_qc_report",
     "character_error_rate",
     "count_syllables",
@@ -599,6 +842,7 @@ __all__ = [
     "latin_spans",
     "measure_lines",
     "measure_pronunciation",
+    "measure_voice_identity",
     "normalise_for_comparison",
     "summarise_duration",
 ]

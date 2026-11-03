@@ -16,6 +16,11 @@ checks:
 * **fit** - the silhouette of the partition, in a cohort-centred space, where the
   threshold comes from the film's own same-voice and different-voice distances rather
   than from a constant chosen for a different embedding model;
+* **separation** - no two of its speakers may be the same voice by that same film's
+  scale. This is what lets a third character be found when the silhouette of a
+  three-speaker partition sits a hair under the film's fit threshold: silhouette favours
+  fewer clusters by construction, while "are these two voices alike?" is the question
+  the module actually has to answer;
 * **size** - every cluster must stand on a minimum number of performances and seconds,
   because a character made of one 0.6 s fragment is not a character;
 * **stability** - the same partition must reappear under bootstrap resampling. A
@@ -51,12 +56,12 @@ FALLBACK_MIN_SILHOUETTE = 0.10
 #: Rand index between resamples) before it may replace pyannote's clustering.
 MIN_STABILITY = 0.75
 
-#: How much better a larger partition has to score before it is preferred over the
-#: number of speakers the model already proposed. Inventing a character is expensive.
-INVENTION_MARGIN = 0.03
-
-#: How much better a *smaller* partition (a merge) has to score before it is preferred.
-MERGE_MARGIN = 0.05
+#: How much of a coarser partition's silhouette a finer one has to keep. Silhouette
+#: always falls as clusters are added - that is arithmetic, not evidence - so comparing
+#: it against a constant punishes the third speaker in a film by construction. A genuine
+#: extra speaker keeps most of the fit; a cluster sliced out of a homogeneous voice
+#: collapses it.
+SILHOUETTE_RETENTION = 0.6
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +128,10 @@ class Candidate:
     smallest_cluster_seconds: float
     accepted: bool
     reason: str
+    #: Similarity of the two most alike speaker voiceprints in this partition: the
+    #: number that says whether these really are different voices. ``None`` for one
+    #: speaker, which has nothing to compare.
+    separation: float | None = None
     #: ``True`` for the partition the run actually adopted.
     chosen: bool = False
 
@@ -133,6 +142,9 @@ class Candidate:
             "speakers": self.k,
             "silhouette": round(self.silhouette, 4),
             "stability": round(self.stability, 4),
+            "separation": (
+                None if self.separation is None else round(self.separation, 4)
+            ),
             "units": self.units,
             "seconds": round(self.seconds, 3),
             "smallest_cluster_units": self.smallest_cluster_units,
@@ -368,6 +380,30 @@ def identity_cosine(left: Sequence[float], right: Sequence[float]) -> float:
     return _cosine_similarity(tuple(left), tuple(right))
 
 
+def speaker_separation(vectors: np.ndarray, labels: np.ndarray, k: int) -> float | None:
+    """Return how alike the two most similar speakers of a partition are.
+
+    This is the question a speaker count actually has to answer: with ``k`` clusters, are
+    all ``k`` of them different voices? Two clusters whose centroids sit closer than the
+    film's own same-voice similarity are one character wearing two labels, whatever the
+    silhouette says. ``None`` for a single cluster, which has nothing to compare.
+    """
+
+    if k < 2:
+        return None
+    centroids = [
+        vectors[labels == cluster].mean(axis=0)
+        for cluster in range(k)
+        if np.any(labels == cluster)
+    ]
+    if len(centroids) < 2:
+        return None
+    matrix = _matrix(np.asarray(centroids))
+    similarity = matrix @ matrix.T
+    order = similarity.shape[0]
+    return float(max(similarity[i, j] for i in range(order) for j in range(i + 1, order)))
+
+
 def calibrate(units: Sequence[Unit]) -> Calibration:
     """Measure the film's own same-voice and different-voice similarity.
 
@@ -487,6 +523,19 @@ def repartition(
         stability_score = float(stability(vectors, k, repeats=repeats))
         smallest_units = int(min(counts))
         smallest_seconds = float(min(seconds))
+        separation = speaker_separation(vectors, labels, k)
+
+        # The speakers of this partition are different voices by the film's own scale.
+        # When the film can calibrate itself, that is the test that decides whether a
+        # partition is believed: silhouette falls with every extra cluster by
+        # construction, so using it as a floor hides exactly the third character this
+        # module exists to find, while "are these two voices alike?" is the question a
+        # speaker count actually answers.
+        distinct = bool(
+            calibration.reliable
+            and separation is not None
+            and separation <= calibration.same_similarity
+        )
 
         reasons: list[str] = []
         if smallest_units < min_cluster_units:
@@ -499,7 +548,25 @@ def repartition(
                 f"a cluster has {smallest_seconds:.1f}s of speech, "
                 f"{min_cluster_seconds:.1f}s are needed"
             )
-        if silhouette_score < calibration.min_silhouette:
+        if k >= 2 and calibration.reliable and not distinct:
+            reasons.append(
+                f"its two most alike speakers are "
+                + (
+                    "not measurable"
+                    if separation is None
+                    else f"{separation:.2f} alike"
+                )
+                + f", which is not below the {calibration.same_similarity:.2f} this "
+                "film calls the same voice; silhouette "
+                f"{silhouette_score:.2f}"
+            )
+        if k >= 2 and not calibration.reliable and silhouette_score < calibration.min_silhouette:
+            reasons.append(
+                f"silhouette {silhouette_score:.2f} is below the "
+                f"{calibration.min_silhouette:.2f} this film's own distances require, "
+                "and the film is too thin to calibrate a voice scale of its own"
+            )
+        if k == 1 and silhouette_score < calibration.min_silhouette:
             reasons.append(
                 f"silhouette {silhouette_score:.2f} is below the "
                 f"{calibration.min_silhouette:.2f} this film's own distances require"
@@ -518,6 +585,7 @@ def repartition(
             seconds=float(sum(seconds)),
             smallest_cluster_units=smallest_units,
             smallest_cluster_seconds=smallest_seconds,
+            separation=separation,
             accepted=not reasons,
             reason="; ".join(reasons) if reasons else "accepted",
         )
@@ -525,7 +593,35 @@ def repartition(
         if candidate.accepted:
             accepted.append((candidate, labels))
 
-    if not accepted:
+    # A finer partition has to keep most of the fit of the coarser one. This is the
+    # guard against inventing a character: slicing a homogeneous voice in two leaves the
+    # two halves as alike as the original, which collapses the silhouette, while a real
+    # extra speaker barely moves it.
+    by_k = {candidate.k: candidate for candidate in candidates}
+    eligible: list[tuple[Candidate, np.ndarray]] = []
+    for candidate, labels in accepted:
+        coarser = by_k.get(candidate.k - 1)
+        if (
+            coarser is not None
+            and coarser.silhouette > 0.0
+            and candidate.silhouette
+            < SILHOUETTE_RETENTION * coarser.silhouette
+        ):
+            replaced = replace(
+                candidate,
+                accepted=False,
+                reason=(
+                    f"silhouette {candidate.silhouette:.2f} keeps less than "
+                    f"{SILHOUETTE_RETENTION:.0%} of the {coarser.silhouette:.2f} that "
+                    f"{candidate.k - 1} speaker(s) reached; the extra cluster is a "
+                    "slice of a voice, not another character"
+                ),
+            )
+            candidates[candidates.index(candidate)] = replaced
+            continue
+        eligible.append((candidate, labels))
+
+    if not eligible:
         return Partition(
             labels=tuple(provisional),
             k=provisional_k,
@@ -539,33 +635,23 @@ def repartition(
             candidates=tuple(candidates),
         )
 
+    # Every speaker contributes, so the finest partition the evidence supports is the
+    # one to use. A film cannot be under-clustered by a criterion that only ever gains a
+    # character when that character is a *different voice* and the partition survives
+    # resampling; and it cannot be over-clustered either, because both of those checks
+    # fail for a spurious one.
     best_candidate, best_labels = max(
-        accepted, key=lambda item: (item[0].silhouette, -item[0].k)
+        eligible, key=lambda item: (item[0].k, item[0].silhouette)
     )
 
-    # Do not invent a character for a marginal gain over the count the model proposed.
-    preferred = [
-        (candidate, labels)
-        for candidate, labels in accepted
-        if candidate.k <= provisional_k
-    ]
-    if best_candidate.k > provisional_k and preferred:
-        near, near_labels = max(preferred, key=lambda item: item[0].silhouette)
-        if near.silhouette >= best_candidate.silhouette - INVENTION_MARGIN:
-            best_candidate, best_labels = near, near_labels
-
-    # Do not merge two proposed speakers unless the evidence for one voice is clearly
-    # stronger than the evidence for two.
+    # Do not merge two proposed speakers: a merge is a different claim, and the evidence
+    # for it is judged by :func:`merge_indistinguishable`.
     if best_candidate.k < provisional_k:
-        same_k = [
-            (candidate, labels)
-            for candidate, labels in accepted
-            if candidate.k == provisional_k
-        ]
-        if same_k:
-            keep, keep_labels = same_k[0]
-            if best_candidate.silhouette - keep.silhouette <= MERGE_MARGIN:
-                best_candidate, best_labels = keep, keep_labels
+        keep = next(
+            (item for item in eligible if item[0].k == provisional_k), None
+        )
+        if keep is not None:
+            best_candidate, best_labels = keep
 
     return Partition(
         labels=tuple(int(label) for label in best_labels),
@@ -575,7 +661,16 @@ def repartition(
         accepted=True,
         reason=(
             f"{best_candidate.k} speaker(s) fit the evidence at silhouette "
-            f"{best_candidate.silhouette:.2f} and reproduce {best_candidate.stability:.2f}"
+            f"{best_candidate.silhouette:.2f} and reproduce "
+            f"{best_candidate.stability:.2f}"
+            + (
+                ""
+                if best_candidate.separation is None
+                else "; the two most alike of them are "
+                f"{best_candidate.separation:.2f} alike, "
+                f"{'inside' if best_candidate.separation <= calibration.same_similarity else 'outside'} "
+                f"the {calibration.same_similarity:.2f} this film calls the same voice"
+            )
         ),
         candidates=tuple(
             replace(
@@ -651,9 +746,8 @@ __all__ = [
     "Candidate",
     "FALLBACK_MIN_SILHOUETTE",
     "FALLBACK_SAME_SIMILARITY",
-    "INVENTION_MARGIN",
-    "MERGE_MARGIN",
     "MIN_STABILITY",
+    "SILHOUETTE_RETENTION",
     "Partition",
     "Unit",
     "adjusted_rand_index",

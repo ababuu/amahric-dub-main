@@ -21,6 +21,7 @@ import pytest
 from app.config import DEFAULT_DIARIZATION_MODEL, Settings
 from app.pipeline import diarization
 from app.pipeline import speaker_identity as identity
+from app.pipeline import speaker_partition as partition
 from app.pipeline.diarization import (
     CrosstalkRegion,
     DiarizationError,
@@ -1658,6 +1659,89 @@ def test_merge_suspects_use_the_same_evidence_as_the_calibration(monkeypatch, tm
     # The two identities are as far apart as their long turns say, not as close as the
     # noisy short ones would suggest.
     assert result.merge_suspects == ()
+
+
+def test_a_scene_that_cannot_separate_its_voices_is_reported_as_unresolved(
+    monkeypatch, tmp_path
+):
+    """A scene that hears one voice where the film has two has not "agreed".
+
+    This is how a film with one character too many shows up, so it is reported rather
+    than counted as confirmation: the attribution stands, but that scene could not check
+    it.
+    """
+
+    _patch(monkeypatch)
+    turns = [
+        (0.0, 5.0, "SPEAKER_00"),
+        (6.0, 11.0, "SPEAKER_01"),
+        (20.0, 25.0, "SPEAKER_00"),
+        (26.0, 31.0, "SPEAKER_01"),
+        (40.0, 45.0, "SPEAKER_00"),
+        (46.0, 51.0, "SPEAKER_01"),
+    ]
+    vectors = {
+        (0.0, 5.0): _VA,
+        (6.0, 11.0): _VB,
+        (20.0, 25.0): _VA,
+        (26.0, 31.0): _VB,
+        (40.0, 45.0): _VA,
+        (46.0, 51.0): _VB,
+    }
+    # The scene's own pass hears a single voice in a scene that holds two characters.
+    _scripted(turns, [[(0.0, 5.0, "SPEAKER_00"), (6.0, 11.0, "SPEAKER_00"),
+                       (20.0, 25.0, "SPEAKER_00"), (26.0, 31.0, "SPEAKER_00"),
+                       (40.0, 45.0, "SPEAKER_00"), (46.0, 51.0, "SPEAKER_00")]], vectors)
+    _install_fake_pyannote_core(monkeypatch)
+    settings = dataclasses.replace(_settings(tmp_path), diarization_scene_gap_seconds=300.0)
+
+    result = diarize_detailed(_audio(tmp_path), settings=settings)
+
+    assert [item.mode for item in result.windows] == ["unresolved"]
+    assert "could not confirm" in result.windows[0].detail
+    # Nothing was rewritten on the strength of a scene that could not separate them.
+    assert result.turns == (
+        SpeakerSegment("SPEAKER_00", 0.0, 5.0),
+        SpeakerSegment("SPEAKER_01", 6.0, 11.0),
+        SpeakerSegment("SPEAKER_00", 20.0, 25.0),
+        SpeakerSegment("SPEAKER_01", 26.0, 31.0),
+        SpeakerSegment("SPEAKER_00", 40.0, 45.0),
+        SpeakerSegment("SPEAKER_01", 46.0, 51.0),
+    )
+
+
+def test_two_identities_at_or_above_the_films_same_voice_level_are_flagged():
+    """The guard for "two characters spoken in one cloned voice".
+
+    When two identities' voiceprints are at the level this film itself calls the same
+    voice, the run says what that means instead of describing them as merely similar:
+    their lines will share a cloned voice.
+    """
+
+    calibration = partition.Calibration(
+        within=0.6,
+        between=0.0,
+        same_similarity=0.31,
+        margin=0.15,
+        min_silhouette=0.30,
+        reliable=True,
+        units=40,
+        clean_units=20,
+    )
+    voiceprints = {
+        "SPEAKER_00": tuple(_VA),
+        "SPEAKER_01": tuple([0.6, 0.8, 0.0, 0.0]),
+        "SPEAKER_02": tuple(_VC),
+    }
+
+    suspects = diarization._suspect_pairs(voiceprints, {}, calibration)
+
+    flagged = [item for item in suspects if item.same_voice]
+    assert flagged, "0.6-alike voices must be flagged against a 0.31 same-voice level"
+    assert flagged[0].speaker_ids == ("SPEAKER_00", "SPEAKER_01")
+    assert "share" in flagged[0].reason or "cloned voice" in flagged[0].reason
+    # An unrelated voice is not swept into the report.
+    assert all("SPEAKER_02" not in item.speaker_ids for item in suspects)
 
 
 def test_a_voice_seen_in_two_scenes_is_confirmed(monkeypatch, tmp_path):

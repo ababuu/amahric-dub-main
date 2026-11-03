@@ -77,6 +77,77 @@ def test_the_scattered_voice_is_recovered_and_the_clean_voices_are_not_merged():
     assert len(first) == 1 and len(second) == 1 and first != second
 
 
+def test_a_third_character_is_kept_when_the_silhouette_floor_rejects_it():
+    """The failure this rule replaces: three characters, two identities.
+
+    On the reported run the three-speaker partition scored silhouette 0.28 against the
+    0.30 the film's own distances asked for, and was thrown away - so one character's
+    dialogue was spoken in another character's cloned voice. Silhouette falls with every
+    extra cluster by construction; the question a speaker count has to answer is whether
+    the speakers are *different voices*, and here they are: no two of them are as alike
+    as this film's own same-voice similarity.
+    """
+
+    import numpy as np
+    from dataclasses import replace
+
+    def unit(provisional: str, seconds: float, axis: int, seed: int,
+             noise: float = 0.4) -> Unit:
+        rng = np.random.default_rng(seed)
+        vector = np.zeros(16)
+        vector[axis] = 1.0
+        vector += rng.normal(0.0, noise, size=16)
+        return Unit(provisional_id=provisional, seconds=seconds,
+                    vector=tuple(vector), tag=seed)
+
+    # One dominant character, one second character, and a third whose lines are short
+    # and were merged into the first character's cluster by the model.
+    units: list[Unit] = []
+    seed = 0
+    for _ in range(30):
+        units.append(unit("SPEAKER_00", 2.5, 0, seed))
+        seed += 1
+    for _ in range(16):
+        units.append(unit("SPEAKER_01", 2.5, 1, seed))
+        seed += 1
+    for _ in range(12):
+        units.append(unit("SPEAKER_00", 1.2, 2, seed, noise=0.48))
+        seed += 1
+
+    calibration = calibrate(units)
+    # The floor the film actually demanded, and the fit this partition actually reached.
+    floor = replace(calibration, min_silhouette=0.30)
+
+    result = repartition(units, floor, max_extra=3)
+
+    assert result.k == 3
+    assert result.accepted is True
+    third = [candidate for candidate in result.candidates if candidate.k == 3][0]
+    assert third.silhouette < floor.min_silhouette
+    # Accepted on the evidence that actually settles it, not on the silhouette.
+    assert third.separation is not None
+    assert third.separation < calibration.same_similarity
+    assert "same voice" in result.reason
+    # The third character's short performances come out as one identity of their own,
+    # separate from the two voices that were already there.
+    from collections import Counter
+
+    short_labels = [
+        label for unit_, label in zip(units, result.labels) if unit_.seconds < 2.0
+    ]
+    dominant, count = Counter(short_labels).most_common(1)[0]
+    assert count >= 9
+    # Three identities, each dominated by one of the three voices.
+    assert len({dominant} | {
+        Counter(
+            label
+            for unit_, label in zip(units, result.labels)
+            if unit_.seconds >= 2.0 and unit_.vector[axis] == max(unit_.vector[:4])
+        ).most_common(1)[0][0]
+        for axis in (0, 1)
+    }) == 3
+
+
 def test_a_third_voice_is_not_invented_when_the_evidence_is_two_voices():
     units = [
         _unit("SPEAKER_00", 2.5, 0, 0.18, seed)

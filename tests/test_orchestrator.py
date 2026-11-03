@@ -541,6 +541,7 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
         "total": 0,
         "separated": 0,
         "agreed": 0,
+        "unresolved": 0,
         "kept": 0,
         "failed": 0,
         "detail": [],

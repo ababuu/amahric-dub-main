@@ -287,6 +287,12 @@ class PipelineResult:
                         1 for item in self.windows if item.mode == "separated"
                     ),
                     "agreed": sum(1 for item in self.windows if item.mode == "agreed"),
+                    # Scenes whose own diarization heard fewer voices than the identities
+                    # they hold: the attribution stands, but those scenes could not
+                    # confirm it.
+                    "unresolved": sum(
+                        1 for item in self.windows if item.mode == "unresolved"
+                    ),
                     "kept": sum(1 for item in self.windows if item.mode == "kept"),
                     "failed": sum(1 for item in self.windows if item.mode == "failed"),
                     "detail": [item.as_dict() for item in self.windows],
@@ -731,6 +737,9 @@ def run_pipeline(
     scene_reports = tuple(diarized.windows)
     if scene_reports:
         separated = sum(1 for item in scene_reports if item.mode == "separated")
+        unresolved_scenes = [
+            item for item in scene_reports if item.mode == "unresolved"
+        ]
         discovered_here = diarized.discovered_speakers
         report(
             f"  scenes: {len(scene_reports)} diarized on their own, {separated} placed "
@@ -740,6 +749,16 @@ def run_pipeline(
             f"{sum(1 for item in scene_reports if item.mode in ('kept', 'failed'))} "
             "left the attribution alone"
         )
+        if unresolved_scenes:
+            shown = ", ".join(
+                f"#{item.index} ({item.start:.1f}-{item.end:.1f}s)"
+                for item in unresolved_scenes[:6]
+            )
+            report(
+                f"  scenes: {len(unresolved_scenes)} of them heard fewer voices than the "
+                f"identities they hold ({shown}); a scene like that cannot confirm who "
+                "was speaking in it"
+            )
         if discovered_here:
             report(
                 f"  scenes: {len(discovered_here)} voice(s) the film-wide pass merged "
@@ -751,6 +770,15 @@ def run_pipeline(
             f"({merge.similarity:.2f} alike; one person found twice)"
         )
     for suspect in diarized.merge_suspects:
+        if suspect.same_voice:
+            report(
+                f"  merge suspect: {suspect.speaker_ids[0]} and "
+                f"{suspect.speaker_ids[1]} are {suspect.similarity:.2f} alike, at or "
+                "above this film's own same-voice similarity - their lines will be "
+                "spoken in the same cloned voice, so either one character was found "
+                "twice or the film has one more character than the evidence allowed"
+            )
+            continue
         report(
             f"  merge suspect: {suspect.speaker_ids[0]} and {suspect.speaker_ids[1]} "
             f"are {suspect.similarity:.2f} alike; left separate on purpose"
@@ -1106,10 +1134,21 @@ def run_pipeline(
         crosstalk=result.crosstalk,
         transcribe=transcriber,
         transcription_model=resolved.transcription_model,
+        reference_pitch=_reference_pitches(result.profiles),
     )
     # Which hard cases the material actually contains. A run can score well simply
     # because it was easy, so this says what was *not* exercised.
     coverage = evaluation.measure_coverage(result.dialogue, crosstalk=result.crosstalk)
+
+    # Said out loud before the summary, because it is the one check that decides whether
+    # the characters are distinguishable at all in the finished audio.
+    if quality.voice_identity is not None:
+        report(f"  voice identity: {quality.voice_identity.summary()}")
+        if not quality.voice_identity.ok:
+            report(
+                "  voice identity: WARNING the dub does not reproduce the actors' "
+                "voices - listen to the named characters before shipping it"
+            )
 
     _write_manifest(
         result,
@@ -1171,6 +1210,20 @@ def _engine_note(settings: Settings) -> str:
     )
 
 
+def _reference_pitches(profiles: Mapping[str, Any]) -> dict[str, float]:
+    """Return each character's reference pitch, for the generated-voice check.
+
+    A profile without a pitch estimate cannot take part in the comparison, so it is left
+    out rather than guessed at.
+    """
+
+    return {
+        speaker_id: float(profile.estimated_pitch_hz)
+        for speaker_id, profile in profiles.items()
+        if getattr(profile, "estimated_pitch_hz", None)
+    }
+
+
 def _write_manifest(
     result: PipelineResult,
     *,
@@ -1185,6 +1238,7 @@ def _write_manifest(
         dialogue=result.dialogue,
         clips=result.clips,
         crosstalk=result.crosstalk,
+        reference_pitch=_reference_pitches(result.profiles),
     )
     exercised = (
         coverage
