@@ -292,110 +292,8 @@ def rig(tmp_path: Path, shared_stem: Path, monkeypatch: pytest.MonkeyPatch) -> R
 
 
 # ---------------------------------------------------------------------------
-# a clone that does not reproduce the character
+# Adapter contract
 # ---------------------------------------------------------------------------
-
-
-class _PitchAwareEngine(FakeOmnivoice):
-    """An engine whose clone only works in one of its two modes.
-
-    With a reference transcript it speaks at ``wrong_hz``; when the transcript is
-    withheld - so the engine preprocesses and transcribes the reference itself - it
-    speaks at ``right_hz``. That is the failure the probe exists to catch: a reference
-    whose transcript did not carry the voice.
-    """
-
-    def __init__(self, *, wrong_hz: float, right_hz: float, **kwargs: object) -> None:
-        super().__init__(**kwargs)  # type: ignore[arg-type]
-        self.wrong_hz = wrong_hz
-        self.right_hz = right_hz
-
-    def synthesize(self, **kwargs: object) -> Path:
-        self.calls.append(dict(kwargs))
-        hz = self.wrong_hz if kwargs.get("reference_text") else self.right_hz
-        destination = Path(str(kwargs["destination"]))
-        times = np.arange(int(self.seconds * self.rate), dtype=np.float64) / self.rate
-        tone = (0.4 * np.sin(2.0 * np.pi * hz * times)).astype(np.float32)
-        _write_wav(destination, tone, self.rate)
-        self.events.append((self.name, destination.name))
-        return destination
-
-
-def test_a_clone_that_does_not_take_is_re_cloned_the_other_way(
-    rig: Rig, tmp_path: Path
-) -> None:
-    """The guarantee: a character is spoken in the actor's voice, or the run says not."""
-
-    profile = VoiceProfile(
-        speaker_id="SPEAKER_00",
-        reference_audio=rig.profile.reference_audio,
-        reference_start=10.0,
-        reference_end=15.0,
-        reference_text="a reference line",
-        estimated_pitch_hz=150.0,
-    )
-    rig.engine = _PitchAwareEngine(wrong_hz=230.0, right_hz=150.0, events=rig.events)
-
-    result = tts.synthesize_dialogue_detailed(
-        [_line(), _line(start=8.0, end=12.0)],
-        rig.stem,
-        {"SPEAKER_00": profile},
-        settings=rig.settings(),
-    )
-
-    # The transcript-free attempt reproduced the actor; the first one did not, and was
-    # abandoned rather than used for the whole film.
-    assert [call.get("reference_text") for call in rig.engine.calls][:2] == [
-        "a reference line",
-        None,
-    ]
-    assert all(clip.index in (0, 1) for clip in result.clips)
-    assert any("preprocessing mode" in note for note in result.notes)
-    # Both lines went through the strategy that worked, so the character keeps one voice.
-    assert [call.get("reference_text") for call in rig.engine.calls][2:] == [None]
-
-
-def test_a_character_that_cannot_be_reproduced_is_named(rig: Rig) -> None:
-    """Neither mode matches: the run must not pretend the actor was reproduced."""
-
-    profile = VoiceProfile(
-        speaker_id="SPEAKER_00",
-        reference_audio=rig.profile.reference_audio,
-        reference_start=10.0,
-        reference_end=15.0,
-        reference_text="a reference line",
-        estimated_pitch_hz=150.0,
-    )
-    rig.engine = _PitchAwareEngine(wrong_hz=300.0, right_hz=90.0, events=rig.events)
-
-    result = tts.synthesize_dialogue_detailed(
-        [_line()], rig.stem, {"SPEAKER_00": profile}, settings=rig.settings()
-    )
-
-    assert any("NOT reproduced" in note for note in result.notes)
-    assert result.clips, "the line is still spoken, in the closest attempt"
-
-
-def test_a_clone_that_takes_first_time_is_not_chattered_about(rig: Rig) -> None:
-    profile = VoiceProfile(
-        speaker_id="SPEAKER_00",
-        reference_audio=rig.profile.reference_audio,
-        reference_start=10.0,
-        reference_end=15.0,
-        reference_text="a reference line",
-        estimated_pitch_hz=150.0,
-    )
-    rig.engine = _PitchAwareEngine(wrong_hz=150.0, right_hz=150.0, events=rig.events)
-
-    result = tts.synthesize_dialogue_detailed(
-        [_line()], rig.stem, {"SPEAKER_00": profile}, settings=rig.settings()
-    )
-
-    assert all("reproduced" not in note for note in result.notes)
-    assert [call.get("reference_text") for call in rig.engine.calls] == ["a reference line"]
-
-
-
 
 
 def test_the_cloning_interface_cannot_be_instantiated() -> None:
@@ -540,8 +438,8 @@ def test_unordered_dialogue_is_rejected(rig: Rig) -> None:
         rig.run(_line(start=20.0, end=22.0), _line(start=10.0, end=12.0))
 
 
-def test_a_lone_unprofiled_speaker_is_an_error_not_a_silent_run(rig: Rig) -> None:
-    """Nothing can be spoken at all, so the stage says so instead of producing silence."""
+def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
+    """An engine that cannot design a voice must not borrow another character's."""
 
     with pytest.raises(MissingVoiceProfileError, match="SPEAKER_09"):
         synthesize_dialogue(
@@ -553,37 +451,27 @@ def test_a_lone_unprofiled_speaker_is_an_error_not_a_silent_run(rig: Rig) -> Non
 
 
 # ---------------------------------------------------------------------------
-# a character with no reference at all
+# designed voices: a character the film gave no usable reference
 # ---------------------------------------------------------------------------
 
 
-def test_a_speaker_without_a_profile_has_its_lines_skipped(rig: Rig) -> None:
-    """No designed stand-in, and no dead film either.
+def test_a_speaker_without_any_profile_stops_the_run(rig: Rig) -> None:
+    """No designed stand-in: a character is spoken in their own voice or not at all.
 
     A speaker with no profile has no audio in the film to imitate, so there is nothing
-    honest to speak them with. Their lines are left unsaid and named in ``skipped``,
-    because stopping the run would leave every other character undubbed as well.
+    honest to speak them with. The run says which speaker is missing instead of quietly
+    inventing a voice that is not theirs.
     """
 
     rig.engine = FakeDesigningEngine(events=rig.events)
 
-    result = tts.synthesize_dialogue_detailed(
-        [
-            _line(speaker_id=rig.profile.speaker_id),
-            _line(speaker_id="SPEAKER_09", start=10.0, end=12.0),
-        ],
-        rig.stem,
-        {rig.profile.speaker_id: rig.profile},
-        settings=rig.settings(),
-    )
+    with pytest.raises(tts.MissingVoiceProfileError, match="SPEAKER_09"):
+        tts.synthesize_dialogue_detailed(
+            [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
+        )
 
-    assert [line.speaker_id for line in result.clips] == [rig.profile.speaker_id]
-    assert [item.speaker_id for item in result.skipped] == ["SPEAKER_09"]
-    reason = result.skipped[0].reason
-    assert "no audio in the film" in reason
-    assert "another character" in reason
-    # No designed voice was assigned to the character without a reference.
-    assert not any(voice.speaker_id == "SPEAKER_09" for voice in result.designed)
+    # Nothing was synthesized, and no designed voice was assigned.
+    assert rig.engine.calls == []
 
 
 def test_the_error_names_the_setting_that_builds_the_missing_profile(rig: Rig) -> None:
@@ -591,7 +479,10 @@ def test_the_error_names_the_setting_that_builds_the_missing_profile(rig: Rig) -
 
     with pytest.raises(tts.MissingVoiceProfileError, match="build_voice_profiles"):
         tts.synthesize_dialogue_detailed(
-            [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
+            [_line(), _line(speaker_id="SPEAKER_09", start=10.0, end=12.0)],
+            rig.stem,
+            {rig.profile.speaker_id: rig.profile},
+            settings=rig.settings(),
         )
 
 

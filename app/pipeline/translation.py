@@ -64,7 +64,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -299,10 +299,10 @@ change of tone inside the sentence is not lost.
 
 Return exactly one JSON object matching this schema, with every input id copied
 exactly once and in order. Do not add, omit, merge, split, or reorder lines or fields.
-Return no prose, markdown, or code fences. Every string value must be on ONE line:
-never put a raw newline, tab or other control character inside a string, and never wrap
-the object across lines inside a value:
-{"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,"delivery":"...","pause_before":0.0,"pause_after":0.0,"beats":[{"part":1,"emotion":"...","intensity":0.0,"delivery":"..."}]}]}
+Return no prose, markdown, or code fences:
+{"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,
+"delivery":"...","pause_before":0.0,"pause_after":0.0,
+"beats":[{"part":1,"emotion":"...","intensity":0.0,"delivery":"..."}]}]}
 """
 
 
@@ -374,84 +374,6 @@ def _required_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidSegmentError(f"{name} must be a non-empty string")
     return value.strip()
-
-
-#: Control characters that may not appear inside a value we accept from a model. A raw
-#: newline or tab in JSON is what a model produces when it wraps a long string, and it is
-#: the one thing that makes an otherwise sound reply unparseable.
-_CONTROL_CHARACTERS = frozenset(chr(code) for code in range(0x20)) | {"\x7f"}
-
-
-def _single_line(value: object) -> object:
-    """Return a text field flattened onto one line, with its words intact.
-
-    A control character inside a value is never meaningful in dialogue: it is a raw
-    newline or tab the model used to wrap the string. Collapsing it to a single space
-    keeps the words and produces text the voice engine can actually read, where keeping
-    the character would leave a newline inside a line that is synthesized in one go.
-    """
-
-    if not isinstance(value, str):
-        return value
-    if not any(character in _CONTROL_CHARACTERS for character in value):
-        return value
-    flattened = "".join(
-        " " if character in _CONTROL_CHARACTERS else character for character in value
-    )
-    return " ".join(flattened.split())
-
-
-def _normalise_reply_line(line: Any) -> Any:
-    """Return one model line with every text field on a single line.
-
-    Applied to every line before it is validated, so a raw control character is repaired
-    where it happened rather than being carried into the dialogue, the manifest or the
-    synthesizer. It reports nothing on its own: the caller has already reported that the
-    reply needed repairing.
-    """
-
-    if not isinstance(line, Mapping):
-        return line
-    cleaned = dict(line)
-    for field in ("amharic", "emotion", "delivery"):
-        if field in cleaned:
-            cleaned[field] = _single_line(cleaned[field])
-    beats = cleaned.get("beats")
-    if isinstance(beats, list):
-        cleaned["beats"] = [
-            {
-                **beat,
-                "emotion": _single_line(beat.get("emotion")),
-                "delivery": _single_line(beat.get("delivery")),
-            }
-            if isinstance(beat, Mapping)
-            else beat
-            for beat in beats
-        ]
-    return cleaned
-
-
-def _reply_needs_repair(line: Any) -> bool:
-    """Return whether ``line`` carries a control character inside one of its strings."""
-
-    if not isinstance(line, Mapping):
-        return False
-
-    def dirty(value: Any) -> bool:
-        return isinstance(value, str) and any(
-            character in _CONTROL_CHARACTERS for character in value
-        )
-
-    if any(dirty(line.get(field)) for field in ("amharic", "emotion", "delivery")):
-        return True
-    beats = line.get("beats")
-    if isinstance(beats, list):
-        return any(
-            isinstance(beat, Mapping)
-            and (dirty(beat.get("emotion")) or dirty(beat.get("delivery")))
-            for beat in beats
-        )
-    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,11 +717,7 @@ def _parts_payload(segment: TranscriptSegment | DialogueSentence) -> dict[str, A
         return {}
     return {
         "parts": [
-            {
-                "part": index,
-                "duration": round(part.duration, 3),
-                "text": _single_line(part.text),
-            }
+            {"part": index, "duration": round(part.duration, 3), "text": part.text}
             for index, part in enumerate(parts, start=1)
         ]
     }
@@ -832,10 +750,7 @@ def _request_kwargs(
                 "id": line_id,
                 "speaker": segment.speaker_id,  # context only; never returned
                 "duration": round(segment.duration, 3),
-                # Flattened before it is sent: a transcript line that carries a raw
-                # newline or tab teaches the model to put one inside the string it
-                # writes back, which is exactly what makes a reply unparseable.
-                "text": _single_line(segment.text),
+                "text": segment.text,
                 **(
                     {"syllable_budget": budget.syllables}
                     if budgets is not None
@@ -1005,102 +920,30 @@ def _json_object(content: str) -> Any:
     sentence of preamble. Losing a whole film's run to that would be a poor trade, so
     the outermost ``{...}`` is tried when the reply is not already valid JSON.
 
-    Parsing is *lenient about control characters*: a reply may carry a literal newline or
-    tab inside a string - an Amharic line wrapped across two lines, or a stray ``\\t`` -
-    and ``json.loads`` rejects those by default even though the object is otherwise
-    sound. Rejecting a batch of ten translated lines over one raw newline is the parser
-    being stricter than the protocol, and it cost a run exactly that way.
-
-    This is deliberately narrow: it accepts a JSON object that is *wrapped* or that
-    carries an unescaped control character, and nothing else. A reply that is not a JSON
-    object still fails with the original error, so a model that genuinely cannot follow
-    the protocol is not quietly accepted.
+    This is deliberately narrow: it accepts a JSON object that is *wrapped*, and nothing
+    else. A reply that is not a JSON object still fails with the original error, so a
+    model that genuinely cannot follow the protocol is not quietly accepted.
     """
 
-    text = content.lstrip("\ufeff")
-    attempts = [text]
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        attempts.append(text[start : end + 1])
-
-    failure: json.JSONDecodeError | None = None
-    for attempt in attempts:
-        try:
-            return json.loads(attempt, strict=False)
-        except json.JSONDecodeError as exc:
-            failure = exc
-    assert failure is not None
-    raise failure
-
-
-def _salvage_line_objects(content: str, ids: Sequence[str]) -> list[Any]:
-    """Return the individual line objects recoverable from a broken reply.
-
-    A reply can be unreadable *as a whole* and still hold every line: a truncated
-    closing brace, a stray character after the object, a fence that never closes. Each
-    ``{...}`` in the text is therefore tried on its own, and the ones that are a dialogue
-    line with an id the request asked for are kept. Nothing is invented: an object that
-    does not parse is simply not recovered, and its line goes to the repair request like
-    any other malformed line.
-    """
-
-    wanted = set(ids)
-    recovered: list[Any] = []
-    stack: list[int] = []
-    in_string = False
-    escaped = False
-    for position, character in enumerate(content):
-        if escaped:
-            escaped = False
-            continue
-        if character == "\\":
-            if in_string:
-                escaped = True
-            continue
-        if character == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if character == "{":
-            stack.append(position)
-            continue
-        if character != "}" or not stack:
-            continue
-        start = stack.pop()
-        try:
-            candidate = json.loads(content[start : position + 1], strict=False)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(candidate, dict):
-            continue
-        raw_id = candidate.get("id")
-        if isinstance(raw_id, str) and raw_id.strip() in wanted:
-            recovered.append(candidate)
-    # The stack unwinds innermost first, so the lines come back in reverse.
-    recovered.reverse()
-    return recovered
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(content[start : end + 1])
 
 
 def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
-    """Parse and validate the model's JSON, returning ``{dialogue_id: line}``.
-
-    A reply that cannot be read as a whole is salvaged line by line, and a line the model
-    left out of an otherwise usable reply is returned as ``None`` so the caller's repair
-    path can ask for it again. A single bad character or one omitted line must not cost
-    the batch: that is a hole in the dub, not a protocol failure.
-    """
+    """Parse and validate the model's JSON, returning ``{dialogue_id: line}``."""
 
     try:
         payload = _json_object(content)
     except json.JSONDecodeError as exc:
-        salvaged = _salvage_line_objects(content, ids)
-        if not salvaged:
-            raise MalformedResponseError(
-                f"the model did not return valid JSON: {exc}"
-            ) from exc
-        payload = {"lines": salvaged}
+        raise MalformedResponseError(
+            f"the model did not return valid JSON: {exc}"
+        ) from exc
 
     if not isinstance(payload, dict):
         raise MalformedResponseError(
@@ -1140,66 +983,14 @@ def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
         found[line_id] = line
 
     missing = [line_id for line_id in ids if line_id not in found]
-    if missing and not found:
+    if missing:
         raise DialogueIdError(
             f"the model returned {len(found)} of {len(ids)} dialogue lines; missing "
             + ", ".join(missing[:5])
             + (" ..." if len(missing) > 5 else "")
         )
-    # A partial reply is repairable: the line is handed back empty, which the caller
-    # treats as a malformed line - it asks for that line alone once, then salvages.
-    for line_id in missing:
-        found[line_id] = None
 
     return found
-
-
-def _clip_beat(
-    start: float, end: float, *, line_start: float, line_end: float
-) -> tuple[float, float] | None:
-    """Return ``(start, end)`` narrowed to the line's own interval, or ``None``.
-
-    A beat is performance metadata on the line's timeline, and the line's timeline is
-    the application's: whatever a part's own timestamps say, a beat may not describe
-    audio outside the line. A part that overlaps the line only partly keeps the
-    overlapping part of itself; a part that lies wholly outside the line describes
-    nothing and is dropped. ``None`` means "drop this beat".
-    """
-
-    clipped_start = max(start, line_start)
-    clipped_end = min(end, line_end)
-    if clipped_end - clipped_start <= TIMESTAMP_TOLERANCE:
-        return None
-    return clipped_start, clipped_end
-
-
-def _clipped_parts(
-    parts: Sequence[Any], *, line_start: float, line_end: float
-) -> dict[int, tuple[float, float]]:
-    """Return each part's interval, clipped into the line and stripped of overlaps.
-
-    The mapping is keyed by the part's 1-based number, so a beat can still be matched to
-    the part the model named. Transcribed segments overlap whenever a turn boundary falls
-    inside a word, so two parts can cover the same instant; beats are a sequence and
-    ``AdaptedDialogue`` requires them not to overlap, so the overlap is resolved here, in
-    the one place the timings are already being adjusted: a part that starts before the
-    previous one ends is moved up to that end. A part left with no duration is dropped.
-    """
-
-    intervals: dict[int, tuple[float, float]] = {}
-    previous_end = line_start
-    for number, part in enumerate(parts, start=1):
-        interval = _clip_beat(
-            part.start, part.end, line_start=line_start, line_end=line_end
-        )
-        if interval is None:
-            continue
-        start = max(interval[0], previous_end)
-        if interval[1] - start <= TIMESTAMP_TOLERANCE:
-            continue
-        intervals[number] = (start, interval[1])
-        previous_end = interval[1]
-    return intervals
 
 
 def _beats_from(
@@ -1207,8 +998,6 @@ def _beats_from(
     parts: Sequence[Any],
     *,
     fallback: tuple[str, float, str],
-    line_start: float,
-    line_end: float,
 ) -> tuple[PerformanceBeat, ...]:
     """Return the model's per-part direction on the parts' own timeline.
 
@@ -1219,29 +1008,20 @@ def _beats_from(
     inherits the line's direction rather than failing a whole run, but a structural
     error (an unknown or repeated part number) is reported as invalid model output:
     the application will not guess which part was meant.
-
-    Every beat is clipped to the line's own interval *and* to the end of the beat before
-    it. Parts are meant to sit inside the line and to follow one another, but nothing
-    guarantees either - a turn boundary inside a word makes them overlap - and a beat
-    that violated that used to fail the whole batch over metadata nobody listens to.
-    The line's text and timing are the application's and are never changed here.
     """
 
     if len(parts) < 2:
         return ()
-    intervals = _clipped_parts(parts, line_start=line_start, line_end=line_end)
-    if not intervals:
-        return ()
     if raw is None:
         return tuple(
             PerformanceBeat(
-                start=intervals[number][0],
-                end=intervals[number][1],
+                start=part.start,
+                end=part.end,
                 emotion=fallback[0],
                 intensity=fallback[1],
                 delivery=fallback[2],
             )
-            for number in sorted(intervals)
+            for part in parts
         )
     if not isinstance(raw, list):
         raise InvalidModelOutputError(
@@ -1275,15 +1055,11 @@ def _beats_from(
             raise InvalidModelOutputError(
                 f"the model returned part {number} more than once"
             )
-        interval = intervals.get(number)
-        if interval is None:
-            # The whole part is outside the line: there is no moment of this line for
-            # the direction to apply to, so it is dropped rather than misplaced.
-            continue
+        part = parts[number - 1]
         try:
             by_part[number] = PerformanceBeat(
-                start=interval[0],
-                end=interval[1],
+                start=part.start,
+                end=part.end,
                 emotion=entry.get("emotion"),
                 intensity=entry.get("intensity"),
                 delivery=entry.get("delivery"),
@@ -1294,22 +1070,19 @@ def _beats_from(
                 f"{number}: {exc}"
             ) from exc
 
-    beats: list[PerformanceBeat] = []
-    for number in sorted(intervals):
-        if number in by_part:
-            beats.append(by_part[number])
-            continue
-        interval = intervals[number]
-        beats.append(
+    return tuple(
+        by_part.get(
+            number,
             PerformanceBeat(
-                start=interval[0],
-                end=interval[1],
+                start=part.start,
+                end=part.end,
                 emotion=fallback[0],
                 intensity=fallback[1],
                 delivery=fallback[2],
-            )
+            ),
         )
-    return tuple(beats)
+        for number, part in enumerate(parts, start=1)
+    )
 
 
 def _build(
@@ -1321,17 +1094,8 @@ def _build(
     that echoes its own speaker or timestamps cannot influence the result. Any
     unacceptable model field is reported as invalid model output rather than as a
     plain validation error.
-
-    ``line`` is ``None`` when the model left this id out of an otherwise usable reply;
-    that is a malformed *line*, so it goes to the repair path with the others rather
-    than ending the batch.
     """
 
-    if not isinstance(line, Mapping):
-        raise InvalidModelOutputError(
-            f"the model returned no adaptation for {line_id!r}"
-        )
-    line = _normalise_reply_line(line)
     try:
         beats = _beats_from(
             line.get("beats"),
@@ -1341,8 +1105,6 @@ def _build(
                 _finite_number("intensity", line.get("intensity")),
                 _required_text("delivery", line.get("delivery")),
             ),
-            line_start=segment.start,
-            line_end=segment.end,
         )
         return AdaptedDialogue(
             speaker_id=segment.speaker_id,
@@ -1395,51 +1157,6 @@ def describe_fallback(settings: Settings) -> str:
     return "disabled; each batch makes one request and failures stop the run"
 
 
-def _salvage_adaptation(
-    segment: TranscriptSegment | DialogueSentence,
-    line_id: str,
-    payload: Any,
-    *,
-    reason: str,
-) -> AdaptedDialogue:
-    """Build the safest dialogue line possible from a malformed model answer.
-
-    The translated text and the original timing are the two things a dub cannot
-    invent, so they are kept: ``amharic`` comes from the model (it is the part that was
-    asked for), and identity, ``start`` and ``end`` come from the transcript as they
-    always do. What is dropped is the performance direction the model got wrong, which
-    is metadata - a neutral delivery is honest, and the line is still spoken with its
-    translated text in its original slot.
-
-    Raises:
-        InvalidModelOutputError: the model returned nothing usable to say. There is no
-            safe substitute for missing translated text, so this is reported instead
-            of putting English (or silence) into an Amharic dub.
-    """
-
-    text = payload.get("amharic") if isinstance(payload, dict) else None
-    text = _single_line(text) if text is not None else None
-    try:
-        return AdaptedDialogue(
-            speaker_id=segment.speaker_id,
-            start=segment.start,
-            end=segment.end,
-            source_text=segment.text,
-            amharic=text,
-            emotion=NEUTRAL_EMOTION,
-            intensity=NEUTRAL_INTENSITY,
-            delivery=NEUTRAL_DELIVERY,
-            pause_before=NEUTRAL_PAUSE,
-            pause_after=NEUTRAL_PAUSE,
-            beats=(),
-        )
-    except InvalidSegmentError as exc:
-        raise InvalidModelOutputError(
-            f"the model returned an unusable adaptation for {line_id!r} ({reason}) and "
-            f"nothing could be salvaged from it: {exc}"
-        ) from exc
-
-
 def _adapt_batch(
     failover: _SingleRequest,
     batch: list[TranscriptSegment | DialogueSentence],
@@ -1455,109 +1172,7 @@ def _adapt_batch(
     The ids are supplied by the caller rather than derived from a start position,
     because a retry sends a *subset* of a batch and each line must keep the id it
     was given the first time.
-
-    One line the model answered badly must not cost the run the whole batch: the
-    offending lines are retried once on their own, and a line that is still malformed
-    after that is salvaged (translated text, original timing, neutral direction) and
-    reported. The result always holds exactly one line per input line, so every caller
-    that indexes it by position keeps working.
     """
-
-    lines = _request_lines(
-        failover,
-        batch,
-        ids,
-        context=context,
-        budgets=budgets,
-        rewrite=rewrite,
-        on_progress=on_progress,
-    )
-
-    produced: list[AdaptedDialogue | None] = []
-    failures: list[tuple[int, Exception]] = []
-    for index, (segment, line_id) in enumerate(zip(batch, ids)):
-        try:
-            produced.append(_build(segment, line_id, lines[line_id]))
-        except InvalidModelOutputError as exc:
-            produced.append(None)
-            failures.append((index, exc))
-    if not failures:
-        repaired = [line for line in produced if line is not None]
-    else:
-        repaired = _repair_adaptations(
-            failover,
-            batch,
-            ids,
-            produced,
-            failures,
-            lines,
-            context=context,
-            budgets=budgets,
-            on_progress=on_progress,
-        )
-    adjusted = sum(
-        1
-        for segment, line in zip(batch, repaired)
-        if _beats_were_adjusted(segment, line.beats)
-    )
-    if adjusted and on_progress is not None:
-        on_progress(
-            f"  translation: {adjusted} line(s) had a performance beat narrowed to the "
-            "line's own interval; the text and the line's timing are unchanged"
-        )
-    return repaired
-
-
-def _beats_were_adjusted(
-    segment: TranscriptSegment | DialogueSentence, beats: Sequence[PerformanceBeat]
-) -> bool:
-    """Return whether any beat differs from where its part sits inside the line.
-
-    True means a beat was narrowed into the line's interval, moved up past an overlapping
-    part, or dropped because it fell wholly outside - all of which are reported so a
-    manifest reader knows the performance metadata was corrected rather than trusted.
-
-    A single-segment line carries no beats by design, so it is never counted: comparing
-    one part against zero beats would report every ordinary line as adjusted, which is
-    exactly the noise that made this report useless.
-    """
-
-    parts = getattr(segment, "parts", ())
-    if len(parts) < 2:
-        return False
-    line_start = float(segment.start)
-    line_end = float(segment.end)
-    # Compare against the parts as they stand: any beat that is not simply "this part,
-    # as given" was corrected - narrowed into the line, moved past an overlapping part,
-    # or dropped because it fell outside.
-    raw = [
-        interval
-        for interval in (
-            _clip_beat(part.start, part.end, line_start=line_start, line_end=line_end)
-            for part in parts
-        )
-        if interval is not None
-    ]
-    if len(raw) != len(beats):
-        return True
-    return any(
-        abs(start - beat.start) > TIMESTAMP_TOLERANCE
-        or abs(end - beat.end) > TIMESTAMP_TOLERANCE
-        for (start, end), beat in zip(raw, beats)
-    )
-
-
-def _request_lines(
-    failover: _SingleRequest,
-    batch: list[TranscriptSegment | DialogueSentence],
-    ids: list[str],
-    *,
-    context: str | None,
-    budgets: Sequence[SyllableBudget] | None,
-    rewrite: str | None,
-    on_progress: Callable[[str], None] | None,
-) -> dict[str, Any]:
-    """Send one request and return the model's raw line objects keyed by id."""
 
     request_kind = "rewrite" if rewrite is not None else "initial"
     provider = failover.current[1].translation_provider
@@ -1595,107 +1210,8 @@ def _request_lines(
             f"{time.perf_counter() - request_started:.1f}s"
         )
 
-    content = _response_content(response)
-    parsed = _parse_response(content, ids)
-    # A control character inside a value is repaired, and said out loud: silently
-    # accepting it would hide a model that keeps wrapping its strings across lines,
-    # which is what makes the *next* reply unparseable.
-    repaired = [
-        line_id for line_id, line in parsed.items() if _reply_needs_repair(line)
-    ]
-    if repaired and on_progress is not None:
-        shown = ", ".join(repaired[:5])
-        if len(repaired) > 5:
-            shown += f", and {len(repaired) - 5} more"
-        on_progress(
-            f"  translation: {len(repaired)} line(s) came back with a raw control "
-            f"character inside a field ({shown}); it was flattened to a space, and the "
-            "text is otherwise unchanged"
-        )
-    return parsed
-
-
-def _repair_adaptations(
-    failover: _SingleRequest,
-    batch: list[TranscriptSegment | DialogueSentence],
-    ids: list[str],
-    produced: list[AdaptedDialogue | None],
-    failures: list[tuple[int, Exception]],
-    lines: dict[str, Any],
-    *,
-    context: str | None,
-    budgets: Sequence[SyllableBudget] | None,
-    on_progress: Callable[[str], None] | None,
-) -> list[AdaptedDialogue]:
-    """Retry only the malformed lines once, then salvage whatever is still wrong."""
-
-    offenders = [index for index, _ in failures]
-    reasons = {index: exc for index, exc in failures}
-    if on_progress is not None:
-        on_progress(
-            f"  translation: {len(offenders)} of {len(batch)} line(s) came back "
-            "malformed (" + "; ".join(str(reasons[index])[:160] for index in offenders[:3])
-            + (")" if len(offenders) <= 3 else "; ...)")
-        )
-
-    instructions = "\n".join(
-        f"- {ids[index]}: the previous answer was not usable - {reasons[index]}. "
-        "Return the same line again, following the schema exactly: performance beats "
-        "describe the line's parts, and no field may be empty, out of range, or "
-        "outside the line's own timing."
-        for index in offenders
-    )
-    try:
-        retried = _request_lines(
-            failover,
-            [batch[index] for index in offenders],
-            [ids[index] for index in offenders],
-            context=context,
-            budgets=(
-                [budgets[index] for index in offenders] if budgets is not None else None
-            ),
-            rewrite=(
-                "Rewrite each of these lines to fix the problem described against it, "
-                "keeping the meaning, tone and character:\n" + instructions
-            ),
-            on_progress=on_progress,
-        )
-    except Exception as exc:
-        # The retry itself failed (network, ids, malformed body). The original answers
-        # are still readable, so salvage from those rather than lose the batch.
-        if on_progress is not None:
-            on_progress(
-                "  translation: the repair request failed "
-                f"({type(exc).__name__}: {exc}); salvaging from the first answer"
-            )
-        retried = {}
-
-    for index in offenders:
-        segment = batch[index]
-        line_id = ids[index]
-        reason = str(reasons[index])
-        if line_id in retried:
-            try:
-                produced[index] = _build(segment, line_id, retried[line_id])
-                if on_progress is not None:
-                    on_progress(
-                        f"  translation: {line_id} recovered on the repair request"
-                    )
-                continue
-            except InvalidModelOutputError as exc:
-                reason = f"retry also unusable: {exc}"
-        produced[index] = _salvage_adaptation(
-            segment,
-            line_id,
-            retried.get(line_id, lines.get(line_id)),
-            reason=reason,
-        )
-        if on_progress is not None:
-            on_progress(
-                f"  translation: {line_id} kept its translated text and original "
-                f"timing with a neutral delivery ({reason})"
-            )
-    return [line for line in produced if line is not None]
+    lines = _parse_response(_response_content(response), ids)
+    return [_build(segment, line_id, lines[line_id]) for segment, line_id in zip(batch, ids)]
 
 
 #: Maximum number of rewrite requests per original batch. Lines that do not improve
@@ -2184,9 +1700,6 @@ def adapt_dialogue(
             f"{settings.translation_backend!r}"
         )
 
-    # One request per batch is a deliberate cost policy - no rewrites, retries, or
-    # failover. The per-batch report in _reduce_overshooting_lines already says how many
-    # lines overshoot, so nothing is silently ignored.
     if maximum_reduction_attempts != 0 and on_progress is not None:
         on_progress(
             "  translation rewrites disabled; each batch is sent exactly once"

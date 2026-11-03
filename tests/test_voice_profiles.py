@@ -1910,63 +1910,6 @@ def test_a_character_with_only_short_turns_gets_a_stitched_reference(
     assert profile.reference_audio.is_file()
 
 
-def test_a_partly_overlapped_turn_contributes_its_clean_remainder(
-    tmp_path: Path, ffmpeg: FakeFfmpeg
-) -> None:
-    """A turn that merely touches crosstalk is trimmed, not thrown away.
-
-    The failure this replaces: a character whose two lines each overlapped another
-    speaker for a moment lost both lines entirely, ended up with no reference, and the
-    whole run stopped at the TTS stage. The overlapped part is what must not be cloned
-    from - the rest of the turn is still this actor speaking alone.
-    """
-
-    stem = _write_stem(
-        tmp_path / "speech.wav",
-        [(10.0, 10.8, LOUD), (12.0, 12.8, LOUD), (14.0, 14.8, LOUD)],
-    )
-    segments = [
-        SpeakerSegment("SPEAKER_00", 10.0, 10.8),
-        SpeakerSegment("SPEAKER_00", 12.0, 12.8),
-    ]
-
-    profiles = build_voice_profiles(
-        segments,
-        stem,
-        # The other character talks over the first half of the second line only.
-        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), start=12.0, end=12.4)],
-        settings=_settings(tmp_path),
-        require_reference_transcript=True,
-    )
-
-    profile = profiles["SPEAKER_00"]
-    assert profile.reference_spans == ((10.0, 10.8), (12.4, 12.8))
-    assert profile.reference_speech_seconds == pytest.approx(1.2, abs=0.05)
-    assert "skipped because they overlap another speaker" not in profile.selection_reason
-
-
-def test_a_character_whose_whole_part_is_one_short_line_gets_a_reference(
-    tmp_path: Path, ffmpeg: FakeFfmpeg
-) -> None:
-    """Half a second of the actor is still the actor, and the silence makes it cloneable."""
-
-    stem = _write_stem(tmp_path / "speech.wav", [(10.0, 10.5, LOUD)])
-    segments = [SpeakerSegment("SPEAKER_06", 10.0, 10.5)]
-
-    profiles = build_voice_profiles(
-        segments, stem, settings=_settings(tmp_path), require_reference_transcript=True
-    )
-
-    profile = profiles["SPEAKER_06"]
-    assert profile.composite is True
-    assert profile.reference_speech_seconds == pytest.approx(0.5, abs=0.05)
-    # The reference the engine is handed is padded to the length it clones from, and the
-    # profile is valid because that audio is what it will read.
-    assert profile.reference_padding_seconds == pytest.approx(2.5, abs=0.05)
-    assert profile.reference_duration == pytest.approx(3.0, abs=0.05)
-    assert profile.reference_audio.is_file()
-
-
 def test_a_stitched_reference_skips_turns_under_crosstalk(
     tmp_path: Path, ffmpeg: FakeFfmpeg
 ) -> None:

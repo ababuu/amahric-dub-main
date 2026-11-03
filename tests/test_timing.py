@@ -35,7 +35,6 @@ from app.pipeline.timing import (
     resolve_timing_directory,
 )
 from app.config import DEFAULT_TIMING_MAX_OVERLAP_SECONDS, DEFAULT_TIMING_MAX_TEMPO
-from app.pipeline.diarization import CrosstalkRegion
 from app.pipeline.translation import AdaptedDialogue
 from app.pipeline.tts import PerformanceControls, TtsClip
 
@@ -718,13 +717,11 @@ def test_lines_never_overlap_when_trimming_is_asked_for(tmp_path: Path) -> None:
     ("second_start", "speaker_id", "expected_start"),
     [
         (5.75, "SPEAKER_01", 5.75),
-        # The film had 0.9s of these two at once; the dub reproduces it.
-        (5.1, "SPEAKER_01", 5.1),
-        # One voice never hands over to itself, whatever the source did.
+        (5.1, "SPEAKER_01", 5.7),
         (5.1, "SPEAKER_00", 6.0),
     ],
 )
-def test_cascade_preserves_a_source_overlap_and_never_lays_one_voice_over_itself(
+def test_cascade_caps_source_overlap_and_prevents_same_speaker_overlap(
     tmp_path: Path, second_start: float, speaker_id: str, expected_start: float
 ) -> None:
     first_clip = _clip(
@@ -763,149 +760,6 @@ def test_cascade_preserves_a_source_overlap_and_never_lays_one_voice_over_itself
     )
 
     assert result[1].start == pytest.approx(expected_start)
-
-
-def _aligned(
-    index: int, clip: TtsClip, start: float, *, speech: float = 1.0
-) -> AlignedClip:
-    """An already-fitted line, for exercising placement without FFmpeg."""
-
-    return AlignedClip(
-        index=index,
-        clip=clip,
-        audio_path=clip.audio_path,
-        sample_rate=CLIP_RATE,
-        start=start,
-        tempo=1.0,
-        required_tempo=1.0,
-        speech_duration=speech,
-        original_window=speech,
-        rendered_pause_before=0.0,
-        rendered_pause_after=0.0,
-    )
-
-
-def _two_voices(tmp_path: Path, *, second_start: float = 5.1,
-                speaker_id: str = "SPEAKER_01") -> list[TtsClip]:
-    return [
-        _clip(tmp_path, index=0, start=5.0, end=6.0),
-        _clip(
-            tmp_path,
-            index=1,
-            start=second_start,
-            end=second_start + 1.0,
-            speaker_id=speaker_id,
-        ),
-    ]
-
-
-def test_a_source_crosstalk_region_lets_the_two_lines_overlap(tmp_path: Path) -> None:
-    """A dub that always separated two people the film had talking at once is wrong."""
-
-    first, second = _two_voices(tmp_path)
-    placed = timing._cascade(
-        [_aligned(0, first, 5.0), _aligned(1, second, 5.1)],
-        guard=0.0,
-        overlap=0.3,
-        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.0, 6.0)],
-    )
-
-    # Without the region this line would have been pushed to 5.7s.
-    assert placed[1].start == pytest.approx(5.1)
-    assert placed[1].deliberate_overlap == pytest.approx(0.9)
-    assert any("speaking at once" in note for note in placed[1].notes)
-    assert placed[1].drift == 0.0
-
-
-def test_a_long_simultaneous_stretch_is_capped(tmp_path: Path) -> None:
-    """Reproducing ten seconds of two voices would be unintelligible in a new language."""
-
-    first, second = _two_voices(tmp_path)
-    # A ten-second first line and a five-second second one, so a 55 s region is what is
-    # being capped rather than either line's own length.
-    long_first = _aligned(0, first, 5.0, speech=10.0)
-    long_second_clip = _clip(tmp_path, index=1, start=5.1, end=10.0,
-                             speaker_id="SPEAKER_01")
-    long_second = _aligned(1, long_second_clip, 5.1, speech=3.0)
-    placed = timing._cascade(
-        [long_first, long_second],
-        guard=0.0,
-        overlap=0.0,
-        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.0, 60.0)],
-    )
-
-    assert placed[1].deliberate_overlap == pytest.approx(
-        timing.MAX_DELIBERATE_OVERLAP_SECONDS, abs=1e-6
-    )
-    assert placed[1].start == pytest.approx(15.0 - timing.MAX_DELIBERATE_OVERLAP_SECONDS)
-
-
-def test_crosstalk_never_lays_one_voice_over_itself(tmp_path: Path) -> None:
-    """The same character talking over themselves is a stutter, not an interruption."""
-
-    first, second = _two_voices(tmp_path, speaker_id="SPEAKER_00")
-    placed = timing._cascade(
-        [_aligned(0, first, 5.0), _aligned(1, second, 5.1)],
-        guard=0.0,
-        overlap=0.0,
-        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.0, 6.0)],
-    )
-
-    assert placed[1].start == pytest.approx(6.0)
-    assert placed[1].deliberate_overlap == 0.0
-
-
-def test_crosstalk_between_other_characters_does_not_move_this_line(
-    tmp_path: Path,
-) -> None:
-    """The region has to name both of *these* voices to excuse an overlap."""
-
-    first, second = _two_voices(tmp_path, second_start=6.1)
-    placed = timing._cascade(
-        [_aligned(0, first, 5.0), _aligned(1, second, 6.1)],
-        guard=0.0,
-        overlap=0.3,
-        crosstalk=[CrosstalkRegion(("SPEAKER_02", "SPEAKER_03"), 5.0, 6.0)],
-    )
-
-    assert placed[1].start == pytest.approx(6.1)
-    assert placed[1].deliberate_overlap == 0.0
-    assert placed[1].drift == 0.0
-
-
-def test_a_simultaneous_line_is_not_squeezed_before_its_partner(
-    tmp_path: Path,
-) -> None:
-    """The film talked over itself here, so the first line gets the overlap as room.
-
-    Without it the earlier line is compressed to fit a gap it never had to respect, which
-    is audible as a rush exactly where the scene is most animated.
-    """
-
-    clips = [
-        _clip(tmp_path, index=0, start=5.0, end=5.4, speech=1.6),
-        _clip(
-            tmp_path,
-            index=1,
-            start=5.6,
-            end=6.4,
-            speech=0.6,
-            speaker_id="SPEAKER_01",
-        ),
-    ]
-
-    alone = align_dialogue(clips, output_dir=tmp_path / "a", settings=_settings(tmp_path))
-    together = align_dialogue(
-        clips,
-        output_dir=tmp_path / "b",
-        settings=_settings(tmp_path),
-        crosstalk=[CrosstalkRegion(("SPEAKER_00", "SPEAKER_01"), 5.0, 6.0)],
-    )
-
-    assert together[0].available > alone[0].available
-    # Enough room now that the line no longer runs past its time into the next one.
-    assert alone[0].overrun > 0.0
-    assert together[0].overrun == 0.0
 
 
 def test_nothing_is_cut_when_there_is_no_next_line(tmp_path: Path) -> None:

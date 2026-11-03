@@ -12,8 +12,7 @@ The stage order is the one ``app/pipeline/__init__.py`` documents::
       -> voice_profiles.build_voice_profiles   one identity reference per speaker
                                         (per-character engines only)
       -> tts.synthesize_dialogue        Amharic speech clips
-      -> timing.align_dialogue          each line fitted to its original window,
-                                        left overlapping where the film was
+      -> timing.align_dialogue          each line fitted to its original window
       -> mixing.mix_track              dialogue over ducked music + effects
       -> video.mux_dub                  the Amharic mix back into the video
 
@@ -82,10 +81,6 @@ MANIFEST_FILENAME = "manifest.json"
 #: per-source intermediates, kept with the run rather than in ``WORK_DIR``.
 STAGES_DIRNAME = "stages"
 
-#: The identities diarization discovered, kept with the run so a re-run of the same film
-#: reuses them instead of renumbering its characters.
-SPEAKER_REGISTRY_FILENAME = "speaker_registry.json"
-
 #: Stage names, in execution order, as recorded in the manifest.
 STAGE_ORDER: tuple[str, ...] = (
     "extract",
@@ -146,40 +141,8 @@ class PipelineResult:
     #: Anything the TTS stage wanted the run to know without treating it as a failure.
     notes: tuple[str, ...] = ()
     speaker_corrections: tuple[diarization.SpeakerAttributionCorrection, ...] = ()
-    #: pyannote's own speaker labels, before the evidence re-partitioned them.
-    raw_speakers: tuple[str, ...] = ()
-    #: The film's own similarity scale, and the partition chosen from it.
-    calibration: diarization.partition.Calibration | None = None
-    reclustering: diarization.partition.Partition | None = None
-    #: Performances that carried evidence, and every one the partition moved.
-    evidence_units: int = 0
-    evidence_seconds: float = 0.0
-    reassignments: tuple[diarization.SpeakerReassignment, ...] = ()
-    #: What each scene's own diarization found, and whether it was kept.
-    windows: tuple[diarization.DiarizationWindow, ...] = ()
-    #: Voices that could not be tied to an identity and were given their own.
-    uncertain_speakers: tuple[diarization.UncertainSpeaker, ...] = ()
-    #: The identities the run stands behind: those in ``speakers`` minus the uncertain.
-    confirmed_speakers: tuple[str, ...] = ()
-    #: Voices a suspect window separated that were never established; they hold no turns.
-    unresolved_speakers: tuple[diarization.UnresolvedSpeaker, ...] = ()
-    #: Performances whose evidence could not separate two identities.
-    undecided_performances: int = 0
-    undecided_seconds: float = 0.0
-    #: Identity pairs that are suspiciously alike but were deliberately not merged.
-    merge_suspects: tuple[diarization.SpeakerMergeSuspect, ...] = ()
-    #: Identity pairs merged as one person discovered twice.
-    speaker_merges: tuple[diarization.SpeakerIdentityMerge, ...] = ()
-    #: Characters only scene-level diarization found.
-    discovered_speakers: tuple[str, ...] = ()
-    #: Turns too short or too overlapped to carry speaker evidence.
-    unmeasured_turns: int = 0
-    #: Where the run persisted its speaker identities, when it did.
-    speaker_registry: Path | None = None
-    #: Why the speaker registry could not be read or written, when that happened.
-    registry_error: str = ""
-    #: ``True`` when the run was given speaker-count bounds instead of discovering them.
-    speaker_count_configured: bool = False
+    #: Clusters the diarization held two voices in, and the character split off each.
+    speaker_splits: tuple[diarization.SpeakerClusterSplit, ...] = ()
     #: Characters the film gave no usable reference, spoken in a designed voice.
     designed_voices: tuple[DesignedVoice, ...] = ()
 
@@ -221,52 +184,6 @@ class PipelineResult:
             "diarization": {
                 "turns": len(self.turns),
                 "speakers": sorted({turn.speaker_id for turn in self.turns}),
-                # What the run will stand behind, and what it will not. `speakers` is what
-                # the turns use; the two counts below are what a reader should quote.
-                "confirmed_speakers": list(self.confirmed_speakers),
-                "uncertain_speakers": [
-                    item.as_dict() for item in self.uncertain_speakers
-                ],
-                "unresolved_speakers": [
-                    item.as_dict() for item in self.unresolved_speakers
-                ],
-                "undecided": {
-                    "performances": self.undecided_performances,
-                    "seconds": round(self.undecided_seconds, 3),
-                },
-                # How the count was arrived at: discovered by the model and scene pass,
-                # or bounded by a configured hint. Never assumed.
-                "speaker_count_source": (
-                    "configured" if self.speaker_count_configured else "automatic"
-                ),
-                "unmeasured_turns": self.unmeasured_turns,
-                # pyannote's own answer, kept so the final partition can be compared
-                # with the model's without re-running the film.
-                "original": {
-                    "speakers": list(self.raw_speakers),
-                    "identity_count": len(self.raw_speakers),
-                },
-                # The film's own similarity scale, measured from its embeddings: every
-                # decision below is relative to these numbers, not to a constant.
-                "calibration": (
-                    self.calibration.as_dict() if self.calibration is not None else None
-                ),
-                # The global re-partitioning: what was tried, what was believed, and why
-                # everything else was refused.
-                "reclustering": (
-                    self.reclustering.as_dict()
-                    if self.reclustering is not None
-                    else None
-                ),
-                "evidence": {
-                    "units": self.evidence_units,
-                    "seconds": round(self.evidence_seconds, 3),
-                },
-                # Every performance the evidence moved from pyannote's cluster to
-                # another identity: this is how a scattered character is put together.
-                "reassignments": [
-                    item.as_dict() for item in self.reassignments
-                ],
                 "speaker_corrections": [
                     {
                         "start": correction.start,
@@ -278,34 +195,19 @@ class PipelineResult:
                     }
                     for correction in self.speaker_corrections
                 ],
-                # Every scene diarized on its own, and what it produced. A scene is the
-                # unit of accounting: a character whose whole part is one short line in
-                # one conversation is found here and nowhere else.
-                "scenes": {
-                    "total": len(self.windows),
-                    "separated": sum(
-                        1 for item in self.windows if item.mode == "separated"
-                    ),
-                    "agreed": sum(1 for item in self.windows if item.mode == "agreed"),
-                    # Scenes whose own diarization heard fewer voices than the identities
-                    # they hold: the attribution stands, but those scenes could not
-                    # confirm it.
-                    "unresolved": sum(
-                        1 for item in self.windows if item.mode == "unresolved"
-                    ),
-                    "kept": sum(1 for item in self.windows if item.mode == "kept"),
-                    "failed": sum(1 for item in self.windows if item.mode == "failed"),
-                    "detail": [item.as_dict() for item in self.windows],
-                },
-                "discovered_speakers": list(self.discovered_speakers),
-                "merge_suspects": [item.as_dict() for item in self.merge_suspects],
-                "merges": [item.as_dict() for item in self.speaker_merges],
-                "registry": (
-                    portable_path(self.speaker_registry)
-                    if self.speaker_registry is not None
-                    else None
-                ),
-                "registry_error": self.registry_error or None,
+                # A cluster that held two voices, split so the second one is not
+                # cloned in the first one's voice.
+                "speaker_splits": [
+                    {
+                        "from": split.speaker_id,
+                        "to": split.new_speaker_id,
+                        "turns": split.turns,
+                        "seconds": round(split.seconds, 3),
+                        "within_similarity": round(split.within_similarity, 4),
+                        "across_similarity": round(split.across_similarity, 4),
+                    }
+                    for split in self.speaker_splits
+                ],
                 # Simultaneous speech the exclusive attribution could not carry.
                 # Reported so a run can be audited for it without re-listening.
                 "crosstalk": {
@@ -347,13 +249,6 @@ class PipelineResult:
                     "selection_reason": profile.selection_reason,
                     "estimated_vocal_presentation": profile.estimated_vocal_presentation,
                     "estimated_pitch_hz": profile.estimated_pitch_hz,
-                    # How the reference was obtained: one continuous performance or
-                    # several short turns stitched together, and how much of it is real
-                    # speech as opposed to silence padded on to reach the engine's floor.
-                    "composite": profile.composite,
-                    "reference_spans": [list(span) for span in profile.reference_spans],
-                    "reference_speech_seconds": profile.reference_speech_seconds,
-                    "reference_padding_seconds": profile.reference_padding_seconds,
                 }
                 for speaker_id, profile in self.profiles.items()
             },
@@ -373,16 +268,6 @@ class PipelineResult:
             "timing": {
                 "lines": len(self.alignment),
                 "unfitted": len(self.unfitted_lines),
-                # Lines the dub deliberately leaves sounding under the line before them,
-                # because the film had those two characters speaking at once.
-                "deliberate_overlap": {
-                    "lines": sum(
-                        1 for line in self.alignment if line.deliberate_overlap > 0.0
-                    ),
-                    "seconds": round(
-                        sum(line.deliberate_overlap for line in self.alignment), 3
-                    ),
-                },
                 "segments": [line.to_dict() for line in self.alignment],
             },
             "mixing": self.mix.to_dict(),
@@ -397,7 +282,6 @@ class PipelineResult:
         speakers = sorted({turn.speaker_id for turn in self.turns})
         stretched = sum(1 for line in self.alignment if line.tempo != 1.0)
         drifted = [line for line in self.alignment if line.drift > 0.005]
-        overlapping = [line for line in self.alignment if line.deliberate_overlap > 0.0]
         lines = [
             f"source          {self.source}",
             f"output          {self.output_dir}",
@@ -405,18 +289,14 @@ class PipelineResult:
             f"diarization     {len(self.turns)} turn(s), {len(speakers)} speaker(s)",
             f"transcription   {len(self.lines)} line(s)",
             f"adaptation      {len(self.dialogue)} Amharic line(s)",
-            f"voice profiles  {len(self.profiles)} in the actor's own voice "
-            f"({sum(1 for profile in self.profiles.values() if profile.composite)} "
-            "stitched from short turns)",
+            f"voice profiles  {len(self.profiles)} cloned, "
+            f"{len(self.designed_voices)} designed from a description",
             f"tts             {len(self.clips)} clip(s)",
             f"timing          {len(self.alignment)} aligned, {stretched} stretched, "
             f"{len(self.unfitted_lines)} not fitted",
             f"placement       {len(drifted)} line(s) moved later to avoid speaking over "
             f"the line before them, worst "
-            f"{max((line.drift for line in drifted), default=0.0):.2f} s; "
-            f"{len(overlapping)} line(s) left overlapping the one before them because the "
-            f"film had both voices at once "
-            f"({sum(line.deliberate_overlap for line in overlapping):.2f} s)",
+            f"{max((line.drift for line in drifted), default=0.0):.2f} s",
             f"bleed           "
             f"{'not measured' if self.bleed is None else self.bleed.summary()}",
             f"dub bleed       "
@@ -650,9 +530,6 @@ def run_pipeline(
         diarization.diarize_detailed,
         stems.speech,
         settings=resolved,
-        # The registry lives with the run, so a re-run of the same film keeps the
-        # identities it established rather than renumbering its characters.
-        registry_path=run_dir / SPEAKER_REGISTRY_FILENAME,
     )
     turns = tuple(diarized.turns)
     if not turns:
@@ -666,134 +543,13 @@ def run_pipeline(
             f"  speaker verification: corrected {len(speaker_corrections)} "
             "high-confidence turn attribution(s)"
         )
-    if diarized.calibration is not None:
-        calibration = diarized.calibration
+    speaker_splits = tuple(diarized.splits)
+    for split in speaker_splits:
         report(
-            f"  speaker evidence: {diarized.units} performance(s) / "
-            f"{diarized.unit_seconds:.1f}s; same-voice similarity "
-            f"{calibration.same_similarity:.2f} "
-            f"(within {calibration.within:.2f}, between {calibration.between:.2f})"
-            + ("" if calibration.reliable else "; the configured fallback is in use")
+            f"  speaker split: {split.new_speaker_id} separated from {split.speaker_id} "
+            f"({split.turns} turn(s), {split.seconds:.1f}s; within-similarity "
+            f"{split.within_similarity:.2f}, across {split.across_similarity:.2f})"
         )
-    if diarized.reclustering is not None:
-        outcome = diarized.reclustering
-        report(
-            f"  re-partitioning: {outcome.k} speaker(s) at silhouette "
-            f"{outcome.silhouette:.2f}, reproducing {outcome.stability:.2f} - "
-            f"{outcome.reason}"
-        )
-        for candidate in outcome.candidates:
-            if candidate.chosen:
-                continue
-            # "refused" means a gate said no; a candidate that passed every gate and
-            # simply was not the finest partition was *not chosen*, which is a different
-            # fact and would otherwise read as a rejection of the right answer.
-            verdict = "refused" if not candidate.accepted else "not chosen"
-            likeness = (
-                ""
-                if candidate.separation is None
-                else f", speakers {candidate.separation:.2f} alike"
-            )
-            report(
-                f"    {verdict} {candidate.k} speaker(s): {candidate.reason} "
-                f"(silhouette {candidate.silhouette:.2f}, stability "
-                f"{candidate.stability:.2f}{likeness})"
-            )
-    raw = diarized.raw_speaker_ids
-    final = diarized.speaker_ids
-    confirmed = diarized.confirmed_speaker_ids
-    provisional = diarized.uncertain_speaker_ids
-    if raw != final or provisional:
-        detail = (
-            f"; {len(provisional)} uncertain, not counted "
-            f"({', '.join(provisional)})"
-            if provisional
-            else ""
-        )
-        report(
-            f"  identities: pyannote reported {len(raw)} ({', '.join(raw)}); "
-            f"{len(confirmed)} established ({', '.join(confirmed) or 'none'}){detail}"
-        )
-    for uncertain_speaker in diarized.uncertain_speakers:
-        report(
-            f"  uncertain speaker: {uncertain_speaker.speaker_id} "
-            f"({uncertain_speaker.seconds:.1f}s; best similarity "
-            f"{uncertain_speaker.similarity:.2f}, margin "
-            f"{uncertain_speaker.margin:.2f}); not counted as an established character - "
-            + uncertain_speaker.reason
-        )
-    for unresolved in diarized.unresolved_speakers:
-        report(
-            f"  not established: {unresolved.speaker_id} "
-            f"({unresolved.seconds:.1f}s; best similarity "
-            f"{unresolved.similarity:.2f}, margin {unresolved.margin:.2f}) - "
-            + unresolved.reason
-        )
-    if diarized.undecided_performances:
-        report(
-            f"  undecided: {diarized.undecided_performances} performance(s) / "
-            f"{diarized.undecided_seconds:.1f}s could not be separated between two "
-            "identities; each keeps the attribution it had and is flagged for QC"
-        )
-    for reassignment in diarized.reassignments:
-        report(
-            f"  reassigned {reassignment.start:.2f}-{reassignment.end:.2f}s from "
-            f"{reassignment.original_speaker_id} to "
-            f"{reassignment.corrected_speaker_id} "
-            f"({reassignment.seconds:.1f}s; similarity {reassignment.similarity:.2f}, "
-            f"margin {reassignment.margin:.2f})"
-        )
-    scene_reports = tuple(diarized.windows)
-    if scene_reports:
-        separated = sum(1 for item in scene_reports if item.mode == "separated")
-        unresolved_scenes = [
-            item for item in scene_reports if item.mode == "unresolved"
-        ]
-        discovered_here = diarized.discovered_speakers
-        report(
-            f"  scenes: {len(scene_reports)} diarized on their own, {separated} placed "
-            f"the dialogue differently, "
-            f"{sum(1 for item in scene_reports if item.mode == 'agreed')} agreed with the "
-            f"film-wide attribution, "
-            f"{sum(1 for item in scene_reports if item.mode in ('kept', 'failed'))} "
-            "left the attribution alone"
-        )
-        if unresolved_scenes:
-            shown = ", ".join(
-                f"#{item.index} ({item.start:.1f}-{item.end:.1f}s)"
-                for item in unresolved_scenes[:6]
-            )
-            report(
-                f"  scenes: {len(unresolved_scenes)} of them heard fewer voices than the "
-                f"identities they hold ({shown}); a scene like that cannot confirm who "
-                "was speaking in it"
-            )
-        if discovered_here:
-            report(
-                f"  scenes: {len(discovered_here)} voice(s) the film-wide pass merged "
-                f"were accounted for in their own scene ({', '.join(discovered_here)})"
-            )
-    for merge in diarized.merges:
-        report(
-            f"  speaker merge: {merge.from_speaker_id} into {merge.to_speaker_id} "
-            f"({merge.similarity:.2f} alike; one person found twice)"
-        )
-    for suspect in diarized.merge_suspects:
-        if suspect.same_voice:
-            report(
-                f"  merge suspect: {suspect.speaker_ids[0]} and "
-                f"{suspect.speaker_ids[1]} are {suspect.similarity:.2f} alike, at or "
-                "above this film's own same-voice similarity - their lines will be "
-                "spoken in the same cloned voice, so either one character was found "
-                "twice or the film has one more character than the evidence allowed"
-            )
-            continue
-        report(
-            f"  merge suspect: {suspect.speaker_ids[0]} and {suspect.speaker_ids[1]} "
-            f"are {suspect.similarity:.2f} alike; left separate on purpose"
-        )
-    if diarized.registry_error:
-        report(f"  speaker registry: {diarized.registry_error}")
     if crosstalk:
         report(
             f"  crosstalk: {len(crosstalk)} region(s), "
@@ -910,31 +666,22 @@ def run_pipeline(
             require_reference_transcript=True,
         )
         profiles = build.profiles
-        uncertain_ids = set(diarized.uncertain_speaker_ids)
-        # An uncertain identity is still a real voice in the film, so it keeps its own
-        # stitched reference rather than a stand-in voice: the identity is what is in
-        # doubt, never the fact that those seconds are the actor's own.
-        for speaker_id in sorted(uncertain_ids & set(profiles)):
-            report(
-                f"  {speaker_id}: cloned from its own short performance, although its "
-                "identity is not established"
-            )
         for unusable in build.unusable:
+            # A character the film never gave four clean seconds is still in the dub;
+            # saying so is what keeps a designed voice from looking like a bug.
             report(
-                f"  {unusable.speaker_id}: no actor reference at all "
-                f"({unusable.reason}); its lines will be left unsaid rather than spoken "
-                "in another voice, and the rest of the film is dubbed"
+                f"  {unusable.speaker_id}: designed voice, no actor reference "
+                f"({unusable.reason})"
             )
-        if not profiles:
+        if not profiles and not build.unusable:
             raise EmptyStageError(
                 "no voice profile could be built from the dialogue stem; the TTS stage "
                 "needs one identity reference per speaker"
             )
-        stitched = [item for item in profiles.values() if item.composite]
         report(
-            "  voice references: every character is spoken in the actor's own voice - "
-            f"{len(profiles) - len(stitched)} from a continuous interval, "
-            f"{len(stitched)} stitched from their own short turns"
+            "  voice references: using clean, transcript-matched film-actor audio "
+            "(one continuous 4-10 second interval per character; "
+            "Amharic-tuned OmniVoice)"
         )
         for speaker_id, profile in profiles.items():
             pitch = (
@@ -994,18 +741,8 @@ def run_pipeline(
             clips,
             output_dir=run_dir,
             settings=resolved,
-            crosstalk=diarized.crosstalk,
         )
     )
-
-    overlapping = [line for line in alignment if line.deliberate_overlap > 0.0]
-    if overlapping:
-        report(
-            f"  overlap: {len(overlapping)} line(s) deliberately sound under the line "
-            f"before them ({sum(line.deliberate_overlap for line in overlapping):.2f}s "
-            "in total) because the film had both characters speaking at once; each one is "
-            "recorded in the manifest"
-        )
 
     # Measured, because the one way the source language can survive into a finished
     # dub is the separator leaving it in the music or effects, which are re-mixed
@@ -1081,30 +818,7 @@ def run_pipeline(
         lines=lines,
         crosstalk=crosstalk,
         speaker_corrections=speaker_corrections,
-        raw_speakers=diarized.raw_speaker_ids,
-        calibration=diarized.calibration,
-        reclustering=diarized.reclustering,
-        evidence_units=diarized.units,
-        evidence_seconds=diarized.unit_seconds,
-        reassignments=tuple(diarized.reassignments),
-        windows=tuple(diarized.windows),
-        uncertain_speakers=tuple(diarized.uncertain_speakers),
-        confirmed_speakers=diarized.confirmed_speaker_ids,
-        unresolved_speakers=tuple(diarized.unresolved_speakers),
-        undecided_performances=diarized.undecided_performances,
-        undecided_seconds=diarized.undecided_seconds,
-        merge_suspects=tuple(diarized.merge_suspects),
-        speaker_merges=tuple(diarized.merges),
-        discovered_speakers=tuple(diarized.discovered_speakers),
-        unmeasured_turns=diarized.unmeasured_turns,
-        speaker_registry=(
-            Path(diarized.registry_path) if diarized.registry_path else None
-        ),
-        registry_error=diarized.registry_error,
-        speaker_count_configured=(
-            resolved.diarization_min_speakers is not None
-            or resolved.diarization_max_speakers is not None
-        ),
+        speaker_splits=speaker_splits,
         dialogue=dialogue,
         profiles=dict(profiles),
         clips=clips,
@@ -1143,21 +857,10 @@ def run_pipeline(
         crosstalk=result.crosstalk,
         transcribe=transcriber,
         transcription_model=resolved.transcription_model,
-        reference_pitch=_reference_pitches(result.profiles),
     )
     # Which hard cases the material actually contains. A run can score well simply
     # because it was easy, so this says what was *not* exercised.
     coverage = evaluation.measure_coverage(result.dialogue, crosstalk=result.crosstalk)
-
-    # Said out loud before the summary, because it is the one check that decides whether
-    # the characters are distinguishable at all in the finished audio.
-    if quality.voice_identity is not None:
-        report(f"  voice identity: {quality.voice_identity.summary()}")
-        if not quality.voice_identity.ok:
-            report(
-                "  voice identity: WARNING the dub does not reproduce the actors' "
-                "voices - listen to the named characters before shipping it"
-            )
 
     _write_manifest(
         result,
@@ -1219,20 +922,6 @@ def _engine_note(settings: Settings) -> str:
     )
 
 
-def _reference_pitches(profiles: Mapping[str, Any]) -> dict[str, float]:
-    """Return each character's reference pitch, for the generated-voice check.
-
-    A profile without a pitch estimate cannot take part in the comparison, so it is left
-    out rather than guessed at.
-    """
-
-    return {
-        speaker_id: float(profile.estimated_pitch_hz)
-        for speaker_id, profile in profiles.items()
-        if getattr(profile, "estimated_pitch_hz", None)
-    }
-
-
 def _write_manifest(
     result: PipelineResult,
     *,
@@ -1247,7 +936,6 @@ def _write_manifest(
         dialogue=result.dialogue,
         clips=result.clips,
         crosstalk=result.crosstalk,
-        reference_pitch=_reference_pitches(result.profiles),
     )
     exercised = (
         coverage
