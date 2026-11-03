@@ -64,7 +64,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -299,10 +299,10 @@ change of tone inside the sentence is not lost.
 
 Return exactly one JSON object matching this schema, with every input id copied
 exactly once and in order. Do not add, omit, merge, split, or reorder lines or fields.
-Return no prose, markdown, or code fences:
-{"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,
-"delivery":"...","pause_before":0.0,"pause_after":0.0,
-"beats":[{"part":1,"emotion":"...","intensity":0.0,"delivery":"..."}]}]}
+Return no prose, markdown, or code fences. Every string value must be on ONE line:
+never put a raw newline, tab or other control character inside a string, and never wrap
+the object across lines inside a value:
+{"lines":[{"id":"<id>","amharic":"...","emotion":"...","intensity":0.0,"delivery":"...","pause_before":0.0,"pause_after":0.0,"beats":[{"part":1,"emotion":"...","intensity":0.0,"delivery":"..."}]}]}
 """
 
 
@@ -374,6 +374,84 @@ def _required_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidSegmentError(f"{name} must be a non-empty string")
     return value.strip()
+
+
+#: Control characters that may not appear inside a value we accept from a model. A raw
+#: newline or tab in JSON is what a model produces when it wraps a long string, and it is
+#: the one thing that makes an otherwise sound reply unparseable.
+_CONTROL_CHARACTERS = frozenset(chr(code) for code in range(0x20)) | {"\x7f"}
+
+
+def _single_line(value: object) -> object:
+    """Return a text field flattened onto one line, with its words intact.
+
+    A control character inside a value is never meaningful in dialogue: it is a raw
+    newline or tab the model used to wrap the string. Collapsing it to a single space
+    keeps the words and produces text the voice engine can actually read, where keeping
+    the character would leave a newline inside a line that is synthesized in one go.
+    """
+
+    if not isinstance(value, str):
+        return value
+    if not any(character in _CONTROL_CHARACTERS for character in value):
+        return value
+    flattened = "".join(
+        " " if character in _CONTROL_CHARACTERS else character for character in value
+    )
+    return " ".join(flattened.split())
+
+
+def _normalise_reply_line(line: Any) -> Any:
+    """Return one model line with every text field on a single line.
+
+    Applied to every line before it is validated, so a raw control character is repaired
+    where it happened rather than being carried into the dialogue, the manifest or the
+    synthesizer. It reports nothing on its own: the caller has already reported that the
+    reply needed repairing.
+    """
+
+    if not isinstance(line, Mapping):
+        return line
+    cleaned = dict(line)
+    for field in ("amharic", "emotion", "delivery"):
+        if field in cleaned:
+            cleaned[field] = _single_line(cleaned[field])
+    beats = cleaned.get("beats")
+    if isinstance(beats, list):
+        cleaned["beats"] = [
+            {
+                **beat,
+                "emotion": _single_line(beat.get("emotion")),
+                "delivery": _single_line(beat.get("delivery")),
+            }
+            if isinstance(beat, Mapping)
+            else beat
+            for beat in beats
+        ]
+    return cleaned
+
+
+def _reply_needs_repair(line: Any) -> bool:
+    """Return whether ``line`` carries a control character inside one of its strings."""
+
+    if not isinstance(line, Mapping):
+        return False
+
+    def dirty(value: Any) -> bool:
+        return isinstance(value, str) and any(
+            character in _CONTROL_CHARACTERS for character in value
+        )
+
+    if any(dirty(line.get(field)) for field in ("amharic", "emotion", "delivery")):
+        return True
+    beats = line.get("beats")
+    if isinstance(beats, list):
+        return any(
+            isinstance(beat, Mapping)
+            and (dirty(beat.get("emotion")) or dirty(beat.get("delivery")))
+            for beat in beats
+        )
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -717,7 +795,11 @@ def _parts_payload(segment: TranscriptSegment | DialogueSentence) -> dict[str, A
         return {}
     return {
         "parts": [
-            {"part": index, "duration": round(part.duration, 3), "text": part.text}
+            {
+                "part": index,
+                "duration": round(part.duration, 3),
+                "text": _single_line(part.text),
+            }
             for index, part in enumerate(parts, start=1)
         ]
     }
@@ -750,7 +832,10 @@ def _request_kwargs(
                 "id": line_id,
                 "speaker": segment.speaker_id,  # context only; never returned
                 "duration": round(segment.duration, 3),
-                "text": segment.text,
+                # Flattened before it is sent: a transcript line that carries a raw
+                # newline or tab teaches the model to put one inside the string it
+                # writes back, which is exactly what makes a reply unparseable.
+                "text": _single_line(segment.text),
                 **(
                     {"syllable_budget": budget.syllables}
                     if budgets is not None
@@ -920,30 +1005,102 @@ def _json_object(content: str) -> Any:
     sentence of preamble. Losing a whole film's run to that would be a poor trade, so
     the outermost ``{...}`` is tried when the reply is not already valid JSON.
 
-    This is deliberately narrow: it accepts a JSON object that is *wrapped*, and nothing
-    else. A reply that is not a JSON object still fails with the original error, so a
-    model that genuinely cannot follow the protocol is not quietly accepted.
+    Parsing is *lenient about control characters*: a reply may carry a literal newline or
+    tab inside a string - an Amharic line wrapped across two lines, or a stray ``\\t`` -
+    and ``json.loads`` rejects those by default even though the object is otherwise
+    sound. Rejecting a batch of ten translated lines over one raw newline is the parser
+    being stricter than the protocol, and it cost a run exactly that way.
+
+    This is deliberately narrow: it accepts a JSON object that is *wrapped* or that
+    carries an unescaped control character, and nothing else. A reply that is not a JSON
+    object still fails with the original error, so a model that genuinely cannot follow
+    the protocol is not quietly accepted.
     """
 
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        return json.loads(content[start : end + 1])
+    text = content.lstrip("\ufeff")
+    attempts = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        attempts.append(text[start : end + 1])
+
+    failure: json.JSONDecodeError | None = None
+    for attempt in attempts:
+        try:
+            return json.loads(attempt, strict=False)
+        except json.JSONDecodeError as exc:
+            failure = exc
+    assert failure is not None
+    raise failure
+
+
+def _salvage_line_objects(content: str, ids: Sequence[str]) -> list[Any]:
+    """Return the individual line objects recoverable from a broken reply.
+
+    A reply can be unreadable *as a whole* and still hold every line: a truncated
+    closing brace, a stray character after the object, a fence that never closes. Each
+    ``{...}`` in the text is therefore tried on its own, and the ones that are a dialogue
+    line with an id the request asked for are kept. Nothing is invented: an object that
+    does not parse is simply not recovered, and its line goes to the repair request like
+    any other malformed line.
+    """
+
+    wanted = set(ids)
+    recovered: list[Any] = []
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    for position, character in enumerate(content):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            if in_string:
+                escaped = True
+            continue
+        if character == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if character == "{":
+            stack.append(position)
+            continue
+        if character != "}" or not stack:
+            continue
+        start = stack.pop()
+        try:
+            candidate = json.loads(content[start : position + 1], strict=False)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        raw_id = candidate.get("id")
+        if isinstance(raw_id, str) and raw_id.strip() in wanted:
+            recovered.append(candidate)
+    # The stack unwinds innermost first, so the lines come back in reverse.
+    recovered.reverse()
+    return recovered
 
 
 def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
-    """Parse and validate the model's JSON, returning ``{dialogue_id: line}``."""
+    """Parse and validate the model's JSON, returning ``{dialogue_id: line}``.
+
+    A reply that cannot be read as a whole is salvaged line by line, and a line the model
+    left out of an otherwise usable reply is returned as ``None`` so the caller's repair
+    path can ask for it again. A single bad character or one omitted line must not cost
+    the batch: that is a hole in the dub, not a protocol failure.
+    """
 
     try:
         payload = _json_object(content)
     except json.JSONDecodeError as exc:
-        raise MalformedResponseError(
-            f"the model did not return valid JSON: {exc}"
-        ) from exc
+        salvaged = _salvage_line_objects(content, ids)
+        if not salvaged:
+            raise MalformedResponseError(
+                f"the model did not return valid JSON: {exc}"
+            ) from exc
+        payload = {"lines": salvaged}
 
     if not isinstance(payload, dict):
         raise MalformedResponseError(
@@ -983,12 +1140,16 @@ def _parse_response(content: str, ids: list[str]) -> dict[str, Any]:
         found[line_id] = line
 
     missing = [line_id for line_id in ids if line_id not in found]
-    if missing:
+    if missing and not found:
         raise DialogueIdError(
             f"the model returned {len(found)} of {len(ids)} dialogue lines; missing "
             + ", ".join(missing[:5])
             + (" ..." if len(missing) > 5 else "")
         )
+    # A partial reply is repairable: the line is handed back empty, which the caller
+    # treats as a malformed line - it asks for that line alone once, then salvages.
+    for line_id in missing:
+        found[line_id] = None
 
     return found
 
@@ -1160,8 +1321,17 @@ def _build(
     that echoes its own speaker or timestamps cannot influence the result. Any
     unacceptable model field is reported as invalid model output rather than as a
     plain validation error.
+
+    ``line`` is ``None`` when the model left this id out of an otherwise usable reply;
+    that is a malformed *line*, so it goes to the repair path with the others rather
+    than ending the batch.
     """
 
+    if not isinstance(line, Mapping):
+        raise InvalidModelOutputError(
+            f"the model returned no adaptation for {line_id!r}"
+        )
+    line = _normalise_reply_line(line)
     try:
         beats = _beats_from(
             line.get("beats"),
@@ -1248,6 +1418,7 @@ def _salvage_adaptation(
     """
 
     text = payload.get("amharic") if isinstance(payload, dict) else None
+    text = _single_line(text) if text is not None else None
     try:
         return AdaptedDialogue(
             speaker_id=segment.speaker_id,
@@ -1424,7 +1595,24 @@ def _request_lines(
             f"{time.perf_counter() - request_started:.1f}s"
         )
 
-    return _parse_response(_response_content(response), ids)
+    content = _response_content(response)
+    parsed = _parse_response(content, ids)
+    # A control character inside a value is repaired, and said out loud: silently
+    # accepting it would hide a model that keeps wrapping its strings across lines,
+    # which is what makes the *next* reply unparseable.
+    repaired = [
+        line_id for line_id, line in parsed.items() if _reply_needs_repair(line)
+    ]
+    if repaired and on_progress is not None:
+        shown = ", ".join(repaired[:5])
+        if len(repaired) > 5:
+            shown += f", and {len(repaired) - 5} more"
+        on_progress(
+            f"  translation: {len(repaired)} line(s) came back with a raw control "
+            f"character inside a field ({shown}); it was flattened to a space, and the "
+            "text is otherwise unchanged"
+        )
+    return parsed
 
 
 def _repair_adaptations(

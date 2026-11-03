@@ -685,10 +685,19 @@ def run_pipeline(
         for candidate in outcome.candidates:
             if candidate.chosen:
                 continue
+            # "refused" means a gate said no; a candidate that passed every gate and
+            # simply was not the finest partition was *not chosen*, which is a different
+            # fact and would otherwise read as a rejection of the right answer.
+            verdict = "refused" if not candidate.accepted else "not chosen"
+            likeness = (
+                ""
+                if candidate.separation is None
+                else f", speakers {candidate.separation:.2f} alike"
+            )
             report(
-                f"    refused {candidate.k} speaker(s): {candidate.reason} "
+                f"    {verdict} {candidate.k} speaker(s): {candidate.reason} "
                 f"(silhouette {candidate.silhouette:.2f}, stability "
-                f"{candidate.stability:.2f})"
+                f"{candidate.stability:.2f}{likeness})"
             )
     raw = diarized.raw_speaker_ids
     final = diarized.speaker_ids

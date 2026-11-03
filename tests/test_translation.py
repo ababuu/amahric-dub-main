@@ -1719,6 +1719,132 @@ def test_model_values_are_used_for_the_amharic_and_performance_fields(monkeypatc
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# a reply that is not clean JSON
+# ---------------------------------------------------------------------------
+
+
+def test_a_raw_newline_inside_a_string_does_not_lose_the_batch(monkeypatch):
+    """The reported failure: one unescaped control character killed nine batches.
+
+    A model that wraps a long Amharic line writes a literal newline inside the string,
+    which ``json.loads`` rejects by default. The object is otherwise sound, so it is
+    read, the newline is flattened to a space, and the lines are kept.
+    """
+
+    _patch(monkeypatch)
+    segments = [_segment(), _segment(start=12.0, end=14.0, text="Second line.")]
+
+    def transform(body):
+        body["lines"][1]["amharic"] = "የመጀመሪያው መስመር\nየሁለተኛው ክፍል"
+        return body
+
+    def build(request):
+        body = {"lines": FakeOpenAI._default_lines(request)}
+        body = transform(body)
+        # A model writing the string itself emits the newline raw.
+        text = json.dumps(body, ensure_ascii=False).replace("\\n", "\n")
+        return FakeResponse(text)
+
+    monkeypatch.setattr(FakeOpenAI, "_build_response", staticmethod(build))
+    adapted = adapt_dialogue(segments, settings=_settings())
+
+    assert len(adapted) == 2
+    assert "\n" not in adapted[1].amharic
+    assert adapted[1].amharic == "የመጀመሪያው መስመር የሁለተኛው ክፍል"
+
+
+def test_a_control_character_repair_is_reported(monkeypatch):
+    """Repairing silently would hide a model that keeps producing unparseable replies."""
+
+    _patch(monkeypatch)
+    messages: list[str] = []
+
+    def build(request):
+        body = {"lines": FakeOpenAI._default_lines(request)}
+        body["lines"][0]["delivery"] = "calm\tand\tquiet"
+        text = json.dumps(body, ensure_ascii=False).replace("\\t", "\t")
+        return FakeResponse(text)
+
+    monkeypatch.setattr(FakeOpenAI, "_build_response", staticmethod(build))
+    adapted = adapt_dialogue(
+        [_segment()], settings=_settings(), on_progress=messages.append
+    )
+
+    assert adapted[0].delivery == "calm and quiet"
+    assert any("raw control character" in message for message in messages)
+
+
+def test_a_truncated_reply_keeps_the_lines_that_are_intact(monkeypatch):
+    """A reply can be unreadable as a whole and still hold every line."""
+
+    _patch(monkeypatch)
+    segments = [_segment(), _segment(start=12.0, end=14.0, text="Second line.")]
+
+    def build(request):
+        body = {"lines": FakeOpenAI._default_lines(request)}
+        text = json.dumps(body, ensure_ascii=False)
+        # The closing brace of the envelope never arrives.
+        return FakeResponse(text[:-2])
+
+    monkeypatch.setattr(FakeOpenAI, "_build_response", staticmethod(build))
+    adapted = adapt_dialogue(segments, settings=_settings())
+
+    assert len(adapted) == 2
+    assert adapted[0].amharic.startswith("የአማርኛ")
+    assert adapted[1].amharic.startswith("የአማርኛ")
+
+
+def test_a_line_the_model_left_out_is_asked_for_again(monkeypatch):
+    """One omitted line is a repairable line, not a broken batch."""
+
+    _patch(monkeypatch)
+    segments = [
+        _segment(),
+        _segment(start=12.0, end=14.0, text="Second line."),
+    ]
+    calls = {"count": 0}
+
+    def build(request):
+        calls["count"] += 1
+        lines = FakeOpenAI._default_lines(request)
+        if calls["count"] == 1:
+            lines = lines[:-1]  # the model forgot the last line
+        return FakeResponse(json.dumps({"lines": lines}, ensure_ascii=False))
+
+    monkeypatch.setattr(FakeOpenAI, "_build_response", staticmethod(build))
+    adapted = adapt_dialogue(segments, settings=_settings())
+
+    assert len(adapted) == 2
+    assert adapted[1].amharic.startswith("የአማርኛ")
+    assert calls["count"] == 2
+
+
+def test_source_text_is_sent_on_one_line(monkeypatch):
+    """A newline in the input teaches the model to put one in its answer."""
+
+    _patch(monkeypatch)
+    adapt_dialogue(
+        [_segment(text="I told him.\nHe did not listen.")], settings=_settings()
+    )
+
+    sent = _sent_lines(FakeOpenAI.requests[0])[0]
+    assert "\n" not in sent["text"]
+    assert sent["text"] == "I told him. He did not listen."
+
+
+def test_the_schema_example_is_not_wrapped_across_lines():
+    """The prompt is the model's model of JSON; it must not demonstrate wrapping."""
+
+    schema = translation.SYSTEM_PROMPT.split("Return exactly one JSON object")[1]
+
+    assert '"delivery":"..."' in schema
+    assert "control character" in schema
+    for line in schema.splitlines()[1:]:
+        if line.strip().startswith('"delivery"'):
+            raise AssertionError("the schema example is wrapped across lines")
+
+
 def test_malformed_json_is_rejected(monkeypatch):
     _patch(monkeypatch)
     FakeOpenAI.raw = "this is not json"
