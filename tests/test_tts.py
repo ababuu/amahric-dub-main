@@ -438,8 +438,8 @@ def test_unordered_dialogue_is_rejected(rig: Rig) -> None:
         rig.run(_line(start=20.0, end=22.0), _line(start=10.0, end=12.0))
 
 
-def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
-    """An engine that cannot design a voice must not borrow another character's."""
+def test_a_lone_unprofiled_speaker_is_an_error_not_a_silent_run(rig: Rig) -> None:
+    """Nothing can be spoken at all, so the stage says so instead of producing silence."""
 
     with pytest.raises(MissingVoiceProfileError, match="SPEAKER_09"):
         synthesize_dialogue(
@@ -451,27 +451,37 @@ def test_missing_voice_profile_is_rejected(rig: Rig) -> None:
 
 
 # ---------------------------------------------------------------------------
-# designed voices: a character the film gave no usable reference
+# a character with no reference at all
 # ---------------------------------------------------------------------------
 
 
-def test_a_speaker_without_any_profile_stops_the_run(rig: Rig) -> None:
-    """No designed stand-in: a character is spoken in their own voice or not at all.
+def test_a_speaker_without_a_profile_has_its_lines_skipped(rig: Rig) -> None:
+    """No designed stand-in, and no dead film either.
 
     A speaker with no profile has no audio in the film to imitate, so there is nothing
-    honest to speak them with. The run says which speaker is missing instead of quietly
-    inventing a voice that is not theirs.
+    honest to speak them with. Their lines are left unsaid and named in ``skipped``,
+    because stopping the run would leave every other character undubbed as well.
     """
 
     rig.engine = FakeDesigningEngine(events=rig.events)
 
-    with pytest.raises(tts.MissingVoiceProfileError, match="SPEAKER_09"):
-        tts.synthesize_dialogue_detailed(
-            [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
-        )
+    result = tts.synthesize_dialogue_detailed(
+        [
+            _line(speaker_id=rig.profile.speaker_id),
+            _line(speaker_id="SPEAKER_09", start=10.0, end=12.0),
+        ],
+        rig.stem,
+        {rig.profile.speaker_id: rig.profile},
+        settings=rig.settings(),
+    )
 
-    # Nothing was synthesized, and no designed voice was assigned.
-    assert rig.engine.calls == []
+    assert [line.speaker_id for line in result.clips] == [rig.profile.speaker_id]
+    assert [item.speaker_id for item in result.skipped] == ["SPEAKER_09"]
+    reason = result.skipped[0].reason
+    assert "no audio in the film" in reason
+    assert "another character" in reason
+    # No designed voice was assigned to the character without a reference.
+    assert not any(voice.speaker_id == "SPEAKER_09" for voice in result.designed)
 
 
 def test_the_error_names_the_setting_that_builds_the_missing_profile(rig: Rig) -> None:
@@ -479,10 +489,7 @@ def test_the_error_names_the_setting_that_builds_the_missing_profile(rig: Rig) -
 
     with pytest.raises(tts.MissingVoiceProfileError, match="build_voice_profiles"):
         tts.synthesize_dialogue_detailed(
-            [_line(), _line(speaker_id="SPEAKER_09", start=10.0, end=12.0)],
-            rig.stem,
-            {rig.profile.speaker_id: rig.profile},
-            settings=rig.settings(),
+            [_line(speaker_id="SPEAKER_09")], rig.stem, {}, settings=rig.settings()
         )
 
 

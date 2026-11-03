@@ -341,6 +341,13 @@ class PipelineResult:
                     "selection_reason": profile.selection_reason,
                     "estimated_vocal_presentation": profile.estimated_vocal_presentation,
                     "estimated_pitch_hz": profile.estimated_pitch_hz,
+                    # How the reference was obtained: one continuous performance or
+                    # several short turns stitched together, and how much of it is real
+                    # speech as opposed to silence padded on to reach the engine's floor.
+                    "composite": profile.composite,
+                    "reference_spans": [list(span) for span in profile.reference_spans],
+                    "reference_speech_seconds": profile.reference_speech_seconds,
+                    "reference_padding_seconds": profile.reference_padding_seconds,
                 }
                 for speaker_id, profile in self.profiles.items()
             },
@@ -878,8 +885,8 @@ def run_pipeline(
         for unusable in build.unusable:
             report(
                 f"  {unusable.speaker_id}: no actor reference at all "
-                f"({unusable.reason}); the run will stop rather than speak them in "
-                "another voice"
+                f"({unusable.reason}); its lines will be left unsaid rather than spoken "
+                "in another voice, and the rest of the film is dubbed"
             )
         if not profiles:
             raise EmptyStageError(

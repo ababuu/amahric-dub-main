@@ -2311,6 +2311,10 @@ def synthesize_dialogue_detailed(
         )
 
     designed: dict[str, str] = {}
+    #: Speakers whose lines cannot be spoken in their own voice, and the reason reported
+    #: for each of their lines. Empty for a single-voice engine, which needs no profiles.
+    unprofiled: set[str] = set()
+    unprofiled_reason = ""
     if single_voice:
         # A single-voice engine has no use for voice profiles, and requiring them
         # would mean building identities the engine cannot honour.
@@ -2324,24 +2328,36 @@ def synthesize_dialogue_detailed(
 
         # Nobody is spoken in a voice that is not theirs. A character whose turns are all
         # short gets a reference stitched from those turns (see
-        # voice_profiles._composite_reference); a character with *no* profile at all has
-        # no audio in the film to imitate, and there is nothing honest left to speak them
-        # with, so the run stops and says which speaker is missing.
-        unprofiled = [speaker_id for speaker_id in speakers if speaker_id not in profiles]
-        if unprofiled:
+        # voice_profiles._composite_reference), so a speaker can only arrive here without
+        # a profile when the film holds no usable audio of them at all. Their lines are
+        # then left unsaid and reported, because ending the whole film over one character
+        # would leave every other character undubbed too.
+        unprofiled = {
+            speaker_id for speaker_id in speakers if speaker_id not in profiles
+        }
+        if unprofiled and len(unprofiled) == len(speakers):
             raise MissingVoiceProfileError(
-                f"speaker {unprofiled[0]!r} has no voice profile; build one with "
+                "no speaker has a voice profile ("
+                + ", ".join(sorted(unprofiled))
+                + "); build them with "
                 "app.pipeline.voice_profiles.build_voice_profiles first. A designed "
                 "stand-in voice is deliberately not used: every character is spoken in "
                 "the actor's own voice, however short their performance"
             )
+        unprofiled_reason = (
+            "this character has no audio in the film that could be used as a voice "
+            "reference, so the line is left unsaid rather than spoken in another "
+            "character's voice"
+        )
 
         # Validate the reference audio of every speaker that is about to be used
         # before any model runs: a missing reference should fail the run the same way
         # whether or not earlier lines could already be synthesized.
         identities: dict[str, str] = {}
         for speaker_id in speakers:
-            profile = profiles[speaker_id]
+            profile = profiles.get(speaker_id)
+            if profile is None:
+                continue
             reference = profile.resolve_reference_audio()
             _validate_audio_file(
                 reference, label=f"the voice reference of speaker {speaker_id!r}"
@@ -2389,6 +2405,8 @@ def synthesize_dialogue_detailed(
     short_windows: list[int] = []
     for index, line in enumerate(lines):
         reason = _skip_reason(line)
+        if reason is None and line.speaker_id in unprofiled:
+            reason = unprofiled_reason
         if reason is not None:
             skipped.append(
                 SkippedLine(

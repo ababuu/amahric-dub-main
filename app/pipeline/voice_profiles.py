@@ -510,6 +510,10 @@ class VoiceProfile:
     #: Seconds of actual speech in the reference, excluding any silence padded on to
     #: reach :data:`REFERENCE_CLONE_FLOOR`.
     reference_speech_seconds: float = 0.0
+    #: Seconds of silence appended to a stitched reference to reach the length the engine
+    #: clones from. Silence carries no voice, so it is what lets a character with a single
+    #: short line still be cloned from their own performance.
+    reference_padding_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_id, str) or not self.speaker_id.strip():
@@ -532,14 +536,16 @@ class VoiceProfile:
         if self.composite:
             # A stitched reference comes from separate stretches of the film, so its
             # timeline span says nothing about how much audio it holds: the audio length
-            # is what the engine sees, and that is what is bounded here.
+            # is what the engine sees, and that is what is bounded here. The padding
+            # counts, because it is real audio in the file the engine is handed - and it
+            # is silence, which cannot make a clone sound like anybody else.
             duration = (
                 self.reference_speech_seconds
                 if self.reference_speech_seconds > 0.0
                 else sum(
                     max(0.0, stop - begin) for begin, stop in self.reference_spans
                 )
-            )
+            ) + self.reference_padding_seconds
         if not MIN_REFERENCE_DURATION <= duration <= MAX_REFERENCE_DURATION:
             raise InvalidProfileError(
                 f"the reference for {self.speaker_id!r} is {duration:.3f}s long; voice cloning "
@@ -596,12 +602,21 @@ class VoiceProfile:
 
     @property
     def reference_duration(self) -> float:
-        """Length of the reference window in seconds.
+        """Length of the reference audio in seconds.
 
-        Derived from the timestamps rather than stored, so a profile can never
-        disagree with itself about how long its reference is.
+        For a continuous reference this is the window's own span. For a stitched one the
+        timeline span says nothing - the stretches come from all over the film - so the
+        length of the audio the engine is handed is reported instead: the speech plus the
+        silence padded on to reach the clone floor.
         """
 
+        if self.composite:
+            speech = (
+                self.reference_speech_seconds
+                if self.reference_speech_seconds > 0.0
+                else sum(max(0.0, stop - begin) for begin, stop in self.reference_spans)
+            )
+            return speech + self.reference_padding_seconds
         return self.reference_end - self.reference_start
 
     def resolve_reference_audio(self) -> Path:
@@ -640,6 +655,7 @@ class VoiceProfile:
             "composite": self.composite,
             "reference_spans": [list(span) for span in self.reference_spans],
             "reference_speech_seconds": self.reference_speech_seconds,
+            "reference_padding_seconds": self.reference_padding_seconds,
         }
 
     @classmethod
@@ -684,6 +700,9 @@ class VoiceProfile:
             ),
             reference_speech_seconds=float(
                 payload.get("reference_speech_seconds", 0.0)  # type: ignore[arg-type]
+            ),
+            reference_padding_seconds=float(
+                payload.get("reference_padding_seconds", 0.0)  # type: ignore[arg-type]
             ),
         )
 
@@ -1862,6 +1881,41 @@ class _CompositeReference:
         return reason
 
 
+def _clean_pieces(
+    segment: SpeakerSegment, regions: Iterable[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Return the parts of a turn that no other speaker is talking over.
+
+    A turn only has to *touch* crosstalk for the whole of it to be unusable as a
+    reference: cloning from a window that holds two voices teaches the model both. But
+    discarding the whole turn is what leaves a character who speaks mostly under someone
+    else with no reference at all, so the overlap is subtracted and the clean remainder
+    is kept.
+    """
+
+    pieces: list[tuple[float, float]] = [(segment.start, segment.end)]
+    for begin, stop in regions:
+        if stop <= segment.start or begin >= segment.end:
+            continue
+        remainder: list[tuple[float, float]] = []
+        for piece_start, piece_stop in pieces:
+            if stop <= piece_start + _COMPOSITE_EDGE_TOLERANCE or begin >= (
+                piece_stop - _COMPOSITE_EDGE_TOLERANCE
+            ):
+                remainder.append((piece_start, piece_stop))
+                continue
+            if begin > piece_start + _COMPOSITE_EDGE_TOLERANCE:
+                remainder.append((piece_start, min(begin, piece_stop)))
+            if stop < piece_stop - _COMPOSITE_EDGE_TOLERANCE:
+                remainder.append((max(stop, piece_start), piece_stop))
+        pieces = remainder
+    return [
+        (begin, stop)
+        for begin, stop in pieces
+        if stop - begin > _COMPOSITE_EDGE_TOLERANCE
+    ]
+
+
 def _composite_reference(
     speaker_id: str,
     own: list[SpeakerSegment],
@@ -1874,11 +1928,15 @@ def _composite_reference(
 ) -> _CompositeReference | None:
     """Assemble the speaker's own turns into one reference, or ``None`` if impossible.
 
-    Turns that overlap another speaker are skipped: a stitch is a join, and a join
-    across crosstalk would splice two voices into one identity - the exact failure this
-    whole path exists to avoid. Turns with no speech in them are skipped too, because a
-    stitch of silence is not a reference to anybody. The remaining turns are taken in
-    film order until the target length is reached.
+    This is the last resort before a character cannot be spoken in their own voice at
+    all, so it gives up only when the film holds no audio of them whatsoever:
+
+    * a turn that another speaker talks over contributes its clean remainder, and is
+      dropped whole only when there is no such remainder;
+    * a stretch with no measurable speech is set aside, but if it is the only audio the
+      speaker has it is used anyway - it is still their own recording, and the profile
+      says so;
+    * the turns are taken in film order until the target length is reached.
     """
 
     regions = list(contaminated)
@@ -1889,29 +1947,27 @@ def _composite_reference(
     for segment in sorted(own, key=lambda item: (item.start, item.end)):
         if len(chosen) >= MAX_COMPOSITE_SPANS or total >= target:
             break
-        if any(
-            segment.start < stop - _COMPOSITE_EDGE_TOLERANCE
-            and segment.end > begin + _COMPOSITE_EDGE_TOLERANCE
-            for begin, stop in regions
-        ):
+        pieces = _clean_pieces(segment, regions)
+        if not pieces:
             skipped += 1
             continue
-        if segment.duration <= _COMPOSITE_EDGE_TOLERANCE:
-            continue
-        room = maximum - total
-        if room <= _COMPOSITE_EDGE_TOLERANCE:
-            break
-        stop = min(segment.end, segment.start + room)
-        samples = reader.read(segment.start, stop)
-        if samples.size == 0:
-            silent += 1
-            continue
-        stats = _measure_window(samples, reader.sample_rate)
-        if stats.speech_ratio < MIN_SPEECH_RATIO:
-            silent += 1
-            continue
-        chosen.append((segment.start, stop))
-        total += stop - segment.start
+        for begin, stop in pieces:
+            if len(chosen) >= MAX_COMPOSITE_SPANS or total >= target:
+                break
+            room = maximum - total
+            if room <= _COMPOSITE_EDGE_TOLERANCE:
+                break
+            stop = min(stop, begin + room)
+            samples = reader.read(begin, stop)
+            if samples.size == 0:
+                silent += 1
+                continue
+            stats = _measure_window(samples, reader.sample_rate)
+            if stats.speech_ratio < MIN_SPEECH_RATIO:
+                silent += 1
+                continue
+            chosen.append((begin, stop))
+            total += stop - begin
     if not chosen:
         return None
 
@@ -2071,6 +2127,7 @@ def _build_composite_profile(
         composite=True,
         reference_spans=composite.spans,
         reference_speech_seconds=composite.speech_seconds,
+        reference_padding_seconds=composite.trailing_pad,
     )
 
 
@@ -2347,8 +2404,19 @@ def _build_profiles(
                 )
                 if composite is None:
                     # One character the film cannot describe is not a reason to abandon
-                    # the ones it can; the caller decides whether that is fatal.
-                    failures.append((speaker_id, error))
+                    # the ones it can; the caller decides whether that is fatal. The
+                    # candidate search already explains what it looked for, so the stitch
+                    # attempt only adds what it found instead.
+                    failures.append(
+                        (
+                            speaker_id,
+                            NoUsableReferenceError(
+                                f"{error}; stitching this speaker's own short turns "
+                                "found nothing usable either, so there is no recording of "
+                                "this character to clone from"
+                            ),
+                        )
+                    )
                     continue
                 profiles[speaker_id] = _build_composite_profile(
                     composite,
