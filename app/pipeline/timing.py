@@ -1,20 +1,26 @@
 """Timing alignment for dubbed dialogue.
 
-Each synthesized clip is fitted to the window of the line it replaces:
+Each synthesized clip is placed against the *active vocal zone* of the line it
+replaces, not against the diarizer's whole turn::
 
-* the **speech** of the line is time-stretched, pitch-preserving, to the length of
-  the original line, so the dub lands on the same beats as the performance;
-* the **rendered pauses** are left alone - they are deliberate silence, not slack
-  to be absorbed - so a line's leading pause still precedes the line;
-* a line that would need more than the configured tempo band is **reported** as
-  not fitting rather than mangled to fit, and the run records by how much;
-* a line that is still too long **moves the next line later** instead of being
-  spoken over it, so two voices are never heard at once unless the source put
-  them there.
+    original turn:  [ ... silence ... ][ actor speaking ][ ... silence ... ]
+    synthesized:              [ Amharic speech ]      -> placed on the actor's zone
+    delivered:      [ ... silence ... ][ Amharic ][ ... silence ... ]
+
+* the **speech** is left at its natural cadence whenever it fits. Time-stretching is
+  applied only when the line cannot fit even with the silence after it, and then only
+  within the configured tempo band - a dub that is uniformly sped up is the artefact
+  this stage exists to avoid;
+* the window's own silence is **written around** the speech, so the line still lands on
+  the picture even when the Amharic is shorter than the performance it replaces;
+* a line that is still too long is **reported** as not fitting rather than mangled to
+  fit, and **moves the next line later** instead of being spoken over it, so two
+  voices are never heard at once unless the source put them there.
 
 The result of this stage is one aligned WAV per line at the pipeline sample rate,
 plus where to place it in the timeline, which is exactly what
-:mod:`app.pipeline.mixing` consumes.
+:mod:`app.pipeline.mixing` consumes. Lines are produced one at a time by
+:func:`iter_aligned`, so mixing can start consuming before the last line is fitted.
 
 Deliberate non-goals
 --------------------
@@ -23,17 +29,18 @@ Deliberate non-goals
   shift every voice up or down, which is never wanted.
 * **No fitting across the tempo band.** Nothing here silently rewrites what the
   dialogue model asked for: a clamped stretch is recorded on the clip.
-* **No padding to fill a window.** A short line keeps its natural delivery and is
-  placed at its original start; the gap that follows is silence, not stretched
-  speech.
+* **No padding *with* stretched speech.** A short line keeps its natural delivery; the
+  gap that follows is silence, not stretched audio.
 * **No touching of the clip files.** The clips remain the TTS stage's artifacts;
   the aligned audio is written beside them.
 """
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -69,6 +76,15 @@ ATEMPO_MAX = 2.0
 #: Length of the fade applied to the tail of a line that has to be cut short, in
 #: seconds. Long enough that the cut is inaudible, short enough not to lose a syllable.
 TRIM_FADE_SECONDS = 0.025
+
+#: Below this frame level there is only noise, whatever the local floor says. Without
+#: it a region of digital silence would make every frame look "active" against a floor
+#: of minus infinity.
+SILENCE_FLOOR_DBFS = -70.0
+
+#: Resolution of the active-zone scan. Short enough to see the gaps between words,
+#: long enough that a single sample cannot define the start of speech.
+ACTIVE_ZONE_FRAME_SECONDS = 0.02
 
 
 class TimingError(RuntimeError):
@@ -138,6 +154,15 @@ class AlignedClip:
     #: A drifted line is *late* rather than doubling another voice, which is the smaller
     #: cost: two voices at once is unintelligible, a late line is merely a little behind.
     drift: float = 0.0
+    #: Absolute start and end of the *active vocal zone* inside the original window: the
+    #: part of the actor's turn that actually contains speech, rather than the diarizer's
+    #: turn boundaries. The dub is placed against this, not against the whole window.
+    active_zone_start: float = 0.0
+    active_zone_end: float = 0.0
+    #: Silence padded before and after the fitted speech, in seconds. This is the time
+    #: the original line spent not speaking; it is filled rather than stretched.
+    silence_before: float = 0.0
+    silence_after: float = 0.0
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
@@ -172,6 +197,17 @@ class AlignedClip:
             number = _finite(name, getattr(self, name))
             if number <= 0:
                 raise InvalidClipError(f"{name} must be positive, got {number}")
+            object.__setattr__(self, name, number)
+
+        for name in (
+            "active_zone_start",
+            "active_zone_end",
+            "silence_before",
+            "silence_after",
+        ):
+            number = _finite(name, getattr(self, name))
+            if number < 0:
+                raise InvalidClipError(f"{name} must be >= 0, got {number}")
             object.__setattr__(self, name, number)
 
         if isinstance(self.notes, list):
@@ -234,6 +270,10 @@ class AlignedClip:
             "trimmed": self.trimmed,
             "overrun": self.overrun,
             "drift": self.drift,
+            "active_zone_start": self.active_zone_start,
+            "active_zone_end": self.active_zone_end,
+            "silence_before": self.silence_before,
+            "silence_after": self.silence_after,
             "rendered_pause_before": self.rendered_pause_before,
             "rendered_pause_after": self.rendered_pause_after,
             "duration": self.duration,
@@ -429,14 +469,93 @@ def _audio_start(clip: TtsClip) -> float:
     return clip.dialogue.start - lead
 
 
+def _region_samples(
+    path: Path, start: float, end: float, *, label: str
+) -> tuple[np.ndarray, int]:
+    """Read only ``[start, end)`` of a long file, without loading the whole thing.
+
+    A film's dialogue stem is far larger than memory, so the region is seeked to and
+    read directly. ``soundfile`` handles the container; no FFmpeg pass is needed for a
+    WAV stem.
+    """
+
+    try:
+        with sf.SoundFile(str(path)) as handle:
+            rate = int(handle.samplerate)
+            first = max(0, int(round(start * rate)))
+            count = max(0, int(round((end - start) * rate)))
+            handle.seek(first)
+            data = handle.read(frames=count, dtype="float32", always_2d=True)
+    except (OSError, RuntimeError) as exc:
+        raise InvalidAudioError(f"could not read {label} at {path}: {exc}") from exc
+
+    if data.size == 0 or rate < 1:
+        raise InvalidAudioError(f"{label} at {path} holds no samples in that window")
+    return np.ascontiguousarray(data.mean(axis=1, dtype=np.float32)), rate
+
+
+def detect_active_zone(
+    path: Path,
+    start: float,
+    end: float,
+    *,
+    margin_db: float = 12.0,
+    minimum_seconds: float = 0.08,
+    frame_seconds: float = 0.02,
+) -> tuple[float, float]:
+    """Return the part of ``[start, end)`` that actually contains speech.
+
+    A diarized turn is a *speaker's* interval, not the actor's first and last phoneme:
+    the turn normally opens and closes with room tone. Fitting Amharic to the turn -
+    which is what the stage used to do - stretches it into that silence and makes the
+    cadence wrong. The active zone is found from the audio instead, with a burstiness
+    test: a frame is active when it rises ``margin_db`` above the noise floor of the
+    window itself, so steady music or hum does not read as speech.
+
+    Falls back to the whole window when the region cannot be read or the zone it finds
+    is implausibly short; a diagnostic must never break a run.
+    """
+
+    if end <= start:
+        return start, end
+
+    try:
+        samples, rate = _region_samples(Path(path), start, end, label="the dialogue stem")
+    except TimingError:
+        return start, end
+
+    frame = max(1, int(round(frame_seconds * rate)))
+    usable = (samples.shape[0] // frame) * frame
+    if usable < frame:
+        return start, end
+    frames = samples[:usable].reshape(-1, frame)
+
+    energy = np.sqrt(np.mean(np.square(frames, dtype=np.float32), axis=1) + 1e-12)
+    levels_db = 20.0 * np.log10(np.maximum(energy, 1e-6))
+
+    floor_db = float(np.percentile(levels_db, 15.0))
+    threshold = max(floor_db + float(margin_db), SILENCE_FLOOR_DBFS)
+    active = np.flatnonzero(levels_db > threshold)
+    if active.size == 0:
+        return start, end
+
+    first = int(active[0]) * frame_seconds
+    last = (int(active[-1]) + 1) * frame_seconds
+    if last - first < minimum_seconds:
+        return start, end
+    # Clamp to the requested window; the region was read for exactly that span.
+    return start + first, min(end, start + last)
+
+
 def align_clip(
     clip: TtsClip,
     destination: str | Path,
     *,
     settings: Settings | None = None,
     room: float | None = None,
+    active_zone: tuple[float, float] | None = None,
 ) -> AlignedClip:
-    """Fit one clip to its window, and describe where to place it.
+    """Place one clip inside its window, against the actor's active vocal zone.
 
     Parameters
     ----------
@@ -450,6 +569,9 @@ def align_clip(
         How many seconds of speech this line may occupy before it would run into the
         next one, including any silence between them. ``None`` means "no more than its
         own window", which is what a single clip considered alone can know.
+    active_zone:
+        Absolute ``(start, end)`` of the speech inside the original window, from
+        :func:`detect_active_zone`. ``None`` uses the whole window.
 
     Returns
     -------
@@ -457,13 +579,13 @@ def align_clip(
 
     Notes
     -----
-    A line that fits its own window is fitted to that window, exactly: matching the
-    original timing is what keeps the dub in step with the picture. A line that *cannot*
-    fit is allowed to use the silence after it up to ``room`` before it is squashed at
-    all, because Amharic does not express the same idea in the same number of syllables
-    the English did and compressing hard to hit a window is what makes a dub sound
-    rushed. Only a line that still does not fit at the tempo limit is cut short, and that
-    is reported rather than done quietly.
+    **The speech is never stretched just to fill a window.** Time-stretching is what
+    makes a dub sound sped up or slurred, and it was being applied because a diarized
+    turn includes silence the actor never spoke into. The clip is placed at the start of
+    the active zone, and the window's own silence is written around it. A line is
+    compressed only when it cannot fit even with the silence after it, and then only
+    within the configured tempo band; anything still too long is reported rather than
+    mangled.
     """
 
     resolved = settings if settings is not None else get_settings()
@@ -480,6 +602,12 @@ def align_clip(
     window = clip.dialogue.duration
     speech = clip.speech_duration
 
+    zone_start, zone_end = (
+        active_zone if active_zone is not None else (clip.dialogue.start, clip.dialogue.end)
+    )
+    zone_start = max(clip.dialogue.start, min(zone_start, clip.dialogue.end))
+    zone_end = max(zone_start, min(zone_end, clip.dialogue.end))
+
     # The room a line may use is never smaller than its own window: the window is where
     # the actor actually spoke, and no line should be squashed below the performance it
     # replaces just because the line in front of it ran long. ``room`` can come back
@@ -489,18 +617,32 @@ def align_clip(
         if room is None
         else max(window, float(room), MINIMUM_PLACEMENT_WINDOW)
     )
-    target = window if speech <= window else max(window, min(limit, speech))
-    required = speech / target
-    within_tolerance = abs(speech - window) <= EXACT_FIT_TOLERANCE_SECONDS
-    tempo = 1.0 if within_tolerance else _clamp(required, minimum, maximum)
 
-    stretched, rate = _stretched_speech(
-        clip,
-        region,
-        sample_rate,
-        tempo,
-        Path(destination).with_name(f"{Path(destination).stem}.speech.wav"),
-    )
+    required = speech / max(limit, MINIMUM_PLACEMENT_WINDOW)
+    if speech <= limit + EXACT_FIT_TOLERANCE_SECONDS:
+        # It fits somewhere in the time it has: leave the cadence alone entirely.
+        tempo = 1.0
+    else:
+        tempo = _clamp(required, minimum, maximum)
+
+    if tempo == 1.0:
+        stretched = np.ascontiguousarray(region, dtype=np.float32)
+        rate = sample_rate
+        if rate != PIPELINE_SAMPLE_RATE:
+            # Only the sample rate needs normalising; no tempo filter is applied.
+            destination = Path(destination)
+            temporary = destination.with_name(f"{destination.stem}.rate.wav")
+            stretched, rate = _stretched_speech(
+                clip, region, sample_rate, 1.0, temporary
+            )
+    else:
+        stretched, rate = _stretched_speech(
+            clip,
+            region,
+            sample_rate,
+            tempo,
+            Path(destination).with_name(f"{Path(destination).stem}.speech.wav"),
+        )
     speech_duration = stretched.shape[0] / rate
 
     notes: list[str] = []
@@ -520,10 +662,10 @@ def align_clip(
                 speech_duration = keep / rate
                 overrun = 0.0
                 notes.append(
-                    f"the line needed {required:.3f}x its own window but even the "
-                    f"{limit:.3f}s available to it (up to the next line) only allows "
-                    f"{maximum:g}x; the last {trimmed:.3f}s were cut with a fade so the "
-                    "next line is not spoken over - the Amharic is longer than its window"
+                    f"the line needed {required:.3f}x the {limit:.3f}s available but "
+                    f"the tempo limit is {maximum:g}x; the last {trimmed:.3f}s were cut "
+                    "with a fade so the next line is not spoken over - the Amharic is "
+                    "longer than its time"
                 )
         else:
             notes.append(
@@ -533,32 +675,43 @@ def align_clip(
                 "longer than its time"
             )
 
-    residual = speech_duration - window
+    # Placement: the speech starts where the actor's speech started. The file may begin
+    # earlier by the line's own leading pause - that pause is silence, and it is the
+    # performance's own entry - clipped so the file never starts before time zero.
+    lead = min(max(clip.rendered_pause_before, 0.0), max(zone_start, 0.0))
+    file_start = zone_start - lead
 
-    if within_tolerance:
-        # Close enough that a filter would only add its own rounding.
-        notes.append("already within the fit tolerance; no stretching applied")
-    elif abs(residual) > EXACT_FIT_TOLERANCE_SECONDS and trimmed == 0.0:
-        # Judged on the audio that was actually produced, not on the arithmetic that
-        # asked for it, so a clamp is only reported when it really shows.
+    # Everything the window has left after the speech is silence. Writing it out is what
+    # keeps the dub in sync with the picture without touching the speech itself. A
+    # pause the dialogue stage asked for is a *minimum*: it is silence too, and the
+    # cascade only measures speech, so keeping it can never make two voices collide.
+    speech_end = zone_start + speech_duration
+    window_trail = max(0.0, clip.dialogue.end - speech_end)
+    trail = max(window_trail, max(clip.rendered_pause_after, 0.0))
+    silence_before = max(0.0, zone_start - clip.dialogue.start)
+    silence_after = trail
+
+    if zone_start > clip.dialogue.start + 1e-9:
         notes.append(
-            f"an exact fit needed a tempo of {required:.3f}, outside "
-            f"[{minimum:g}, {maximum:g}]; clamped to {tempo:.3f}, so the line "
-            f"runs {abs(residual):.3f}s "
-            f"{'long' if residual > 0 else 'short'} of its window"
+            f"the line is placed at the start of the actor's active speech "
+            f"({zone_start:.3f}s, {silence_before:.3f}s into the window) and the "
+            f"{silence_before:.3f}s before it is silence, not compressed audio"
         )
-
-    # A line at the very start of the film has nowhere to put its leading pause.
-    # The pause is trimmed rather than the line being pushed late, so the speech
-    # still lands on its original start.
-    lead = min(clip.rendered_pause_before, clip.dialogue.start)
     if lead < clip.rendered_pause_before - 1e-9:
         notes.append(
             f"the {clip.rendered_pause_before:.3f}s leading pause was trimmed to "
             f"{lead:.3f}s so the line could keep its original start of "
             f"{clip.dialogue.start:.3f}s"
         )
-    trail = clip.rendered_pause_after
+    if tempo == 1.0:
+        notes.append("the cadence is left untouched; no time-stretching was applied")
+    elif trimmed == 0.0 and abs(speech_duration - window) > EXACT_FIT_TOLERANCE_SECONDS:
+        notes.append(
+            f"an exact fit needed a tempo of {required:.3f}, outside "
+            f"[{minimum:g}, {maximum:g}]; clamped to {tempo:.3f}, so the line runs "
+            f"{abs(speech_duration - window):.3f}s "
+            f"{'long' if speech_duration > window else 'short'} of its window"
+        )
 
     pieces = [stretched]
     if lead:
@@ -578,7 +731,7 @@ def align_clip(
         clip=clip,
         audio_path=Path(destination),
         sample_rate=rate,
-        start=clip.dialogue.start - lead,
+        start=file_start,
         tempo=tempo,
         required_tempo=required,
         speech_duration=speech_duration,
@@ -589,6 +742,10 @@ def align_clip(
         available=limit,
         trimmed=trimmed,
         overrun=overrun,
+        active_zone_start=zone_start,
+        active_zone_end=zone_end,
+        silence_before=silence_before,
+        silence_after=silence_after,
     )
 
 
@@ -627,11 +784,180 @@ def resolve_timing_directory(
     return root / TIMING_DIRECTORY_NAME / ALIGNED_DIRECTORY_NAME
 
 
+def _rooms(ordered: list[TtsClip], guard: float) -> list[float | None]:
+    """Return how long each line may speak before it would meet the next one."""
+
+    rooms: list[float | None] = []
+    for position, clip in enumerate(ordered):
+        if position + 1 >= len(ordered):
+            rooms.append(None)
+            continue
+        following = ordered[position + 1]
+        deadline = _audio_start(following) - guard
+        rooms.append(deadline - clip.dialogue.start - clip.rendered_pause_after)
+    return rooms
+
+
+def _place(
+    clip: AlignedClip,
+    *,
+    previous: AlignedClip | None,
+    previous_speech_end: float,
+    guard: float,
+    overlap: float,
+) -> tuple[AlignedClip, float]:
+    """Move one placed line later if the line before it is still sounding.
+
+    Everything here is measured between *speech* boundaries rather than file boundaries.
+    A clip carries its rendered pauses with it, and silence over silence is inaudible, so
+    a line is not moved to avoid an overlap nobody can hear.
+    """
+
+    same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
+    allowed = 0.0 if same_speaker else overlap
+    # The constraint is on speech, not the files: pauses are inaudible over silence.
+    # Even genuine source crosstalk is capped so translated dialogue stays clear.
+    floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
+    start = max(clip.start, floor)
+    drift = start - clip.start
+    if drift > 1e-6:
+        why = (
+            "the same character had not finished, and one voice cannot hand over to "
+            "itself"
+            if same_speaker
+            else "the line before it ran past its own time"
+        )
+        clip = replace(
+            clip,
+            start=start,
+            drift=drift,
+            notes=clip.notes
+            + (
+                f"{why}, so this line starts {drift:.3f}s later rather than being "
+                "spoken over",
+            ),
+        )
+    speech_end = clip.start + clip.rendered_pause_before + clip.speech_duration
+    return clip, speech_end
+
+
+def iterate_aligned(
+    clips: Iterable[TtsClip],
+    *,
+    output_dir: str | Path | None = None,
+    settings: Settings | None = None,
+    speech_stem: str | Path | None = None,
+) -> Iterator[AlignedClip]:
+    """Fit and place every clip, yielding each one as soon as it is written.
+
+    Yielding rather than returning a list is what lets :mod:`app.pipeline.mixing` start
+    consuming the dub while later lines are still being fitted. The room each line has
+    and the placement of each line only depend on metadata and on the line before it, so
+    nothing here needs the whole film in memory.
+
+    Parameters
+    ----------
+    clips:
+        Clips from :func:`app.pipeline.tts.synthesize_dialogue`, in order.
+    output_dir:
+        Directory to keep the aligned lines in. Defaults to
+        ``<WORK_DIR>/timing/aligned``.
+    settings:
+        Project settings override; defaults to :func:`app.config.get_settings`.
+    speech_stem:
+        The original clean speech stem. When supplied, the *active vocal zone* of each
+        original line is measured from it, so the dub is aligned to the actor's speech
+        rather than to the diarizer's turn boundaries. Absent means the whole window is
+        used, which is the old behaviour.
+
+    Yields
+    ------
+    AlignedClip
+        One per input clip, in order, never overlapping another line more than the
+        configured hand-over allowance.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    _tempo_bounds(resolved)
+
+    ordered = list(clips)
+    if not ordered:
+        return
+
+    directory = resolve_timing_directory(output_dir, settings=resolved)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    guard = resolved.timing_min_line_gap
+    rooms = _rooms(ordered, guard)
+
+    previous: AlignedClip | None = None
+    previous_speech_end = 0.0
+    for clip, room in zip(ordered, rooms):
+        if not isinstance(clip, TtsClip):
+            raise InvalidClipError(f"expected a TtsClip, got {type(clip).__name__}")
+
+        active_zone: tuple[float, float] | None = None
+        if speech_stem is not None:
+            active_zone = detect_active_zone(
+                Path(speech_stem),
+                clip.dialogue.start,
+                clip.dialogue.end,
+                margin_db=resolved.timing_active_zone_margin_db,
+                minimum_seconds=resolved.timing_active_zone_min_seconds,
+                frame_seconds=ACTIVE_ZONE_FRAME_SECONDS,
+            )
+
+        destination = directory / f"{Path(clip.audio_path).stem}.wav"
+        aligned = align_clip(
+            clip,
+            destination,
+            settings=resolved,
+            room=room,
+            active_zone=active_zone,
+        )
+        aligned, previous_speech_end = _place(
+            aligned,
+            previous=previous,
+            previous_speech_end=previous_speech_end,
+            guard=guard,
+            overlap=resolved.timing_max_overlap_seconds,
+        )
+        previous = aligned
+        yield aligned
+
+
+async def align_dialogue_stream(
+    clips: Iterable[TtsClip],
+    *,
+    output_dir: str | Path | None = None,
+    settings: Settings | None = None,
+    speech_stem: str | Path | None = None,
+) -> AsyncIterator[AlignedClip]:
+    """Async view of :func:`iterate_aligned`, for streaming into the mixing stage.
+
+    The fitting work is blocking CPU/FFmpeg work, so each line is produced on a worker
+    thread and yielded to the caller as soon as it exists. Stage 9 can therefore start
+    mixing while the last lines are still being fitted.
+    """
+
+    iterator = iterate_aligned(
+        clips, output_dir=output_dir, settings=settings, speech_stem=speech_stem
+    )
+
+    while True:
+        try:
+            item = await asyncio.to_thread(next, iterator)
+        except StopIteration:
+            return
+        yield item
+
+
 def align_dialogue(
     clips: list[TtsClip] | tuple[TtsClip, ...],
     *,
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
+    speech_stem: str | Path | None = None,
 ) -> list[AlignedClip]:
     """Fit every clip to its original window, in the order it was given.
 
@@ -644,14 +970,14 @@ def align_dialogue(
         ``<WORK_DIR>/timing/aligned``.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
+    speech_stem:
+        The original clean speech stem, used to measure each line's active vocal zone.
 
     Returns
     -------
     list[AlignedClip]
         One entry per input clip, in the same order. An empty input returns an
-        empty list without touching FFmpeg. A line that could not fit its time is
-        moved later rather than spoken over the next one, so the returned lines
-        never overlap unless they overlapped in the source.
+        empty list without touching FFmpeg.
 
     Raises
     ------
@@ -666,120 +992,24 @@ def align_dialogue(
         format.
     """
 
-    resolved = settings if settings is not None else get_settings()
-    _tempo_bounds(resolved)
-
-    ordered = list(clips)
-    if not ordered:
-        return []
-
-    directory = resolve_timing_directory(output_dir, settings=resolved)
-    directory.mkdir(parents=True, exist_ok=True)
-
-    # Each line is told the room it has before the next one begins. The next line's own
-    # leading pause is included, because that pause is part of where its audio starts and
-    # so is the earliest moment two lines could collide. Without this every line is fitted
-    # to its own window alone, and a line that cannot fit - which is most of them in a
-    # language longer than English - simply overruns into its neighbour and two voices
-    # speak at once.
-    guard = resolved.timing_min_line_gap
-    rooms: list[float | None] = []
-    for position, clip in enumerate(ordered):
-        if position + 1 >= len(ordered):
-            rooms.append(None)
-            continue
-        following = ordered[position + 1]
-        deadline = _audio_start(following) - guard
-        rooms.append(deadline - clip.dialogue.start - clip.rendered_pause_after)
-
-    aligned: list[AlignedClip] = []
-    for clip, room in zip(ordered, rooms):
-        if not isinstance(clip, TtsClip):
-            raise InvalidClipError(
-                f"expected a TtsClip, got {type(clip).__name__}"
-            )
-        destination = directory / f"{Path(clip.audio_path).stem}.wav"
-        aligned.append(align_clip(clip, destination, settings=resolved, room=room))
-
-    return _cascade(
-        aligned,
-        guard=guard,
-        overlap=resolved.timing_max_overlap_seconds,
+    return list(
+        iterate_aligned(
+            clips,
+            output_dir=output_dir,
+            settings=settings,
+            speech_stem=speech_stem,
+        )
     )
 
 
-def _cascade(
-    aligned: list[AlignedClip], *, guard: float, overlap: float = 0.0
-) -> list[AlignedClip]:
-    """Place lines later so that no two of them are ever *intelligibly* at once.
-
-    A line whose Amharic needs more time than the film left it cannot be fitted without
-    either rushing it past intelligibility or cutting a word off the end. Both were
-    tried; both were audible. So the overrun is paid for in position instead: the next
-    line waits until this one has finished, except for the configured short handover
-    allowance between different speakers. Originally simultaneous lines are subject to
-    the same cap as any other handover.
-
-    ``overlap`` is the concession that keeps the picture: up to this many seconds of the
-    previous line may still be sounding when the next one starts, which is what a
-    conversation already sounds like, before the next line is moved at all. A third of a
-    second of hand-over is heard as a natural interruption; three seconds of it is two
-    people talking at once, which is the thing a dub must never do.
-
-    The allowance is for a change of speaker. The same character never hands over to
-    themselves - their turns do not overlap in the source, and the same voice laid over
-    itself is not heard as an interruption but as a stutter, because the ear has nothing
-    to separate the two copies with. So one speaker's speech is never left sounding under
-    their own next line.
-
-    Everything here is measured between *speech* boundaries rather than file boundaries.
-    A clip carries its rendered pauses with it, and silence over silence is inaudible, so
-    a line is not moved to avoid an overlap nobody can hear.
-    """
-
-    placed: list[AlignedClip] = []
-    previous: AlignedClip | None = None
-    previous_speech_end = 0.0
-    for clip in aligned:
-        same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
-        allowed = 0.0 if same_speaker else overlap
-        # The constraint is on speech, not the files: pauses are inaudible over silence.
-        # Even genuine source crosstalk is capped so translated dialogue stays clear.
-        floor = previous_speech_end + guard - clip.rendered_pause_before - allowed
-        start = max(clip.start, floor)
-        drift = start - clip.start
-        if drift > 1e-6:
-            same_speaker = previous is not None and previous.speaker_id == clip.speaker_id
-            why = (
-                "the same character had not finished, and one voice cannot hand over to "
-                "itself"
-                if same_speaker
-                else "the line before it ran past its own time"
-            )
-            clip = replace(
-                clip,
-                start=start,
-                drift=drift,
-                notes=clip.notes
-                + (
-                    f"{why}, so this line starts {drift:.3f}s later rather than being "
-                    "spoken over",
-                ),
-            )
-        previous_speech_end = (
-            clip.start + clip.rendered_pause_before + clip.speech_duration
-        )
-        previous = clip
-        placed.append(clip)
-    return placed
-
-
 __all__ = [
+    "ACTIVE_ZONE_FRAME_SECONDS",
     "ALIGNED_DIRECTORY_NAME",
     "ATEMPO_MAX",
     "ATEMPO_MIN",
     "EXACT_FIT_TOLERANCE_SECONDS",
     "PIPELINE_SAMPLE_RATE",
+    "SILENCE_FLOOR_DBFS",
     "TIMING_DIRECTORY_NAME",
     "AlignedClip",
     "ConfigurationError",
@@ -792,5 +1022,8 @@ __all__ = [
     "TimingError",
     "align_clip",
     "align_dialogue",
+    "align_dialogue_stream",
+    "detect_active_zone",
+    "iterate_aligned",
     "resolve_timing_directory",
 ]

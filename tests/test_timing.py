@@ -246,13 +246,22 @@ def test_line_is_stretched_to_its_window(tmp_path: Path, ffmpeg: FakeFfmpeg) -> 
     assert aligned.original_window == pytest.approx(0.8)
 
 
-def test_slow_down_is_also_pitch_preserving(tmp_path: Path, ffmpeg: FakeFfmpeg) -> None:
+def test_a_short_line_is_padded_with_silence_not_slowed(
+    tmp_path: Path, ffmpeg: FakeFfmpeg
+) -> None:
+    """A 1.0 s line in a 1.25 s window keeps its cadence; the gap is silence.
+
+    Slowing a line down to fill a window is heard as dragged delivery, so the stage
+    writes the window's own silence around the speech instead.
+    """
+
     aligned = align_dialogue([_clip(tmp_path, start=2.0, end=3.25)], settings=_settings(tmp_path))[0]
 
-    assert ffmpeg.filters == ["atempo=0.800000"]
-    assert aligned.tempo < 1.0
-    assert aligned.speech_duration == pytest.approx(1.25, abs=0.01)
-    assert aligned.fits
+    assert ffmpeg.filters == []
+    assert aligned.tempo == pytest.approx(1.0)
+    assert aligned.speech_duration == pytest.approx(1.0, abs=0.01)
+    assert aligned.silence_after > 0.0
+    assert not aligned.fits  # it is shorter than its window, and that is reported
 
 
 def test_a_line_that_already_fits_is_left_alone(
@@ -263,7 +272,7 @@ def test_a_line_that_already_fits_is_left_alone(
     assert aligned.tempo == 1.0
     assert ffmpeg.filters == []
     assert aligned.fits
-    assert any("tolerance" in note for note in aligned.notes)
+    assert any("cadence is left untouched" in note for note in aligned.notes)
 
 
 def test_a_tiny_difference_is_not_worth_a_filter(
@@ -753,7 +762,25 @@ def test_cascade_caps_source_overlap_and_prevents_same_speaker_overlap(
             rendered_pause_after=0.0,
         )
 
-    result = timing._cascade(
+    def place(items: list[AlignedClip], *, guard: float, overlap: float) -> list[AlignedClip]:
+        """Apply the same placement rule the streaming stage applies, one line at a time."""
+
+        placed: list[AlignedClip] = []
+        previous: AlignedClip | None = None
+        previous_speech_end = 0.0
+        for item in items:
+            item, previous_speech_end = timing._place(
+                item,
+                previous=previous,
+                previous_speech_end=previous_speech_end,
+                guard=guard,
+                overlap=overlap,
+            )
+            previous = item
+            placed.append(item)
+        return placed
+
+    result = place(
         [aligned(0, first_clip, 5.0), aligned(1, second_clip, second_start)],
         guard=0.0,
         overlap=0.3,

@@ -25,8 +25,8 @@ Notes
   functions in their existing order, passing each stage's own outputs to the next
   one. No text, speaker id, timing or performance value is hard-coded here.
 * Which models the translation and synthesis stages use is the configuration's
-  decision, not this runner's: ``TRANSLATION_BACKEND`` picks the translator and
-  ``TTS_ENGINE`` the synthesis engine, and both are reported before the run. The
+  decision, not this runner's: ``TRANSLATION_MODEL`` names the local Qwen checkpoint
+  and ``TTS_ENGINE`` the synthesis engine, and both are reported before the run. The
   runner follows the same branch the orchestrator does, so a single-voice engine
   skips the voice-profile stage entirely rather than building references nothing
   reads.
@@ -108,7 +108,7 @@ def report_settings(settings: Settings) -> None:
     _info("model cache", settings.model_cache_dir)
     _info("diarization model", settings.diarization_model)
     _info("transcription model", settings.transcription_model)
-    _info("translation backend", settings.translation_backend)
+    _info("translation backend", "local vLLM")
     _info("translation model", settings.translation_model)
     _info("tts engine", settings.tts_engine)
     if settings.tts_engine == "omnivoice":
@@ -121,22 +121,15 @@ def report_settings(settings: Settings) -> None:
     else:
         _info("tts model", settings.tts_model)
 
-    # The check is configuration-aware, so this names only what this run will
-    # actually read: the token always, the translation provider's key only under the
-    # instruction-following backend.
+    # Dialogue adaptation is served from this same GPU host, so the only credential
+    # a run still needs is the token the gated diarization pipeline authenticates with.
     missing = settings.missing_credentials()
     if missing:
         raise RuntimeError(
             "missing credentials: "
             + ", ".join(missing)
-            + " - the gated diarization pipeline needs HUGGINGFACE_TOKEN"
-            + (
-                f", and TRANSLATION_BACKEND=openai ({settings.translation_provider}) "
-                f"needs {settings.translation_api_key_env}"
-                if settings.translation_backend == "openai"
-                else ""
-            )
-            + " (copy .env.example to .env and fill them in)"
+            + " - the gated diarization pipeline needs HUGGINGFACE_TOKEN "
+            "(copy .env.example to .env and fill it in)"
         )
 
 
@@ -184,7 +177,7 @@ def report_lines(lines: list[transcription.TranscriptSegment]) -> None:
 def report_dialogue(dialogue: list[AdaptedDialogue], settings: Settings) -> None:
     """Print the adapted Amharic lines with the performance the model chose."""
 
-    _rule(f"4. Adaptation - {settings.translation_backend} ({settings.translation_model})")
+    _rule(f"4. Adaptation - local vLLM ({settings.translation_model})")
     _info("lines", len(dialogue))
     for index, line in enumerate(dialogue, start=1):
         print(

@@ -7,23 +7,23 @@ other models have already been downloaded. This script loads each model by itsel
 prints what happened, and releases it before moving on, so a failure names exactly
 one component.
 
-Which translation and synthesis models are checked follows the configuration:
+Which models are checked follows the configuration:
 
-* ``TRANSLATION_BACKEND`` selects a local ``nllb`` checkpoint, or ``openai`` for a
-  served instruction-following model (``TRANSLATION_PROVIDER`` picks the vendor).
+* Dialogue adaptation always talks to the local Qwen model served by vLLM at
+  ``TRANSLATION_BASE_URL``; the step probes it with one JSON-mode request.
 * ``TTS_ENGINE`` selects ``omnivoice`` (the default), or ``mms``.
 
-Only the selected ones are loaded. Checking the other pair would download many
-gigabytes a run never touches and, worse, would leave the models it *does* use
+Only the selected engine is loaded. Checking the other one would download many
+gigabytes a run never touches and, worse, would leave the engine it *does* use
 unchecked, so the pre-flight would pass and the run would still fail. To check the
-other configuration, set the environment variables::
+other configuration, set the environment variable::
 
-    TRANSLATION_BACKEND=openai TTS_ENGINE=mms python scripts/validate_models.py
+    TTS_ENGINE=mms python scripts/validate_models.py
 
 ::
 
     python scripts/validate_models.py
-    python scripts/validate_models.py --only nllb
+    python scripts/validate_models.py --only served
     python scripts/validate_models.py --only separation,mms
 
 Each step drives the stage's *own* loader (``separation``'s model, ``diarization``'s
@@ -185,26 +185,45 @@ def load_whisper() -> None:
     _report("loaded", type(model).__name__)
 
 
-def load_nllb() -> None:
-    """Load the NLLB translation model and translate one short line.
+def load_served_model() -> None:
+    """Reach the local vLLM server and confirm it answers a JSON-mode request.
 
-    Loading the weights only proves the download worked; translating proves the
-    tokenizer, the language codes and ``generate`` all agree, which is the part that
-    actually fails when a checkpoint and a library version disagree.
+    A reachable endpoint that returns the model's own name is the smallest thing that
+    proves the server is up, the configured checkpoint is loaded, and the client's
+    request shape is accepted - which is worth knowing before a run reaches the
+    adaptation stage and submits a whole film's windows.
     """
 
-    from app.pipeline import nllb
+    import asyncio
+    import json
 
-    settings = nllb.get_settings()
+    from app.pipeline import translation
+
+    settings = translation.get_settings()
+    _report("base url", settings.translation_base_url)
     _report("model", settings.translation_model)
-    _report("device", settings.device)
-    _report("languages", f"{nllb.SOURCE_LANGUAGE} -> {nllb.TARGET_LANGUAGE}")
+    _report("batching", translation.describe_backend(settings))
 
-    translator = nllb.load_translator(settings=settings)
-    result = translator.translate("Hello.")
-    if not result.text.strip():
-        raise RuntimeError("NLLB returned an empty translation")
-    _report("loaded", "translated a probe line")
+    client = translation._client_for(settings)  # noqa: SLF001
+
+    async def probe() -> str:
+        try:
+            return await client.complete(
+                system="Reply with a JSON object.",
+                user='Return exactly {"ok": true} and nothing else.',
+            )
+        finally:
+            await client.aclose()
+
+    try:
+        reply = asyncio.run(probe())
+    except translation.ApiClientError as exc:
+        raise RuntimeError(
+            f"the local vLLM server is not reachable at "
+            f"{settings.translation_base_url}: {exc}"
+        ) from exc
+    json.loads(reply)
+    _report("loaded", "answered a JSON-mode probe")
 
 
 def load_mms() -> None:
@@ -296,38 +315,6 @@ def load_omnivoice() -> None:
     _report("loaded", f"synthesized a cloned line at {engine.sample_rate} Hz")
 
 
-def load_served_model() -> None:
-    """Build the served-model client and confirm the key is accepted.
-
-    ``client.models.list()`` is the smallest call that proves the credential works,
-    which is worth knowing before a run reaches the adaptation stage. The provider
-    decides which key is read and which endpoint is called, so this validates whichever
-    one the run would actually use.
-    """
-
-    from app.pipeline import translation
-
-    settings = translation.get_settings()
-    if settings.translation_backend != "openai":
-        raise RuntimeError(
-            f"TRANSLATION_BACKEND is {settings.translation_backend!r}, so a served "
-            "endpoint is not what a run would use; validate 'nllb' instead"
-        )
-    if not settings.translation_api_key:
-        raise RuntimeError(f"{settings.translation_api_key_env} is not set")
-
-    _report("provider", settings.translation_provider)
-    _report("base url", settings.translation_base_url)
-    _report("model", settings.translation_model)
-    _report("thinking", translation.describe_thinking(settings))
-
-    client = translation._build_client(  # noqa: SLF001
-        settings, settings.translation_api_key
-    )
-    models = client.models.list()
-    _report("models listed", str(len(getattr(models, "data", []) or [])))
-
-
 #: Steps that every configuration needs, in pipeline order.
 STEPS: tuple[tuple[str, str, object], ...] = (
     ("torch", "compute runtime", load_torch),
@@ -341,12 +328,11 @@ STEPS: tuple[tuple[str, str, object], ...] = (
 #: the run never touches, and - worse - would leave the models it *does* use
 #: unchecked, so the pre-flight would pass and the run would still fail.
 CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
-    ("nllb", "NLLB-200 translation (TRANSLATION_BACKEND=nllb)", load_nllb, "nllb"),
     (
         "served",
-        "instruction-following adaptation (TRANSLATION_BACKEND=openai)",
+        "local vLLM adaptation (TRANSLATION_BASE_URL)",
         load_served_model,
-        "openai",
+        "vllm",
     ),
     (
         "omnivoice",
@@ -360,8 +346,7 @@ CONFIGURED_STEPS: tuple[tuple[str, str, object, str], ...] = (
 
 #: How to make a step that the current configuration does not select part of it.
 ACTIVATION: dict[str, str] = {
-    "nllb": "set TRANSLATION_BACKEND=nllb",
-    "served": "set TRANSLATION_BACKEND=openai",
+    "served": "start the vLLM server at TRANSLATION_BASE_URL",
     "omnivoice": "set TTS_ENGINE=omnivoice",
     "mms": "set TTS_ENGINE=mms",
 }
@@ -377,13 +362,11 @@ def configured_steps() -> tuple[tuple[str, str, object], ...]:
     from app.pipeline import translation, tts
 
     settings = translation.get_settings()
-    backend = settings.translation_backend
     engine = tts.get_settings().tts_engine
 
     selected: list[tuple[str, str, object]] = list(STEPS)
     for name, description, loader, wanted in CONFIGURED_STEPS:
-        if name in ("nllb", "served") and wanted != backend:
-            continue
+        # Dialogue adaptation is always local; only the speech engine is a choice.
         if name in ("mms", "omnivoice") and wanted != engine:
             continue
         selected.append((name, description, loader))

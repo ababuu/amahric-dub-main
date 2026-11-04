@@ -132,15 +132,17 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import soundfile as sf
 
 from app.config import PROJECT_ROOT, Settings, get_settings
+from app.models import load_omnivoice_network
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
+from app.pipeline.script_parse import normalize_character_name
 from app.pipeline.transcription import TranscriptSegment
 
 #: A voice-clone encoder: ``(reference_audio, destination) -> prompt path``.
@@ -2428,15 +2430,430 @@ def apply_voice_samples(
     return replaced
 
 
+# ---------------------------------------------------------------------------
+# Pre-encoded speaker profiles: /voice_samples/<Character_Name>/
+# ---------------------------------------------------------------------------
+
+#: The pair of files one character's manual sample is made of. The transcript is not
+#: optional: OmniVoice conditions on text *and* audio, and a reference whose words are
+#: unknown makes the engine run its own ASR over it - one more model, one more thing to
+#: go wrong on a pod, and a worse prompt than the operator's own script.
+VOICE_SAMPLE_AUDIO_FILENAME = "sample_01.wav"
+VOICE_SAMPLE_TEXT_FILENAME = "sample_01.txt"
+VOICE_SAMPLE_AUDIO_SUFFIX = ".wav"
+
+#: Encoded speaker tokens, keyed by the encoder, the audio's digest and its transcript.
+#: A dict, not a file: the whole point is that Stage 7 does not pay the encoding cost
+#: per line or per run, and the payload is an engine object that only lives in memory.
+_SPEAKER_TOKEN_CACHE: dict[tuple[str, str, str], Any] = {}
+
+
+@runtime_checkable
+class SpeakerProfileEncoder(Protocol):
+    """Turns one reference recording into the engine's own speaker prompt.
+
+    Implemented by :class:`OmniVoiceProfileEncoder` in production and by a fake in the
+    tests. The payload is opaque on purpose: it is whatever the engine needs to speak as
+    that speaker, and this module never inspects it.
+    """
+
+    name: str
+
+    def encode(self, *, reference_audio: Path, reference_text: str) -> Any:
+        """Return the engine's reusable speaker prompt."""
+
+    def close(self) -> None:
+        """Release any weights the encoder loaded."""
+
+
+class OmniVoiceProfileEncoder:
+    """OmniVoice's native voice-prompt embedding, computed once per character.
+
+    ``create_voice_clone_prompt`` is the engine's own entry point for this: it embeds
+    the reference audio and its transcript into the conditioning tensor OmniVoice
+    continues from. Doing it here, at stage 6, is what lets Stage 7 hand the *same*
+    cached prompt to every line instead of re-encoding a reference thousands of times.
+    """
+
+    name = "omnivoice"
+
+    def __init__(
+        self, *, model: str, device: str = "cuda", torch_dtype: str = "float16"
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigurationError("the OmniVoice model must be a non-empty id")
+        self._model = model.strip()
+        self._device = device
+        self._torch_dtype = torch_dtype
+        self._network: Any | None = None
+
+    def _load(self) -> Any:
+        if self._network is not None:
+            return self._network
+        try:
+            self._network = load_omnivoice_network(
+                self._model, device=self._device, dtype=self._torch_dtype
+            )
+        except ImportError as exc:  # pragma: no cover - only without the runtime
+            raise ClonePromptError(
+                "pre-encoding a speaker profile needs the 'omnivoice' package "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - reported as this module's error
+            raise ClonePromptError(
+                f"could not load the OmniVoice checkpoint {self._model!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        return self._network
+
+    def encode(self, *, reference_audio: Path, reference_text: str) -> Any:
+        network = self._load()
+        try:
+            return network.create_voice_clone_prompt(
+                ref_audio=str(reference_audio),
+                ref_text=reference_text,
+                preprocess_prompt=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as this module's error
+            raise ClonePromptError(
+                f"OmniVoice could not encode the reference {reference_audio}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    def close(self) -> None:
+        self._network = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerProfile:
+    """One character's pre-encoded voice, ready for the synthesis stage.
+
+    ``tokens`` is the engine's payload and is never serialised: the profile exists so
+    that the cost of encoding a reference is paid once, in memory, before any line is
+    spoken.
+    """
+
+    character: str
+    reference_audio: Path
+    reference_text: str
+    tokens: Any
+    sample: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.character, str) or not self.character.strip():
+            raise InvalidProfileError("character must be a non-empty string")
+        object.__setattr__(
+            self,
+            "reference_audio",
+            _profile_path("reference_audio", self.reference_audio),
+        )
+        if not isinstance(self.reference_text, str) or not self.reference_text.strip():
+            raise InvalidProfileError(
+                f"the sample transcript for {self.character!r} is empty; a cloned voice "
+                "needs the words the reference says"
+            )
+        object.__setattr__(self, "reference_text", self.reference_text.strip())
+
+    def resolve_reference_audio(self) -> Path:
+        """Return the sample path, absolute if it was stored relative."""
+
+        return resolve_project_path(self.reference_audio)
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe description of the profile (never the tokens)."""
+
+        return {
+            "character": self.character,
+            "reference_audio": portable_path(self.reference_audio),
+            "reference_text": self.reference_text,
+            "sample": self.sample,
+            "pre_encoded": self.tokens is not None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerProfileBank:
+    """Every character's pre-encoded voice, plus what could not be found."""
+
+    profiles: Mapping[str, SpeakerProfile] = field(default_factory=dict)
+    missing: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    def __len__(self) -> int:
+        return len(self.profiles)
+
+    def __contains__(self, character: object) -> bool:
+        return character in self.profiles
+
+    def get(self, character: str) -> SpeakerProfile | None:
+        """Return ``character``'s profile, or ``None`` when it has no sample."""
+
+        return self.profiles.get(character)
+
+    def tokens(self) -> dict[str, Any]:
+        """Return the pre-encoded prompts keyed by character, for the TTS stage."""
+
+        return {
+            character: profile.tokens
+            for character, profile in self.profiles.items()
+            if profile.tokens is not None
+        }
+
+    def voice_profiles(self) -> dict[str, VoiceProfile]:
+        """Return the bank as the stage's ordinary :class:`VoiceProfile` mapping."""
+
+        profiles: dict[str, VoiceProfile] = {}
+        for character, profile in self.profiles.items():
+            audio = profile.resolve_reference_audio()
+            try:
+                seconds = float(sf.info(str(audio)).duration)
+            except (OSError, RuntimeError) as exc:
+                raise MissingVoiceSampleError(
+                    f"could not read the sample for {character!r} at {audio}: {exc}"
+                ) from exc
+            profiles[character] = VoiceProfile(
+                speaker_id=character,
+                reference_audio=audio,
+                reference_start=0.0,
+                reference_end=seconds,
+                reference_text=profile.reference_text,
+                quality_score=1.0,
+                selection_reason=f"pre-encoded voice sample {profile.sample}",
+            )
+        return profiles
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-safe view of the bank."""
+
+        return {
+            "pre_encoded": len(self.profiles),
+            "characters": sorted(self.profiles),
+            "missing": list(self.missing),
+            "notes": list(self.notes),
+        }
+
+
+def _sample_digest(path: Path) -> str:
+    """Return a stable digest of a sample file's contents."""
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise MissingVoiceSampleError(f"could not read the voice sample {path}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _character_directory_index(root: Path) -> dict[str, Path]:
+    """Return the sample directories keyed by normalised character name."""
+
+    index: dict[str, Path] = {}
+    if not root.is_dir():
+        return index
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        try:
+            name = normalize_character_name(entry.name)
+        except ValueError:
+            continue
+        index.setdefault(name.lower(), entry)
+    return index
+
+
+def _sample_pair(directory: Path) -> tuple[Path, Path] | None:
+    """Return the first complete ``sample_NN.wav``/``.txt`` pair in ``directory``."""
+
+    audio = directory / VOICE_SAMPLE_AUDIO_FILENAME
+    text = directory / VOICE_SAMPLE_TEXT_FILENAME
+    if audio.is_file() and text.is_file():
+        return audio, text
+
+    # A numbered sample that is not 01 still counts, in order, so an operator who
+    # recorded a second take does not have to rename anything.
+    for candidate in sorted(directory.glob(f"*{VOICE_SAMPLE_AUDIO_SUFFIX}")):
+        transcript = candidate.with_suffix(".txt")
+        if transcript.is_file():
+            return candidate, transcript
+    return None
+
+
+def reset_speaker_profile_cache() -> None:
+    """Drop the in-memory encoded prompts. Used by tests and by a model switch."""
+
+    _SPEAKER_TOKEN_CACHE.clear()
+
+
+def precompute_speaker_profiles(
+    characters: Iterable[str],
+    *,
+    settings: Settings | None = None,
+    encoder: SpeakerProfileEncoder | None = None,
+    use_cache: bool = True,
+) -> SpeakerProfileBank:
+    """Encode every character's ``voice_samples/<Character>/sample_01`` once.
+
+    Parameters
+    ----------
+    characters:
+        The characters the dialogue actually speaks, as resolved from the screenplay.
+    settings:
+        Project settings override; ``VOICE_SAMPLE_DIR``, the OmniVoice checkpoint and
+        the device live here.
+    encoder:
+        An encoder to use instead of OmniVoice's own, which is how this stage is tested
+        without a GPU.
+    use_cache:
+        Reuse a prompt already encoded for the same reference and transcript.
+
+    Returns
+    -------
+    SpeakerProfileBank
+        One pre-encoded profile per character that has a complete sample pair, and the
+        names of those that do not. A character with no sample is **not** an error here:
+        the orchestrator falls back to the film's own reference for them, and the bank
+        says which ones those were.
+
+    Raises
+    ------
+    MissingVoiceSampleError
+        A sample pair exists but its audio or transcript cannot be read.
+    InvalidProfileError
+        A sample is longer than a cloning reference may be.
+    ClonePromptError
+        The encoder could not produce a prompt.
+    """
+
+    resolved = settings if settings is not None else get_settings()
+    ordered = [name for name in dict.fromkeys(characters) if isinstance(name, str) and name.strip()]
+    if not ordered:
+        return SpeakerProfileBank()
+
+    root = Path(resolved.voice_sample_dir)
+    index = _character_directory_index(root)
+    if not index:
+        return SpeakerProfileBank(
+            missing=tuple(ordered),
+            notes=(
+                f"no character sample directories under {root}; every speaker is voiced "
+                "from the film's own reference",
+            ),
+        )
+
+    active = encoder
+    if active is None:
+        active = OmniVoiceProfileEncoder(
+            model=resolved.omnivoice_model,
+            device=resolved.device,
+            torch_dtype=resolved.omnivoice_torch_dtype,
+        )
+
+    profiles: dict[str, SpeakerProfile] = {}
+    missing: list[str] = []
+    notes: list[str] = []
+    try:
+        for character in ordered:
+            try:
+                normalized = normalize_character_name(character)
+            except ValueError as exc:
+                raise InvalidProfileError(
+                    f"{character!r} cannot be used as a character name: {exc}"
+                ) from exc
+
+            directory = index.get(normalized.lower())
+            if directory is None:
+                missing.append(character)
+                continue
+
+            pair = _sample_pair(directory)
+            if pair is None:
+                missing.append(character)
+                notes.append(
+                    f"{character}: {directory.name} has no complete "
+                    f"{VOICE_SAMPLE_AUDIO_FILENAME} + {VOICE_SAMPLE_TEXT_FILENAME} pair"
+                )
+                continue
+
+            audio, transcript = pair
+            try:
+                text = transcript.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise MissingVoiceSampleError(
+                    f"could not read the sample transcript {transcript}: {exc}"
+                ) from exc
+            if not text:
+                missing.append(character)
+                notes.append(f"{character}: the sample transcript {transcript.name} is empty")
+                continue
+
+            try:
+                seconds = float(sf.info(str(audio)).duration)
+            except (OSError, RuntimeError) as exc:
+                raise MissingVoiceSampleError(
+                    f"could not read the voice sample {audio}: {exc}"
+                ) from exc
+            if seconds < MIN_REFERENCE_DURATION:
+                raise InvalidProfileError(
+                    f"the sample for {character!r} is {seconds:.2f}s long; voice cloning "
+                    f"needs at least {MIN_REFERENCE_DURATION:g}s"
+                )
+            if seconds > MAX_REFERENCE_DURATION:
+                raise InvalidProfileError(
+                    f"the sample for {character!r} is {seconds:.2f}s long; a cloning "
+                    f"reference may be at most {MAX_REFERENCE_DURATION:g}s, so trim it"
+                )
+
+            key = (getattr(active, "name", type(active).__name__), _sample_digest(audio), text)
+            tokens = _SPEAKER_TOKEN_CACHE.get(key) if use_cache else None
+            if tokens is None:
+                tokens = active.encode(reference_audio=audio, reference_text=text)
+                if use_cache:
+                    _SPEAKER_TOKEN_CACHE[key] = tokens
+
+            profiles[character] = SpeakerProfile(
+                character=character,
+                reference_audio=audio,
+                reference_text=text,
+                tokens=tokens,
+                sample=f"{directory.name}/{audio.name}",
+            )
+    finally:
+        if encoder is None:
+            active.close()
+
+    if profiles:
+        notes.append(
+            f"pre-encoded {len(profiles)} speaker prompt(s) from {root}: "
+            + ", ".join(sorted(profiles))
+        )
+    return SpeakerProfileBank(
+        profiles=profiles,
+        missing=tuple(missing),
+        notes=tuple(notes),
+    )
+
+
 __all__ = [
     "AudioAnalysisError",
     "CLONE_PROMPT_FILENAME",
     "MissingVoiceSampleError",
+    "OmniVoiceProfileEncoder",
     "SAMPLE_REFERENCE_FILENAME",
+    "SpeakerProfile",
+    "SpeakerProfileBank",
+    "SpeakerProfileEncoder",
+    "VOICE_SAMPLE_AUDIO_FILENAME",
+    "VOICE_SAMPLE_TEXT_FILENAME",
     "VOICE_SAMPLE_SUFFIXES",
     "apply_voice_samples",
     "assign_voice_samples",
     "available_voice_samples",
+    "precompute_speaker_profiles",
+    "reset_speaker_profile_cache",
     "ClonePromptEncoder",
     "ClonePromptError",
     "ConfigurationError",

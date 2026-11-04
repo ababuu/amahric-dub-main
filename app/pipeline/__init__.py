@@ -9,15 +9,20 @@ Stage order
 1. ``video``         - extract the audio from the source video; mux the dub back later.
 2. ``separation``    - split the soundtrack into dialogue / music / effects stems.
 3. ``diarization``   - identify who spoke when.
-4. ``transcription`` - transcribe the dialogue stem with timestamps, then assemble
-   the pause-delimited segments into complete sentences.
-5. ``translation``   - adapt and translate the sentences into Amharic.
-6. ``voice_profiles``- build a per-character Amharic voice profile.
-7. ``tts``           - synthesize Amharic dialogue with cloned voices.
-8. ``timing``        - align synthesized speech to the original timings.
-9. ``mixing``        - combine dubbed dialogue with the music/effects stems.
+4. ``transcription`` - transcribe the dialogue stem with timestamps.
+5. ``script_parse``  - overwrite the ``SPEAKER_XX`` labels with the screenplay's
+   character names, then assemble the segments into complete sentences.
+6. ``translation``   - adapt the sentences into Amharic on the local Qwen model served
+   by vLLM, in overlapping concurrent windows.
+7. ``voice_profiles``- pre-encode a per-character voice prompt from
+   ``voice_samples/<Character>/``, falling back to the film's own cleanest reference.
+8. ``tts``           - synthesize Amharic dialogue concurrently, with the line's
+   emotion as a style instruction.
+9. ``timing``        - place each line against the actor's active vocal zone, filling
+   the rest of the window with silence.
+10. ``mixing``       - combine dubbed dialogue with the music/effects stems.
 
-Steps 1-9 are implemented and are chained by
+Steps 1-10 are implemented and are chained by
 :func:`app.pipeline.orchestrator.run_pipeline`, which is the single entry point for
 a run:
 

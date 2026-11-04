@@ -31,17 +31,19 @@ huggingface_hub
 # safetensors is the weight format those checkpoints ship in.
 safetensors
 
-# transformers is imported directly by the NLLB backend and by the MMS engine,
-# and OmniVoice requires it (>=5.3) regardless.
+# transformers is imported directly by the MMS engine, and OmniVoice requires it
+# (>=5.3) regardless.
 transformers
 # scipy is imported directly by the mixing and prosody stages.
 scipy
 
-# --- Dialogue adaptation / translation client ------------------------------
-# The instruction-following backend talks to any OpenAI-compatible endpoint.
+# --- Dialogue adaptation client --------------------------------------------
+# The adaptation stage talks to a local Qwen-2.5-Instruct served by vLLM, through
+# vLLM's OpenAI-compatible endpoint. The server itself is installed on the GPU host
+# (`pip install vllm`) and launched with scripts/serve_vllm.py; it is deliberately not
+# pinned here, because its torch constraints move independently of this project's.
 openai
-# SentencePiece: NLLB's tokenizer. The fast tokenizer ships with transformers, but
-# the checkpoint's tokenizer can fall back to the slow one, which needs this.
+# SentencePiece, for checkpoints whose tokenizer falls back to the slow variant.
 sentencepiece
 
 # --- Amharic speech synthesis (MMS-TTS) ------------------------------------

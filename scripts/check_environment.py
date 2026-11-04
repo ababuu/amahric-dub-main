@@ -66,18 +66,11 @@ RUNTIME_MODULES: dict[str, str] = {
     "huggingface_hub": "model downloads",
 }
 
-#: Packages only one translation backend or speech engine needs, keyed by the setting
-#: that selects it. A configuration is checked against its own list and nothing else:
-#: demanding a working MMS install for an OmniVoice run would report a failure over
-#: something the run never imports, which sends someone chasing a red mark that does not
-#: affect them. ``openai`` is required by the default backend, so it is listed here rather
-#: than above; running ``TRANSLATION_BACKEND=nllb`` correctly stops requiring it.
+#: Packages only one speech engine needs, keyed by the setting that selects it. A
+#: configuration is checked against its own list and nothing else: demanding a working
+#: MMS install for an OmniVoice run would report a failure over something the run never
+#: imports, which sends someone chasing a red mark that does not affect them.
 BACKEND_MODULES: dict[str, tuple[str, dict[str, str]]] = {
-    "openai": ("translation_backend", {"openai": "LLM adaptation"}),
-    "nllb": (
-        "translation_backend",
-        {"sentencepiece": "NLLB-200 tokenizer"},
-    ),
     "omnivoice": (
         "tts_engine",
         {"omnivoice": "OmniVoice synthesis", "accelerate": "OmniVoice device placement"},
@@ -107,7 +100,7 @@ PROJECT_MODULES: tuple[str, ...] = (
     "app.pipeline.diarization",
     "app.pipeline.evaluation",
     "app.pipeline.mixing",
-    "app.pipeline.nllb",
+    "app.pipeline.script_parse",
     "app.pipeline.orchestrator",
     "app.pipeline.prosody",
     "app.pipeline.qc",
@@ -295,33 +288,27 @@ def _env_example_placeholders() -> dict[str, str]:
 def check_credentials() -> bool:
     """Report the pipeline credentials, flagging unedited ``.env`` placeholders.
 
-    Only the credentials the configured run needs are blocking: the Hugging Face
-    token always, because the gated diarization pipeline needs it, and the key of the
-    configured translation provider only when ``TRANSLATION_BACKEND`` is ``openai``.
-    Failing on a key the configured backend never reads would send someone hunting for
-    a credential they do not need while the real problem waits.
+    Only the credentials the configured run needs are blocking. Dialogue adaptation is
+    served from the same GPU host, so the only secret the pipeline still needs is the
+    Hugging Face token, which the gated diarization pipeline requires. ``openai`` (the
+    client package for vLLM's endpoint) is checked as a package, not as a key.
     """
 
     from app.config import get_settings
 
     settings = get_settings()
     placeholders = _env_example_placeholders()
-    translation_required = settings.translation_backend == "openai"
-    # The key's *name* follows the provider, so the check names the variable the
-    # configured run actually reads instead of the one it used to read.
     translation_key_env = settings.translation_api_key_env
     configured = {
         "HUGGINGFACE_TOKEN": (settings.huggingface_token, True),
-        translation_key_env: (settings.translation_api_key, translation_required),
+        # A loopback vLLM server normally ignores the token, so it is optional.
+        translation_key_env: (settings.translation_api_key, False),
     }
 
     healthy = True
     for name, (value, required) in configured.items():
         if not required:
-            print(
-                f"{name}: not needed by TRANSLATION_BACKEND="
-                f"{settings.translation_backend}  [SKIP]"
-            )
+            print(f"{name}: optional for the local vLLM server  [SKIP]")
             continue
         if not value:
             print(f"{name}: not set  [FAIL]")

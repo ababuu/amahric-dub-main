@@ -18,29 +18,24 @@ from app.config import (
     DEFAULT_OMNIVOICE_MODEL,
     DEFAULT_TIMING_MAX_TEMPO,
     DEFAULT_TIMING_MIN_LINE_GAP,
-    DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
-    DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
-    DEFAULT_TRANSLATION_LENGTH_PENALTY,
-    DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS,
-    DEFAULT_TRANSLATION_SHORTEN_PENALTY,
+    DEFAULT_TRANSLATION_BASE_URL,
+    DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION,
+    DEFAULT_TRANSLATION_MAX_CONCURRENCY,
+    DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
+    DEFAULT_TRANSLATION_WINDOW_LINES,
+    DEFAULT_TRANSLATION_WINDOW_OVERLAP,
     DEFAULT_TIMING_MIN_TEMPO,
     DEFAULT_TRANSCRIPTION_COMPUTE_TYPE,
     DEFAULT_TRANSCRIPTION_MODEL,
-    DEFAULT_TRANSLATION_BASE_URL,
-    DEFAULT_TRANSLATION_BATCH_SIZE,
-    DEFAULT_TRANSLATION_GEMINI_BASE_URL,
-    DEFAULT_TRANSLATION_GEMINI_MODEL,
-    DEFAULT_TRANSLATION_MODEL,
-    DEFAULT_TRANSLATION_OPENAI_MODEL,
-    DEFAULT_TRANSLATION_THINKING,
+    DEFAULT_TTS_MAX_INPUT_CHARS,
     DEFAULT_TTS_MIN_LINE_SECONDS,
     DEFAULT_TTS_MAX_PAUSE_SECONDS,
     DEFAULT_TTS_MODEL,
     DEFAULT_VOICE_REFERENCE_MAX_DURATION,
     DEFAULT_VOICE_REFERENCE_MIN_DURATION,
     DEFAULT_VOICE_REFERENCE_TARGET_DURATION,
-    TRANSLATION_PROVIDERS,
+    TRANSLATION_API_KEY_ENV,
     Settings,
     apply_torch_compile_policy,
     get_settings,
@@ -66,122 +61,93 @@ def test_defaults_are_project_relative(_clean_env: None) -> None:
 def test_missing_credentials_do_not_break_construction(_clean_env: None) -> None:
     settings = Settings.from_env()
 
-    assert settings.gemini_api_key is None
-    assert settings.deepseek_api_key is None
+    assert settings.translation_api_key is None
     assert settings.huggingface_token is None
-    assert settings.has_gemini_credentials is False
-    assert settings.has_deepseek_credentials is False
     assert settings.has_huggingface_credentials is False
-    # The default backend is an instruction-following endpoint, which needs a key, so both
-    # credentials are reported - and the key named is the *default provider's*, because
-    # that is the one a run would actually read. Under TRANSLATION_BACKEND=nllb only the
-    # token is.
-    assert settings.translation_backend == "openai"
-    assert settings.translation_provider == "gemini"
-    assert settings.missing_credentials() == [
-        "GEMINI_API_KEY",
-        "HUGGINGFACE_TOKEN",
-    ]
+    # Dialogue adaptation is served from the same GPU host, so no hosted-vendor key
+    # exists anywhere in the pipeline. Only the gated model download needs a token.
+    assert settings.missing_credentials() == ["HUGGINGFACE_TOKEN"]
 
 
-def test_the_missing_key_named_follows_the_provider(
+def test_the_local_server_needs_no_api_key(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
-    """Naming the wrong variable sends someone hunting for a credential they do not need."""
+    """A loopback vLLM deployment is a working configuration with no secret at all."""
 
-    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_test")
+    monkeypatch.setenv("TRANSLATION_API_KEY", "")
 
     settings = Settings.from_env()
 
-    assert settings.translation_api_key_env == "DEEPSEEK_API_KEY"
-    assert settings.missing_credentials() == [
-        "DEEPSEEK_API_KEY",
-        "HUGGINGFACE_TOKEN",
-    ]
+    assert settings.translation_api_key is None
+    assert settings.missing_credentials() == []
+    assert settings.translation_api_key_env == TRANSLATION_API_KEY_ENV
 
 
-def test_each_provider_supplies_its_own_key(
+def test_an_optional_local_token_is_read(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
-    """Only the configured provider's key is read; the other is never consulted."""
+    monkeypatch.setenv("TRANSLATION_API_KEY", "local-token")
 
-    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
-
-    assert Settings.from_env().translation_api_key == "gemini-key"
-
-    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
-    assert Settings.from_env().translation_api_key == "deepseek-key"
+    assert Settings.from_env().translation_api_key == "local-token"
 
 
-@pytest.mark.parametrize("provider", sorted(TRANSLATION_PROVIDERS))
-def test_every_known_provider_is_a_complete_configuration(provider: str) -> None:
-    """``other`` is the exception: it names a server only the operator knows."""
+def test_the_local_llm_defaults_are_a_loopback_vllm_server(_clean_env: None) -> None:
+    settings = Settings.from_env()
 
-    record = TRANSLATION_PROVIDERS[provider]
-
-    assert record.name == provider
-    assert record.api_key_env
-
-    if record.base_url or record.model:
-        assert record.base_url.startswith("https://")
-        assert record.model
-
-
-def test_the_default_endpoint_and_model_follow_the_provider(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    """One shared default would send a vendor's key to another vendor's host."""
-
-    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
-
-    gemini = Settings.from_env()
-    assert gemini.translation_base_url == DEFAULT_TRANSLATION_GEMINI_BASE_URL
-    assert gemini.translation_model == DEFAULT_TRANSLATION_GEMINI_MODEL
-
-    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
-
-    deepseek = Settings.from_env()
-    assert deepseek.translation_base_url == DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL
-    assert deepseek.translation_model == DEFAULT_TRANSLATION_DEEPSEEK_MODEL
+    assert settings.translation_model == DEFAULT_TRANSLATION_MODEL
+    assert "qwen" in settings.translation_model.lower()
+    assert settings.translation_base_url == DEFAULT_TRANSLATION_BASE_URL
+    assert settings.translation_base_url.startswith("http://127.0.0.1")
+    assert settings.translation_window_lines == DEFAULT_TRANSLATION_WINDOW_LINES
+    assert settings.translation_window_overlap == DEFAULT_TRANSLATION_WINDOW_OVERLAP
+    assert (
+        settings.translation_window_overlap < settings.translation_window_lines
+    )
+    assert settings.translation_max_concurrency == DEFAULT_TRANSLATION_MAX_CONCURRENCY
+    assert (
+        settings.translation_gpu_memory_utilization
+        == DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION
+        == 0.90
+    )
 
 
-def test_the_local_backend_keeps_its_checkpoint_default(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    """NLLB names a local checkpoint, so no served provider may rename it."""
+def test_the_server_arguments_match_the_client_settings(_clean_env: None) -> None:
+    """The server and the client must agree on the VRAM reservation and the batch."""
 
-    monkeypatch.setenv("TRANSLATION_BACKEND", "nllb")
+    settings = Settings.from_env()
 
-    assert Settings.from_env().translation_model == DEFAULT_TRANSLATION_MODEL
+    arguments = settings.vllm_server_arguments()
+
+    assert arguments[0] == "--model"
+    assert arguments[1] == settings.translation_model
+    assert "--gpu-memory-utilization" in arguments
+    assert f"{settings.translation_gpu_memory_utilization:.2f}" in arguments
+    assert str(settings.translation_max_concurrency) in arguments
 
 
-def test_an_explicit_endpoint_still_wins_over_the_provider_default(
+def test_an_explicit_endpoint_still_wins(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
     """Someone pointing at a proxy or a mirror means it."""
 
-    monkeypatch.setenv("TRANSLATION_BACKEND", "openai")
-    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://mirror.test/v1")
-    monkeypatch.setenv("TRANSLATION_MODEL", "gemini-3.8-flash")
-    monkeypatch.setenv("TRANSLATION_PROVIDER", "gemini")
+    monkeypatch.setenv("TRANSLATION_BASE_URL", "http://10.0.0.5:9000/v1")
+    monkeypatch.setenv("TRANSLATION_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
     settings = Settings.from_env()
 
-    assert settings.translation_base_url == "https://mirror.test/v1"
-    assert settings.translation_model == "gemini-3.8-flash"
+    assert settings.translation_base_url == "http://10.0.0.5:9000/v1"
+    assert settings.translation_model == "Qwen/Qwen2.5-7B-Instruct"
 
 
-def test_missing_credentials_under_the_local_backend(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
+def test_the_screenplay_path_is_configurable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, _clean_env: None
 ) -> None:
-    """A local translator needs no key, so reporting one would be a false blocker."""
+    script = tmp_path / "movie.txt"
+    script.write_text("JACK\nHello.\n", encoding="utf-8")
+    monkeypatch.setenv("SCRIPT_PATH", str(script))
 
-    monkeypatch.setenv("TRANSLATION_BACKEND", "nllb")
-
-    settings = Settings.from_env()
-
-    assert settings.missing_credentials() == ["HUGGINGFACE_TOKEN"]
+    assert Settings.from_env().script_path == script
 
 
 def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -189,8 +155,6 @@ def test_environment_variables_override_defaults(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("WORK_DIR", str(tmp_path / "work"))
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("MODEL_CACHE_DIR", str(tmp_path / "models"))
-    monkeypatch.setenv("TRANSLATION_PROVIDER", "deepseek")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_test_token")
     monkeypatch.setenv("DEVICE", "cpu")
     monkeypatch.setenv("LOG_LEVEL", "debug")
@@ -231,7 +195,6 @@ def test_ensure_directories_creates_all_paths(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setenv("WORK_DIR", str(tmp_path / "working"))
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "output"))
     monkeypatch.setenv("MODEL_CACHE_DIR", str(tmp_path / "models_cache"))
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
 
     settings = Settings.from_env()
@@ -244,17 +207,14 @@ def test_ensure_directories_creates_all_paths(monkeypatch: pytest.MonkeyPatch, t
 
 
 def test_as_dict_never_exposes_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GEMINI_API_KEY", "super-secret-value")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "other-secret-value")
+    monkeypatch.setenv("TRANSLATION_API_KEY", "super-secret-value")
     monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_secret_value")
 
     payload = Settings.from_env().as_dict()
 
-    assert payload["gemini_api_key_set"] is True
-    assert payload["deepseek_api_key_set"] is True
+    assert payload["translation_api_key_set"] is True
     assert payload["huggingface_token_set"] is True
     assert "super-secret-value" not in str(payload)
-    assert "other-secret-value" not in str(payload)
     assert "hf_secret_value" not in str(payload)
 
 
@@ -326,61 +286,45 @@ def test_translation_settings_are_configurable(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
     defaults = Settings.from_env()
-    # The default follows the configured backend: a served endpoint is asked for a served
-    # model name, not for a local checkpoint path. Within the served backend it also
-    # follows the provider, so the default endpoint and model are the same vendor's.
-    assert defaults.translation_backend == "openai"
-    assert defaults.translation_model == DEFAULT_TRANSLATION_GEMINI_MODEL
-    assert defaults.translation_base_url == DEFAULT_TRANSLATION_GEMINI_BASE_URL
-    assert defaults.translation_batch_size == DEFAULT_TRANSLATION_BATCH_SIZE
-    assert defaults.translation_thinking == DEFAULT_TRANSLATION_THINKING
-    assert (
-        defaults.translation_max_reduction_attempts
-        == DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS
-        == 0
-    )
+    assert defaults.translation_model == DEFAULT_TRANSLATION_MODEL
+    assert defaults.translation_base_url == DEFAULT_TRANSLATION_BASE_URL
+    assert defaults.translation_window_lines == DEFAULT_TRANSLATION_WINDOW_LINES
 
-    monkeypatch.setenv("TRANSLATION_MODEL", "gemini-3.6-flash")
-    monkeypatch.setenv("TRANSLATION_BASE_URL", "https://example.test/v1")
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "4")
-    monkeypatch.setenv("TRANSLATION_THINKING", "HIGH")
+    monkeypatch.setenv("TRANSLATION_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+    monkeypatch.setenv("TRANSLATION_BASE_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setenv("TRANSLATION_WINDOW_LINES", "32")
+    monkeypatch.setenv("TRANSLATION_WINDOW_OVERLAP", "6")
+    monkeypatch.setenv("TRANSLATION_MAX_CONCURRENCY", "16")
+    monkeypatch.setenv("TRANSLATION_GPU_MEMORY_UTILIZATION", "0.85")
+    monkeypatch.setenv("TRANSLATION_TEMPERATURE", "0.2")
 
     settings = Settings.from_env()
-    assert settings.translation_model == "gemini-3.6-flash"
-    assert settings.translation_base_url == "https://example.test/v1"
-    assert settings.translation_batch_size == 4
-    assert settings.translation_thinking == "high"  # normalised to lower case
+    assert settings.translation_model == "Qwen/Qwen2.5-7B-Instruct"
+    assert settings.translation_base_url == "http://127.0.0.1:8001/v1"
+    assert settings.translation_window_lines == 32
+    assert settings.translation_window_overlap == 6
+    assert settings.translation_max_concurrency == 16
+    assert settings.translation_gpu_memory_utilization == 0.85
+    assert settings.translation_temperature == 0.2
 
     payload = settings.as_dict()
-    assert payload["translation_model"] == "gemini-3.6-flash"
-    assert payload["translation_base_url"] == "https://example.test/v1"
-    assert payload["translation_batch_size"] == 4
-    assert payload["translation_thinking"] == "high"
-    # Which vendor a manifest was produced with is part of the manifest: a later run
-    # cannot be compared with this one without it.
-    assert payload["translation_provider"] == "gemini"
-    assert payload["translation_api_key_env"] == "GEMINI_API_KEY"
-
-
-def test_translation_reduction_attempts_allow_zero(
-    monkeypatch: pytest.MonkeyPatch, _clean_env: None
-) -> None:
-    monkeypatch.setenv("TRANSLATION_MAX_REDUCTION_ATTEMPTS", "0")
-    assert Settings.from_env().translation_max_reduction_attempts == 0
-
-    monkeypatch.setenv("TRANSLATION_MAX_REDUCTION_ATTEMPTS", "-1")
-    with pytest.raises(ValueError, match="must not be negative"):
-        Settings.from_env()
+    assert payload["translation_model"] == "Qwen/Qwen2.5-7B-Instruct"
+    assert payload["translation_window_lines"] == 32
+    assert payload["translation_window_overlap"] == 6
+    # Which model and how it was batched are part of the manifest: a later run
+    # cannot be compared with this one without them.
+    assert payload["translation_provider"] == "local"
+    assert payload["translation_backend"] == "vllm"
 
 
 def test_malformed_integer_setting_is_rejected(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "0")
+    monkeypatch.setenv("TRANSLATION_WINDOW_LINES", "0")
     with pytest.raises(ValueError, match="positive integer"):
         Settings.from_env()
 
-    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "lots")
+    monkeypatch.setenv("TRANSLATION_WINDOW_LINES", "lots")
     with pytest.raises(ValueError, match="integer"):
         Settings.from_env()
 
@@ -493,7 +437,7 @@ def test_malformed_float_setting_is_rejected(
 def test_malformed_boolean_setting_is_rejected(
     monkeypatch: pytest.MonkeyPatch, _clean_env: None
 ) -> None:
-    monkeypatch.setenv("TRANSLATION_ENFORCE_BUDGET", "maybe")
+    monkeypatch.setenv("TTS_CONTINUE_ON_FAILURE", "maybe")
     with pytest.raises(ValueError, match="boolean flag"):
         Settings.from_env()
 
@@ -586,11 +530,10 @@ def test_the_syllable_prior_matches_the_adaptation_prompt() -> None:
     )
 
 
-def test_the_default_length_penalty_leaves_the_model_alone() -> None:
-    """Only a line that will not fit should be searched for brevity."""
+def test_the_synthesis_split_threshold_leaves_room_for_a_segment() -> None:
+    """A line over this is split before OmniVoice's own ceiling is reached."""
 
-    assert DEFAULT_TRANSLATION_LENGTH_PENALTY == 1.0
-    assert 0.0 < DEFAULT_TRANSLATION_SHORTEN_PENALTY < 1.0
+    assert 80 <= DEFAULT_TTS_MAX_INPUT_CHARS <= 400
 
 
 def test_the_line_gap_is_positive_and_small() -> None:

@@ -51,9 +51,10 @@ models_cache/**
 # A bare `models/` is not the configured cache directory (`models_cache` is), but a
 # relative MODEL_CACHE_DIR - which is what a test or a quick script tends to set -
 # resolves to exactly this, and a partial download landing in the tree must never be
-# committable.
-models/
-models/**
+# committable. Anchored to the repository root so it cannot swallow `app/models/`,
+# which is a source package (the shared model loader), not a cache.
+/models/
+/models/**
 .cache/
 .huggingface/
 torch_cache/
@@ -80,12 +81,20 @@ torch_cache/
 
 # Native-speaker voice samples are pipeline *inputs*, not artifacts: the GPU worker
 # needs them to give each character an Amharic voice instead of the film's own English
-# audio, exactly as it needs the test clip above. They are a few hundred KB each. These
-# negations have to come after the media block, because the last matching rule wins.
-!data/voice-samples/*.mp3
-!data/voice-samples/*.wav
-!data/voice-samples/*.flac
-!data/voice-samples/*.m4a
+# audio, exactly as it needs the test clip above. They are a few hundred KB each, and
+# they live one directory below the root, one per character:
+#     voice_samples/<Character_Name>/sample_01.wav + sample_01.txt
+# The globs are recursive because the audio sits under that character directory; a
+# single-level negation would only match files directly in the root. These negation
+# rules have to come after the media block, because the last matching rule wins.
+!data/voice-samples/**/*.wav
+!data/voice-samples/**/*.mp3
+!data/voice-samples/**/*.flac
+!data/voice-samples/**/*.m4a
+!data/voice_samples/**/*.wav
+!data/voice_samples/**/*.mp3
+!data/voice_samples/**/*.flac
+!data/voice_samples/**/*.m4a
 
 # ---------------------------------------------------------------------------
 # JSON manifests generated during processing

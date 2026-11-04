@@ -31,6 +31,7 @@ Deliberately not done here
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -303,7 +304,7 @@ def _find_overlaps(placed: list[tuple[int, str, float, float]]) -> tuple[Overlap
 
 
 def mix_track(
-    aligned: list[AlignedClip] | tuple[AlignedClip, ...],
+    aligned: Iterable[AlignedClip],
     music_stem: str | Path,
     effects_stem: str | Path,
     *,
@@ -315,7 +316,11 @@ def mix_track(
     Parameters
     ----------
     aligned:
-        Lines from :func:`app.pipeline.timing.align_dialogue`.
+        Lines from :func:`app.pipeline.timing.align_dialogue`, or the live iterator
+        :func:`app.pipeline.timing.iterate_aligned` returns. An iterator is consumed as
+        it arrives, so the mix starts reading placed lines while the last ones are still
+        being fitted; each line is written into the dialogue buffer at its own offset, so
+        arrival order does not matter.
     music_stem, effects_stem:
         The ``music`` and ``effects`` stems from
         :func:`app.pipeline.separation.separate_stems`. The speech stem is
@@ -348,13 +353,6 @@ def mix_track(
     resolved = settings if settings is not None else get_settings()
     dialogue_gain_db, duck_db = _validate_levels(resolved)
 
-    lines = list(aligned)
-    for line in lines:
-        if not isinstance(line, AlignedClip):
-            raise InvalidClipError(
-                f"expected an AlignedClip, got {type(line).__name__}"
-            )
-
     notes: list[str] = []
     music, music_rate = _read_stereo(Path(music_stem), label="the music stem")
     effects, effects_rate = _read_stereo(Path(effects_stem), label="the effects stem")
@@ -384,7 +382,11 @@ def mix_track(
     gain = db_to_gain(dialogue_gain_db)
     placed: list[tuple[int, str, float, float]] = []
 
-    for line in sorted(lines, key=lambda entry: (entry.start, entry.index)):
+    for line in aligned:
+        if not isinstance(line, AlignedClip):
+            raise InvalidClipError(
+                f"expected an AlignedClip, got {type(line).__name__}"
+            )
         samples, sample_rate = _read_stereo(
             Path(line.audio_path), label=f"the aligned line {line.index}"
         )

@@ -43,8 +43,8 @@ import json
 import sys
 import time
 import traceback
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ from app.pipeline import (
     evaluation,
     mixing,
     qc,
+    script_parse,
     separation,
     timing,
     transcription,
@@ -87,6 +88,7 @@ STAGE_ORDER: tuple[str, ...] = (
     "separation",
     "diarization",
     "transcription",
+    "script",
     "translation",
     "voice_profiles",
     "tts",
@@ -145,6 +147,11 @@ class PipelineResult:
     speaker_splits: tuple[diarization.SpeakerClusterSplit, ...] = ()
     #: Characters the film gave no usable reference, spoken in a designed voice.
     designed_voices: tuple[DesignedVoice, ...] = ()
+    #: What the ``.txt`` screenplay resolved the diarization labels to, when one was
+    #: supplied.
+    character_assignment: script_parse.CharacterAssignment | None = None
+    #: Pre-encoded speaker prompts, one per character with a ``voice_samples`` pair.
+    pre_encoded_speakers: tuple[str, ...] = ()
 
     @property
     def final_video(self) -> Path:
@@ -160,9 +167,18 @@ class PipelineResult:
 
     @property
     def unfitted_lines(self) -> tuple[AlignedClip, ...]:
-        """Lines whose delivery could not be fitted to their original window."""
+        """Lines that did not fit the time available to them.
 
-        return tuple(line for line in self.alignment if not line.fits)
+        Only an *overrun* counts. A line shorter than its window is not a defect: the
+        stage pads the window with silence rather than slowing the delivery down, so
+        the dub still lands on the picture at its natural cadence.
+        """
+
+        return tuple(
+            line
+            for line in self.alignment
+            if line.overrun > 0.005 or line.trimmed > 0.005
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe view of the run, for a manifest or a report."""
@@ -234,6 +250,12 @@ class PipelineResult:
                 "lines": len(self.dialogue),
                 "segments": [_dialogue_dict(line) for line in self.dialogue],
             },
+            "script": (
+                None
+                if self.character_assignment is None
+                else self.character_assignment.as_dict()
+            ),
+            "pre_encoded_speakers": list(self.pre_encoded_speakers),
             "voice_profiles": {                speaker_id: {
                     "reference_audio": portable_path(profile.reference_audio),
                     "reference_start": profile.reference_start,
@@ -570,13 +592,43 @@ def run_pipeline(
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
 
+    # The screenplay is the only ground truth for *who* is speaking and for the
+    # complete sentence a fragment belongs to. It is applied before sentences are
+    # assembled, so two characters a merged cluster conflated are split apart before
+    # their fragments can be joined into one utterance.
+    script: script_parse.ParsedScript | None = None
+    assignment: script_parse.CharacterAssignment | None = None
+    script_path = Path(resolved.script_path)
+    if script_path.is_file():
+        def _apply_script() -> tuple[script_parse.ParsedScript, script_parse.CharacterAssignment]:
+            parsed = script_parse.load_script(script_path)
+            return parsed, script_parse.align_characters(lines, parsed)
+
+        script, assignment = _stage("script", seconds, report, _apply_script)
+        lines = assignment.segments
+        turns = assignment.relabel_turns(turns)
+        report(
+            f"  screenplay: {len(script)} dialogue line(s), "
+            f"{len(script.characters)} character(s); "
+            f"{assignment.matched} transcribed line(s) matched, "
+            f"{assignment.inherited} inherited their speaker's character, "
+            f"{assignment.unmatched} kept their diarization label"
+        )
+        for note in assignment.notes:
+            report(f"  screenplay: {note}")
+    else:
+        _stage("script", seconds, report, lambda: None)
+        report(
+            f"  screenplay: none at {script_path}; keeping SPEAKER_XX labels and "
+            "letting the model infer characters from the dialogue"
+        )
+
     # A transcriber segments on pauses, not on grammar, so one spoken sentence
-    # routinely arrives as several segments. Adapting and speaking each of them
+    # routinely arrives as several fragments. Translating and speaking each fragment
     # separately produces exactly what a listener hears as broken delivery: the
     # same thought becomes several utterances, each with its own final intonation.
     # The sentence is therefore the unit from here on; the raw segments stay the
-    # record of what was transcribed, and the clauses inside a sentence stay
-    # available as performance beats.
+    # record of what was transcribed.
     sentences = tuple(transcription.assemble_sentences(lines))
     if sentences and len(sentences) < len(lines):
         report(
@@ -595,45 +647,19 @@ def run_pipeline(
             report,
             translation.adapt_dialogue,
             sentences,
+            script=script.lines if script is not None else (),
             settings=resolved,
             bible=bible,
-            enforce_budget=resolved.translation_enforce_budget,
-            enforce_fidel_loanwords=resolved.translation_enforce_fidel_loanwords,
-            maximum_reduction_attempts=resolved.translation_max_reduction_attempts,
             on_progress=report,
         )
     )
-    if resolved.translation_backend == "nllb":
-        # NLLB is a sentence-level translation model: it is handed one line at a time
-        # and cannot be asked for a shorter rewrite, so the scene/character context,
-        # the syllable-budget re-ask and the script check have nothing to act on here.
-        # They are not silently skipped - the run says so.
-        report(
-            "  adaptation: NLLB translates line by line; scene/character context and "
-            "length enforcement are not applied"
-        )
-        # Whether the Amharic can be spoken in the time the film gives it is the number
-        # that decides whether the dub fits or has to be squashed, so it is measured and
-        # stated here rather than left to be discovered from the timing report later.
-        _report_dialogue_fit(dialogue, resolved, report)
-    else:
-        # Which model produced the Amharic, and how hard it was asked to think, are the
-        # first things to know when comparing two runs. The provider also decides whether
-        # the requested thinking level was even available, which a bare model name would
-        # leave a reader to guess at.
-        report(
-            f"  adaptation: {resolved.translation_provider} "
-            f"{resolved.translation_model} "
-            f"({translation.describe_thinking(resolved)})"
-        )
-        report(f"  adaptation fallback: {translation.describe_fallback(resolved)}")
-        report(
-            "  adaptation requests: one per batch; no rewrites, retries, or failover"
-        )
-        # Only the instruction-following backend reads the bible, so only it can report
-        # having applied one.
-        if bible:
-            report(f"  dialogue bible: {len(bible)} character(s) applied")
+    report(f"  adaptation: {translation.describe_backend(resolved)}")
+    if bible:
+        report(f"  dialogue bible: {len(bible)} character(s) applied")
+    # Whether the Amharic can be spoken in the time the film gives it is the number
+    # that decides whether the dub fits or has to be squashed, so it is measured and
+    # stated here rather than left to be discovered from the timing report later.
+    _report_dialogue_fit(dialogue, resolved, report)
     if not dialogue:
         raise EmptyStageError("adaptation produced no lines; nothing to synthesize")
 
@@ -643,47 +669,87 @@ def run_pipeline(
     # only result is a set of references nothing reads. Which engines those are is the
     # TTS stage's own contract, asked rather than assumed here.
     needs_profiles = tts.engine_needs_profiles(resolved.tts_engine)
-    profiles: Mapping[str, VoiceProfile] = {}
+    profiles: dict[str, VoiceProfile] = {}
+    speaker_tokens: dict[str, Any] = {}
+    pre_encoded: tuple[str, ...] = ()
+    characters = list(dict.fromkeys(line.speaker_id for line in dialogue))
     if not needs_profiles:
         seconds["voice_profiles"] = 0.0
         report(f"  voice profiles: skipped ({resolved.tts_engine} is single-voice)")
+    elif not characters:
+        raise EmptyStageError(
+            "adaptation produced no characters; there is nothing to voice"
+        )
     else:
-        # Built from every transcribed line, not from a shortened run: a profile is a
-        # character's identity and is reused across runs, so it is never truncated.
-        build = _stage(
+        # 1. Manual samples win. Each character with a complete
+        #    voice_samples/<Character>/sample_01.wav + .txt pair is encoded once, here,
+        #    and its prompt is carried in memory to the synthesis stage.
+        bank = _stage(
             "voice_profiles",
             seconds,
             report,
-            voice_profiles.build_voice_profiles_detailed,
-            turns,
-            stems.speech,
-            # Simultaneous speech is passed in because it is the one thing the
-            # per-line overlap check cannot see: the turns it compares are exclusive,
-            # so a window full of crosstalk still reports no overlap.
-            crosstalk=crosstalk,
-            transcript=lines,
+            voice_profiles.precompute_speaker_profiles,
+            characters,
             settings=resolved,
-            require_reference_transcript=True,
         )
-        profiles = build.profiles
-        for unusable in build.unusable:
-            # A character the film never gave four clean seconds is still in the dub;
-            # saying so is what keeps a designed voice from looking like a bug.
-            report(
-                f"  {unusable.speaker_id}: designed voice, no actor reference "
-                f"({unusable.reason})"
-            )
-        if not profiles and not build.unusable:
+        profiles.update(bank.voice_profiles())
+        speaker_tokens.update(bank.tokens())
+        pre_encoded = tuple(sorted(profiles))
+        for note in bank.notes:
+            report(f"  voice samples: {note}")
+
+        # 2. Everyone else falls back to the film's own cleanest reference, which is
+        #    what a run without manual samples uses for the whole cast.
+        missing = [character for character in characters if character not in profiles]
+        build = None
+        if missing:
+            relevant = [turn for turn in turns if turn.speaker_id in set(missing)]
+            if relevant:
+                refine_started = time.perf_counter()
+                build = voice_profiles.build_voice_profiles_detailed(
+                    relevant,
+                    stems.speech,
+                    # Simultaneous speech is passed in because it is the one thing the
+                    # per-line overlap check cannot see: the turns it compares are
+                    # exclusive, so a window full of crosstalk still reports no overlap.
+                    crosstalk=crosstalk,
+                    transcript=list(lines),
+                    settings=resolved,
+                    require_reference_transcript=True,
+                )
+                # This refinement is part of the voice-profile stage, not a stage of
+                # its own: it is only reached for characters a manual sample missed.
+                seconds["voice_profiles"] = seconds.get("voice_profiles", 0.0) + (
+                    time.perf_counter() - refine_started
+                )
+                profiles.update(build.profiles)
+                for unusable in build.unusable:
+                    # A character the film never gave four clean seconds is still in the
+                    # dub; saying so is what keeps a designed voice from looking like a bug.
+                    report(
+                        f"  {unusable.speaker_id}: designed voice, no actor reference "
+                        f"({unusable.reason})"
+                    )
+        if not profiles and not (build is not None and build.unusable):
+            # Nothing was cloned and nothing was *reported* as unusable either, which
+            # means the stage returned nothing at all rather than that this cast is
+            # uncloneable. A run must not silently fall back to designed voices for a
+            # whole film, so this stops and names the stage.
             raise EmptyStageError(
-                "no voice profile could be built from the dialogue stem; the TTS stage "
-                "needs one identity reference per speaker"
+                "no voice profile could be built: no character has a complete "
+                "voice_samples/<Character>/ sample pair and the dialogue stem offered "
+                "no clean reference"
+            )
+        if pre_encoded:
+            report(
+                f"  pre-encoded: {len(pre_encoded)} character prompt(s) cached in "
+                f"memory ({', '.join(pre_encoded)})"
             )
         report(
-            "  voice references: using clean, transcript-matched film-actor audio "
-            "(one continuous 4-10 second interval per character; "
-            "Amharic-tuned OmniVoice)"
+            "  voice references: manual samples first, then clean, transcript-matched "
+            "film-actor audio (one continuous 4-10 second interval per character)"
         )
-        for speaker_id, profile in profiles.items():
+        for speaker_id, profile in sorted(profiles.items()):
             pitch = (
                 f", median pitch {profile.estimated_pitch_hz:.0f} Hz"
                 if profile.estimated_pitch_hz is not None
@@ -713,6 +779,8 @@ def run_pipeline(
         stems.speech,
         profiles or None,
         settings=resolved,
+        speaker_tokens=speaker_tokens or None,
+        on_progress=report,
     )
     clips = tuple(synthesized.clips)
     skipped = tuple(synthesized.skipped)
@@ -732,17 +800,39 @@ def run_pipeline(
             "speech synthesis produced no clips; there is nothing to place or mix"
         )
 
-    alignment = tuple(
-        _stage(
-            "timing",
-            seconds,
-            report,
-            timing.align_dialogue,
-            clips,
-            output_dir=run_dir,
-            settings=resolved,
-        )
-    )
+    # Fitting streams: each line is placed, written and yielded while the next one is
+    # still being fitted, and the mixing stage consumes that same stream - it reads the
+    # stems first and then places each line as it arrives, so a film's dialogue is never
+    # buffered whole before the mix begins. The lines are also collected here because the
+    # manifest, the quality report and the bleed measurements all describe the finished
+    # timeline.
+    streamed: list[AlignedClip] = []
+    timing_started = time.perf_counter()
+    report("  -> timing")
+
+    def _aligned_stream() -> Iterator[AlignedClip]:
+        try:
+            for position, aligned in enumerate(
+                timing.iterate_aligned(
+                    clips,
+                    output_dir=run_dir,
+                    settings=resolved,
+                    speech_stem=stems.speech,
+                ),
+                start=1,
+            ):
+                streamed.append(aligned)
+                if position == 1 or position % 25 == 0 or position == len(clips):
+                    report(f"  timing: {position}/{len(clips)} line(s) aligned")
+                yield aligned
+        except Exception as exc:
+            # Named like every other stage failure, even though the work happens while
+            # the mixing stage is pulling from this iterator.
+            raise StageError(
+                f"the timing stage failed with {type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            seconds["timing"] = time.perf_counter() - timing_started
 
     # Measured, because the one way the source language can survive into a finished
     # dub is the separator leaving it in the music or effects, which are re-mixed
@@ -765,17 +855,38 @@ def run_pipeline(
                 f"{bleed.leaked} line(s); it will be heard under the Amharic"
             )
 
+    alignment_iter = _aligned_stream()
+    # Prime the stream before the mixer is called: this is what makes the timing stage
+    # start (and be timed, and reported) before mixing begins, while still handing mixing
+    # a live iterator rather than a materialized film.
+    first_aligned = next(alignment_iter, None)
+    if first_aligned is None:
+        raise EmptyStageError("timing produced no aligned lines; nothing to mix")
+
+    def _primed_stream() -> Iterator[AlignedClip]:
+        yield first_aligned
+        yield from alignment_iter
+
     mixed = _stage(
         "mixing",
         seconds,
         report,
         mixing.mix_track,
-        alignment,
+        _primed_stream(),
         stems.music,
         stems.effects,
         output_dir=run_dir,
         settings=resolved,
     )
+    # The mixing stage consumes the stream as it places lines; draining it afterwards is
+    # a no-op for that case and the guarantee for every other one (a stage substituted in
+    # a test, a future mixer that reads clips some other way): timing always runs to
+    # completion, so `streamed` and `seconds["timing"]` are never left half-filled.
+    for _ in alignment_iter:
+        pass
+    alignment = tuple(streamed)
+    if not alignment:
+        raise EmptyStageError("timing produced no aligned lines; nothing to mix")
 
     # The bed check above cannot see the finished dub: it inspects the music and
     # effects, and the dubbed dialogue is not part of them. This is the other half -
@@ -834,6 +945,8 @@ def run_pipeline(
         stage_seconds=dict(seconds),
         elapsed_seconds=time.perf_counter() - started,
         synthesized_lines=len(clips),
+        character_assignment=assignment,
+        pre_encoded_speakers=pre_encoded,
     )
 
     # Measured, not assumed: the model-free quality report is part of every run.
@@ -885,21 +998,14 @@ def _provenance(settings: Settings) -> dict[str, Any]:
 
     provenance: dict[str, Any] = {
         "tts_engine": settings.tts_engine,
-        "translation_backend": settings.translation_backend,
+        "translation_backend": "local-vllm",
+        "translation_model": settings.translation_model,
+        "translation_base_url": settings.translation_base_url,
+        "translation_window_lines": settings.translation_window_lines,
+        "translation_window_overlap": settings.translation_window_overlap,
+        "translation_max_concurrency": settings.translation_max_concurrency,
+        "translation_describe": translation.describe_backend(settings),
     }
-
-    if settings.translation_backend == "openai":
-        provenance["translation_provider"] = settings.translation_provider
-        provenance["translation_model"] = settings.translation_model
-        # What was *sent*, not what was configured: the provider decides whether the
-        # requested level was available, and a manifest must not claim reasoning the
-        # request never carried.
-        provenance["translation_thinking"] = translation.describe_thinking(settings)
-        provenance["translation_fallback"] = translation.describe_fallback(settings)
-    else:
-        # NLLB is a local checkpoint, so it is the path that identifies it.
-        provenance["translation_model"] = settings.translation_model
-
     return provenance
 
 
@@ -914,8 +1020,9 @@ def _engine_note(settings: Settings) -> str:
     if tts.engine_needs_profiles(settings.tts_engine):
         return (
             f"{settings.tts_engine} runs voice cloning: each character is spoken in "
-            "their own voice, cloned from their isolated performance in the film, so "
-            "the dub carries that performance's accent as well as its timbre"
+            "their own voice, cloned from the pre-encoded prompt of a manual "
+            "voice_samples recording when one exists, otherwise from their isolated "
+            "performance in the film"
         )
     return (
         f"{settings.tts_engine} is a single-voice engine: one voice speaks every part"
@@ -960,6 +1067,9 @@ def _write_manifest(
             "a line whose Amharic needs more time than the film gave it is moved "
             "later rather than being spoken over the next line, because two voices "
             "at once cannot be understood; the shift is recorded per line as 'drift'",
+            "each line is aligned to the actor's active vocal zone and the rest of its "
+            "window is filled with silence, so the Amharic is never time-stretched just "
+            "to fill a turn; 'silence_before'/'silence_after' record that padding",
             "the qc block is measured, not assumed; pronunciation is left "
             "unmeasured because it needs an Amharic ASR model, which is injected "
             "by the caller rather than downloaded by a run",
@@ -1006,6 +1116,15 @@ def main(argv: list[str] | None = None) -> int:
         help="directory for the run (default: <OUTPUT_DIR>/<source stem>)",
     )
     parser.add_argument(
+        "--script",
+        type=Path,
+        default=None,
+        help=(
+            "flat .txt screenplay used as ground truth for character names and the "
+            "complete sentences (default: SCRIPT_PATH, or data/input/script.txt)"
+        ),
+    )
+    parser.add_argument(
         "--max-lines",
         type=int,
         default=None,
@@ -1016,8 +1135,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    overrides: dict[str, Any] = {}
+    if args.script is not None:
+        overrides["script_path"] = args.script
+    settings = (
+        get_settings() if not overrides else replace(get_settings(), **overrides)
+    )
+
     try:
-        result = run_pipeline(args.source, output_dir=args.out, max_lines=args.max_lines)
+        result = run_pipeline(
+            args.source,
+            output_dir=args.out,
+            max_lines=args.max_lines,
+            settings=settings,
+        )
     except OrchestrationError as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         traceback.print_exc()

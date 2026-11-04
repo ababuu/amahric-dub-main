@@ -8,14 +8,13 @@ Design rules
 * A local ``.env`` file is loaded when present, but it never overrides variables
   that are already defined in the real environment. This lets the RunPod worker
   environment inject values that win over a developer's local file.
-* Secrets (``DEEPSEEK_API_KEY``, ``HUGGINGFACE_TOKEN``) are optional. The
-  project must stay runnable without them so that the scaffold, the health
-  check, and the tests work before any credentials exist.
+* Secrets (``HUGGINGFACE_TOKEN``) are optional. The project must stay runnable
+  without them so that the scaffold, the health check, and the tests work before
+  any credentials exist.
 * Secrets are *never* hard-coded and are *never* logged or printed.
 
 Environment variables
 ---------------------
-``DEEPSEEK_API_KEY``  API key for the DeepSeek dialogue adaptation/translation.
 ``HUGGINGFACE_TOKEN`` Token used to download gated Hugging Face models
                       (e.g. pyannote speaker diarization).
 ``INPUT_DIR``         Directory holding source videos. Defaults to ``data/input``.
@@ -29,27 +28,34 @@ Environment variables
                       CTranslate2 compute type (e.g. ``float16`` on GPU).
 ``TRANSCRIPTION_LANGUAGE``
                       Source language code; unset means detect automatically.
-``TRANSLATION_BACKEND``
-                      ``nllb`` for local translation, or ``openai`` (the default) for
-                      an instruction-following model served over an OpenAI-compatible
-                      endpoint.
-``TRANSLATION_PROVIDER``
-                      Which vendor the served backend talks to: ``gemini`` (the
-                      default), ``deepseek``, or ``other`` for a server you name
-                      yourself. Decides the endpoint, the model, the key variable and
-                      how reasoning is requested.
-``TRANSLATION_MODEL`` The model the served endpoint answers to; follows the provider.
+``TRANSLATION_MODEL``
+                      Qwen-2.5-Instruct checkpoint served by the local vLLM server.
 ``TRANSLATION_BASE_URL``
-                      Endpoint base URL; follows the provider, required for ``other``.
-``TRANSLATION_BATCH_SIZE``
-                      Consecutive dialogue lines adapted in one request.
-``TRANSLATION_THINKING``
-                      ``off``/``low``/``medium``/``high``, mapped onto whatever the
-                      provider understands. Reported as what was actually sent.
-``TRANSLATION_ENFORCE_BUDGET`` / ``TRANSLATION_ENFORCE_FIDEL_LOANWORDS``
-                      Whether a line that comes back over its syllable budget, or
-                      with a borrowed word left in Roman script, is sent back once
-                      to be fixed. Both on by default.
+                      OpenAI-compatible base URL of the local vLLM server.
+``TRANSLATION_API_KEY``
+                      Optional bearer token for that server; local vLLM usually
+                      ignores it, so it defaults to an empty string.
+``TRANSLATION_WINDOW_LINES`` / ``TRANSLATION_WINDOW_OVERLAP``
+                      Size of one chronological context window, and how many lines
+                      consecutive windows share so a scene is never cut mid-exchange.
+``TRANSLATION_MAX_CONCURRENCY``
+                      Number of windows in flight at once - the client-side ceiling
+                      that keeps a high-throughput batch from spiking VRAM.
+``TRANSLATION_GPU_MEMORY_UTILIZATION``
+                      Fraction of VRAM the vLLM server may pre-allocate; exported to
+                      the server launcher, not sent with a request.
+``TRANSLATION_TEMPERATURE`` / ``TRANSLATION_MAX_NEW_TOKENS`` / ``TRANSLATION_TIMEOUT_SECONDS``
+                      Sampling and request bounds for one window.
+``SCRIPT_PATH``       Flat ``.txt`` ground-truth screenplay used for character names
+                      and dialogue alignment. Absent means labels stay ``SPEAKER_XX``.
+``TTS_MAX_INPUT_CHARS``
+                      Longest text sent to OmniVoice in one inference pass; longer
+                      lines are split at punctuation and stitched back together.
+``TTS_MAX_CONCURRENCY``
+                      Number of synthesis requests in flight at once.
+``TIMING_ACTIVE_ZONE_MARGIN_DB`` / ``TIMING_ACTIVE_ZONE_MIN_SECONDS``
+                      How the active speech zone inside an original line is detected
+                      so the dub is padded with silence rather than time-stretched.
 ``VOICE_PROFILE_DIR`` Directory holding per-speaker voice profiles.
 ``DIALOGUE_BIBLE_PATH``
                       Persistent character/consistency state (names, address
@@ -131,154 +137,65 @@ DEFAULT_TRANSCRIPTION_COMPUTE_TYPE = "float16"
 #: so no comparison with the original can find it.
 DEFAULT_QC_PRONUNCIATION = False
 
-#: Which translation backend :mod:`app.pipeline.translation` uses.
+#: The local dialogue-adaptation model: Qwen-2.5-Instruct, served by vLLM on the
+#: GPU host. Every heavy operation - including this inference - runs on the rented
+#: GPU, because the host CPU cannot carry a 7B-to-14B model at film scale.
 #:
-#: ``"openai"`` (the default) talks to any OpenAI-compatible endpoint - Gemini by
-#: default, DeepSeek or a server you run yourself if configured - and is what provides
-#: *adaptation* rather than translation: scene and character context, a syllable budget
-#: that a line can be sent back to meet, the
-#: borrowed-word policy, and per-line performance metadata.
-#:
-#: ``"nllb"`` translates locally with Meta's NLLB-200 and needs no key. It is kept
-#: because it is genuinely the stronger *translator* on measured Amharic - it beats every
-#: open instruction model on this direction - but it cannot be instructed, and that turns
-#: out to matter more for dubbing than translation quality does: NLLB cannot be told to
-#: be brief, to keep a borrowed word in Fidel, or to match a character. Measured on a real
-#: run it produced Amharic needing **1.66x** the time available, with no mechanism to
-#: shorten it, which forced the timing stage to cut 31 of 38 lines short.
-DEFAULT_TRANSLATION_BACKEND = "openai"
+#: The checkpoint name is the one the server was launched with; the client never
+#: downloads weights, so a mismatch is reported by vLLM rather than hidden here.
+DEFAULT_TRANSLATION_MODEL = "Qwen/Qwen2.5-14B-Instruct"
 
-#: NLLB-200 at 3.3B parameters.
-#:
-#: Chosen over the distilled 1.3B on measured Amharic, not on size. On FLORES-200
-#: (chrF++, eng->amh) 3.3B scores 37.9 against 37.2 for both the 1.3B and 600M
-#: checkpoints, and on AFRIDOC-MT's document-level metric the gap is wider: 52.2
-#: against 49.3. Document-level context is the part that matters for dialogue, and
-#: NLLB is the only model family with published Amharic numbers that beat every open
-#: instruction-following model tried on it (AFRIDOC-MT measured Gemma-2-9B at 6.5
-#: d-chrF on this direction, and AfriScience-MT put the best open LLM about 27 points
-#: of SSA-COMET behind NLLB).
-#:
-#: It costs ~6.6 GB in bf16, which the target 48 GB card carries without displacing
-#: anything else. Amharic (``amh_Ethi``) has real parallel data behind it in NLLB-200.
-#: The weights are CC-BY-NC-4.0.
-DEFAULT_TRANSLATION_MODEL = "facebook/nllb-200-3.3B"
+#: OpenAI-compatible endpoint of the local vLLM server. Loopback by default: the
+#: server and the pipeline run in the same GPU pod, and nothing about a film is
+#: sent to a third party.
+DEFAULT_TRANSLATION_BASE_URL = "http://127.0.0.1:8000/v1"
 
-#: Which vendor serves the instruction-following translation model. Both speak the
-#: OpenAI chat-completions protocol, so the pipeline code is the same; the provider
-#: decides three things that genuinely differ between them - the environment variable
-#: the API key is read from, the default endpoint and model, and how "think harder"
-#: is requested.
-DEFAULT_TRANSLATION_PROVIDER = "gemini"
+#: Environment variable holding the optional bearer token for that server. A local
+#: vLLM deployment normally ignores the key, so an empty value is valid and no
+#: hosted-vendor credential is needed anywhere in this pipeline.
+TRANSLATION_API_KEY_ENV = "TRANSLATION_API_KEY"
 
-#: The model the Gemini provider asks for by default.
-#:
-#: ``gemini-3.8-flash`` is the current Flash model, and is free of charge on the free
-#: tier. It is *not* an arbitrary pick: ``gemini-3.7-flash`` - the id this project
-#: first reached for - is deprecated, and Google now routes requests for it to
-#: ``gemini-3.8-flash`` automatically, so naming 3.8 explicitly is naming what
-#: actually answers. Thinking is on by default at level ``medium``.
-#:
-#: Amharic evidence is thin and is stated as such in the README: there is no
-#: Google-published Amharic MT benchmark. What justifies an instruction-following
-#: model here is not raw translation quality but *instructability* - the adaptation
-#: stage has to hit a syllable budget, keep a borrowed word in Fidel, and hold a
-#: character consistent, none of which a sentence-level MT model can be asked for.
-DEFAULT_TRANSLATION_GEMINI_MODEL = "gemini-3.8-flash"
+#: Dialogue lines in one chronological context window. Large enough that the model
+#: sees a scene as a conversation rather than a list of sentences, small enough that
+#: one rejection is cheap and the JSON response stays inside a predictable budget.
+DEFAULT_TRANSLATION_WINDOW_LINES = 24
 
-#: Gemini's OpenAI-compatible endpoint. Documented by Google as beta; switching back
-#: to another provider is a ``TRANSLATION_PROVIDER`` change and nothing else.
-DEFAULT_TRANSLATION_GEMINI_BASE_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/openai/"
-)
+#: Lines consecutive windows share. The overlap is what keeps an exchange from being
+#: cut in half at a window boundary; the duplicate lines it produces are removed by
+#: :func:`app.pipeline.translation.deduplicate_records` before anything downstream.
+DEFAULT_TRANSLATION_WINDOW_OVERLAP = 5
 
-#: How hard the served model is asked to think, one of ``off``, ``low``, ``medium``,
-#: ``high``. The adaptation stage is the one place in this pipeline where reasoning
-#: pays: it must read a scene, keep a character consistent, and hit a syllable count
-#: that is often far below a literal rendering. ``off`` minimizes latency and cost;
-#: ``medium`` or ``high`` may help with difficult dialogue.
-#:
-#: ``off`` is honest about being a request rather than a guarantee: Gemini 3 models
-#: cannot disable reasoning, so on that provider it selects the lowest level available.
-DEFAULT_TRANSLATION_THINKING = "off"
+#: How many windows may be in flight at once. This is the client-side half of the
+#: VRAM throttle: the server pre-allocates its cache (``--gpu-memory-utilization``),
+#: and this bounds how much request state can land on it at the same moment.
+DEFAULT_TRANSLATION_MAX_CONCURRENCY = 8
 
-#: Retained for compatibility with existing environment files. Requests do not fail
-#: over: a missing Gemini key selects DeepSeek before the first request, while any
-#: request failure is surfaced immediately.
-DEFAULT_TRANSLATION_FALLBACK_PROVIDER = "deepseek"
+#: Fraction of VRAM the vLLM server may pre-allocate. Handed to the server launcher
+#: as ``--gpu-memory-utilization``; it is never sent with a chat request.
+DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION = 0.90
 
-#: The model the other instruction-following provider asks for by default. Measured
-#: against the test film's real 42-line transcript, ``deepseek-v4-pro`` produced 426
-#: syllables where ``deepseek-flash`` produced 462 and the older prompt produced 486,
-#: and it got the short lines right where flash did not ("We're done." -> ጨረስን rather
-#: than ጨረቃ, "moon"). Kept so the two providers can be compared on the same film.
-DEFAULT_TRANSLATION_DEEPSEEK_MODEL = "deepseek-v4-pro"
+#: Sampling temperature for adaptation. Zero keeps the same film producing the same
+#: Amharic twice, which is what makes two runs comparable.
+DEFAULT_TRANSLATION_TEMPERATURE = 0.0
 
-#: DeepSeek's endpoint, for ``TRANSLATION_PROVIDER=deepseek``.
-DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+#: Longest JSON response one window may generate, in tokens. A 24-line window needs
+#: well under this; the bound exists so a runaway generation cannot hold a slot.
+DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 2048
 
-#: Kept as the name of the *served instruction-following backend's* default model, which
-#: is what older code and documentation call it. New code should read
-#: :data:`DEFAULT_TRANSLATION_GEMINI_MODEL` or :data:`DEFAULT_TRANSLATION_DEEPSEEK_MODEL`
-#: according to the provider.
-DEFAULT_TRANSLATION_OPENAI_MODEL = DEFAULT_TRANSLATION_GEMINI_MODEL
+#: Seconds one window request may take before it is failed rather than left pending.
+DEFAULT_TRANSLATION_TIMEOUT_SECONDS = 300.0
 
-#: Beam search width. ``1`` is greedy, which is deterministic - the same line always
-#: translates the same way, so two runs can be compared against one another. Raise it
-#: when quality matters more than reproducibility, at a proportional cost in time.
-DEFAULT_TRANSLATION_NUM_BEAMS = 1
-
-#: Longest output NLLB may generate for one chunk, in tokens. 512 is comfortably
-#: above any spoken line; it exists to bound a runaway generation rather than to
-#: shape it.
-DEFAULT_TRANSLATION_MAX_NEW_TOKENS = 512
-
-#: NLLB's decoding preference over the *length* of its output. ``1.0`` is the model's own
-#: balance; below it the search favours shorter renderings, above it longer ones.
-#:
-#: This matters more here than in ordinary translation. Amharic does not express the same
-#: idea in the same number of syllables as English, so a faithful translation of film
-#: dialogue routinely needs about twice the time the English line occupied - measured on a
-#: real run, the delivered speech came to 117s against 63s of original window. A dub can
-#: recover about a third of that from the silence between lines, and the rest has to come
-#: out of the text. NLLB cannot be *told* to be brief, but it can be *searched* for
-#: brevity. Left at the model's own default.
-DEFAULT_TRANSLATION_LENGTH_PENALTY = 1.0
-
-#: Legacy setting retained for compatibility. NLLB translation is single-pass and does
-#: not perform a second inference to shorten an over-budget line.
-DEFAULT_TRANSLATION_SHORTEN_PENALTY = 0.6
-
-#: Syllables per second an Amharic performer delivers, used to turn a span of time into a
-#: syllable budget. Measured at about 4.6 syllables/second on real synthesized output, and
-#: kept a little slower than that on purpose: asking a line to fit when it comfortably
-#: can is harmless, while asking one to fit when it cannot leads to it being cut.
-#: ``app.pipeline.dialogue_context.DEFAULT_SYLLABLES_PER_SECOND`` holds the same prior
-#: for the adaptation prompt, and a test keeps the two in step.
+#: Syllables per second an Amharic performer delivers, used to turn a span of time into
+#: a syllable budget. Measured at about 4.6 syllables/second on real synthesized output,
+#: and kept a little slower than that on purpose: asking a line to fit when it
+#: comfortably can is harmless, while asking one to fit when it cannot leads to it being
+#: cut. ``app.pipeline.dialogue_context.DEFAULT_SYLLABLES_PER_SECOND`` holds the same
+#: prior for the adaptation prompt, and a test keeps the two in step.
 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND = 4.0
 
-#: Maximum number of rewrite requests for lines that miss the syllable budget or
-#: contain Roman-script text. Zero keeps each batch to one hosted model call, avoiding
-#: a second billable request; set to one to re-ask for targeted quality corrections.
-DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS = 0
-
-#: The endpoint the *served* instruction-following backend talks to by default.
-#: Kept under its original name for callers that already read it; the value follows the
-#: default provider.
-DEFAULT_TRANSLATION_BASE_URL = DEFAULT_TRANSLATION_GEMINI_BASE_URL
-
-#: How many consecutive dialogue lines are adapted in a single API request.
-#: Small enough to stay well inside the context window and keep a rejection
-#: cheap, large enough for the model to follow who is answering whom.
-DEFAULT_TRANSLATION_BATCH_SIZE = 10
-
-#: Whether a line that comes back too long for its window, or with a borrowed word
-#: left in Roman script, is sent back once to be fixed. Both are on by default: the
-#: first is how a line is made to fit without being stretched, and the second is how
-#: a word gets into a script the Amharic voice can actually read. Turn them off to
-#: send every line exactly once, which is cheaper and is what a comparison run wants.
-DEFAULT_TRANSLATION_ENFORCE_BUDGET = True
-DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS = True
+#: The flat ``.txt`` screenplay the run is given as ground truth. It is optional: a run
+#: without one keeps the diarization labels and lets the model infer characters.
+DEFAULT_SCRIPT_PATH = DEFAULT_INPUT_DIR / "script.txt"
 
 #: Directory holding the per-speaker voice profiles consumed by the TTS stage.
 DEFAULT_VOICE_PROFILE_DIR = DEFAULT_WORK_DIR / "voices"
@@ -299,10 +216,12 @@ DEFAULT_VOICE_REFERENCE_MIN_DURATION = 4.0
 DEFAULT_VOICE_REFERENCE_TARGET_DURATION = 5.0
 DEFAULT_VOICE_REFERENCE_MAX_DURATION = 10.0
 
-#: Legacy sample-voice configuration retained so existing environment files continue
-#: to parse. The production pipeline no longer loads sample recordings; OmniVoice uses
-#: each character's own clean, transcript-matched actor reference instead.
-DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "data" / "voice-samples"
+#: Root of the manually provided per-character voice samples, one directory per
+#: character: ``voice_samples/<Character_Name>/sample_01.wav`` with the matching
+#: ``sample_01.txt`` transcript beside it. The directory name is matched to the
+#: character names resolved from the screenplay, so it is the same spelling the
+#: dialogue and the voice profiles use.
+DEFAULT_VOICE_SAMPLE_DIR = PROJECT_ROOT / "voice_samples"
 
 #: Legacy sample mapping, currently unused by the production pipeline.
 DEFAULT_VOICE_SAMPLE_MAP = ""
@@ -395,6 +314,19 @@ DEFAULT_TTS_CONTINUE_ON_FAILURE = False
 #: comparison run can switch it off and attribute a difference to it.
 DEFAULT_TTS_REQUEST_RATE = True
 
+#: Longest text handed to OmniVoice in one inference pass.
+#:
+#: The engine has a hard per-call character ceiling, and a line that crosses it fails
+#: outright. The threshold is kept below the documented limit so a punctuation-split
+#: segment still has room, and the split itself happens at natural punctuation so the
+#: seam is a pause a listener already expects.
+DEFAULT_TTS_MAX_INPUT_CHARS = 220
+
+#: How many synthesis requests may be in flight at once. OmniVoice runs on the GPU, so
+#: this is a VRAM throttle as much as a throughput setting: the semaphore keeps a
+#: film-scale batch from turning into an out-of-memory failure.
+DEFAULT_TTS_MAX_CONCURRENCY = 4
+
 #: How far a line's delivery may be time-stretched to fit the window of the
 #: original line, as a tempo factor. A factor below 1 slows the line down, above
 #: 1 speeds it up, and both are pitch-preserving. The band is deliberately narrow:
@@ -454,6 +386,19 @@ DEFAULT_TIMING_MIN_LINE_GAP = 0.12
 #: Set it true to trade a clipped word for a guaranteed gap between lines.
 DEFAULT_TIMING_TRIM_TO_FIT = False
 
+#: How far above the line's own noise floor a frame must rise to count as speech when
+#: the *active vocal zone* of the original line is measured.
+#:
+#: The original line's timestamps are the diarizer's idea of a turn, not the actor's
+#: first and last phoneme: a turn usually opens and closes with silence. Fitting the
+#: Amharic to the turn would stretch it into that silence; fitting it to the zone that
+#: actually contains speech, then padding the rest with silence, keeps the cadence.
+DEFAULT_TIMING_ACTIVE_ZONE_MARGIN_DB = 12.0
+
+#: A detected zone shorter than this is a detection failure - a line that is mostly a
+#: breath or a click - and the whole original window is used instead of trusting it.
+DEFAULT_TIMING_ACTIVE_ZONE_MIN_SECONDS = 0.08
+
 #: Level of the dubbed dialogue in the final mix, in dB relative to the clips the
 #: TTS stage produced. Never a boost by default: the dialogue was generated at a
 #: consistent level, so raising it here would only invite clipping.
@@ -508,107 +453,6 @@ def apply_torch_compile_policy() -> None:
 
     os.environ["TORCH_COMPILE_DISABLE"] = "1"
     _compile_guard_installed = True
-
-
-def _translation_model_default() -> str:
-    """Return the model to use when ``TRANSLATION_MODEL`` is not set.
-
-    The two backends name completely different things: a local NLLB *checkpoint path* or
-    the model a *served* endpoint answers to. A single default would silently ask Gemini
-    for a model called ``facebook/nllb-200-3.3B`` - which fails - so the default follows
-    the configured backend, and within the served backend it follows the provider.
-    """
-
-    backend = (
-        _read_env("TRANSLATION_BACKEND", DEFAULT_TRANSLATION_BACKEND)
-        or DEFAULT_TRANSLATION_BACKEND
-    ).strip().lower()
-    if backend == "nllb":
-        return DEFAULT_TRANSLATION_MODEL
-    return translation_provider_defaults(
-        _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
-        or DEFAULT_TRANSLATION_PROVIDER
-    ).model
-
-
-def _translation_base_url_default() -> str:
-    """Return the endpoint to use when ``TRANSLATION_BASE_URL`` is not set.
-
-    Follows the provider for the same reason the model does: the endpoint *is* the
-    provider on an OpenAI-compatible backend, and a single default would quietly send
-    Gemini's key to DeepSeek's host. Meaningless for the NLLB backend, which is local
-    and talks to no endpoint at all.
-    """
-
-    return translation_provider_defaults(
-        _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
-        or DEFAULT_TRANSLATION_PROVIDER
-    ).base_url
-
-
-@dataclass(frozen=True)
-class TranslationProvider:
-    """What one served-model vendor decides, and nothing else.
-
-    Keeping this to three fields is deliberate. Everything else about a request - the
-    prompt, the JSON protocol, the batching, the syllable budgets, the rewrite passes -
-    is the pipeline's and is identical for every provider, which is why adding a vendor
-    does not touch the pipeline.
-    """
-
-    name: str
-    base_url: str
-    model: str
-    api_key_env: str
-    #: ``True`` when the vendor understands ``reasoning_effort``.
-    supports_reasoning_effort: bool
-    #: ``True`` when the vendor understands the ``thinking`` request body this project
-    #: used for DeepSeek's hybrid models.
-    supports_thinking_switch: bool
-
-
-#: The vendors this project knows how to talk to. A local or self-hosted
-#: OpenAI-compatible server is not in this table: name it with ``TRANSLATION_PROVIDER=other``
-#: and set ``TRANSLATION_BASE_URL``, ``TRANSLATION_MODEL`` and its key yourself.
-TRANSLATION_PROVIDERS: dict[str, TranslationProvider] = {
-    "gemini": TranslationProvider(
-        name="gemini",
-        base_url=DEFAULT_TRANSLATION_GEMINI_BASE_URL,
-        model=DEFAULT_TRANSLATION_GEMINI_MODEL,
-        api_key_env="GEMINI_API_KEY",
-        supports_reasoning_effort=True,
-        supports_thinking_switch=False,
-    ),
-    "deepseek": TranslationProvider(
-        name="deepseek",
-        base_url=DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL,
-        model=DEFAULT_TRANSLATION_DEEPSEEK_MODEL,
-        api_key_env="DEEPSEEK_API_KEY",
-        supports_reasoning_effort=False,
-        supports_thinking_switch=True,
-    ),
-    "other": TranslationProvider(
-        name="other",
-        # Deliberately blank: there is no sensible guess for a server this project has
-        # never seen, and a *wrong* guess would send a film's requests to somebody
-        # else's host. Empty values are refused at start-up with a named variable.
-        base_url="",
-        model="",
-        api_key_env="TRANSLATION_API_KEY",
-        supports_reasoning_effort=False,
-        supports_thinking_switch=False,
-    ),
-}
-
-#: Accepted values of ``TRANSLATION_THINKING``, weakest first.
-TRANSLATION_THINKING_LEVELS: tuple[str, ...] = ("off", "low", "medium", "high")
-
-
-def translation_provider_defaults(name: str) -> TranslationProvider:
-    """Return the provider named by ``name``, or the default if it is unknown."""
-
-    key = (name or "").strip().lower()
-    return TRANSLATION_PROVIDERS.get(key, TRANSLATION_PROVIDERS[DEFAULT_TRANSLATION_PROVIDER])
 
 
 def _read_env(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -770,11 +614,10 @@ class Settings:
     work_dir: Path
     output_dir: Path
     model_cache_dir: Path
-    #: API keys for the served translation providers. Only the configured provider's
-    #: key is ever read; the other stays ``None`` and unused.
-    gemini_api_key: Optional[str] = None
-    deepseek_api_key: Optional[str] = None
     huggingface_token: Optional[str] = None
+    #: Optional bearer token for the local vLLM server. A loopback deployment normally
+    #: ignores it, so an unset value is a working configuration, not a missing secret.
+    translation_api_key: Optional[str] = None
     device: str = "cuda"
     log_level: str = "INFO"
     #: Hugging Face pipeline id used by :mod:`app.pipeline.diarization`.
@@ -794,33 +637,25 @@ class Settings:
     qc_pronunciation: bool = DEFAULT_QC_PRONUNCIATION
     #: Source language code for transcription; ``None`` detects it automatically.
     transcription_language: Optional[str] = None
-    #: Dialogue adaptation / translation settings for
-    #: :mod:`app.pipeline.translation`.
-    translation_backend: str = DEFAULT_TRANSLATION_BACKEND
-    #: Which vendor serves the instruction-following model. Decides the default endpoint,
-    #: the default model, the environment variable the key is read from, and how thinking
-    #: is requested - and nothing else.
-    translation_provider: str = DEFAULT_TRANSLATION_PROVIDER
-    translation_model: str = DEFAULT_TRANSLATION_GEMINI_MODEL
-    translation_base_url: str = DEFAULT_TRANSLATION_GEMINI_BASE_URL
-    translation_batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
-    #: ``off``/``low``/``medium``/``high``. See :data:`DEFAULT_TRANSLATION_THINKING`.
-    translation_thinking: str = DEFAULT_TRANSLATION_THINKING
-    #: Legacy setting retained for environment compatibility; request failures never
-    #: trigger provider failover.
-    translation_fallback_provider: str = DEFAULT_TRANSLATION_FALLBACK_PROVIDER
-    translation_num_beams: int = DEFAULT_TRANSLATION_NUM_BEAMS
+    #: Dialogue adaptation settings for :mod:`app.pipeline.translation`, which talks
+    #: to a local Qwen-2.5-Instruct served by vLLM on the GPU host.
+    translation_model: str = DEFAULT_TRANSLATION_MODEL
+    translation_base_url: str = DEFAULT_TRANSLATION_BASE_URL
+    #: Lines per chronological window and how many of them adjacent windows share.
+    translation_window_lines: int = DEFAULT_TRANSLATION_WINDOW_LINES
+    translation_window_overlap: int = DEFAULT_TRANSLATION_WINDOW_OVERLAP
+    #: Client-side concurrency ceiling, paired with the server's own VRAM reservation.
+    translation_max_concurrency: int = DEFAULT_TRANSLATION_MAX_CONCURRENCY
+    translation_gpu_memory_utilization: float = (
+        DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION
+    )
+    translation_temperature: float = DEFAULT_TRANSLATION_TEMPERATURE
     translation_max_new_tokens: int = DEFAULT_TRANSLATION_MAX_NEW_TOKENS
-    translation_length_penalty: float = DEFAULT_TRANSLATION_LENGTH_PENALTY
-    translation_shorten_penalty: float = DEFAULT_TRANSLATION_SHORTEN_PENALTY
+    translation_timeout_seconds: float = DEFAULT_TRANSLATION_TIMEOUT_SECONDS
     translation_syllables_per_second: float = DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND
-    translation_max_reduction_attempts: int = (
-        DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS
-    )
-    translation_enforce_budget: bool = DEFAULT_TRANSLATION_ENFORCE_BUDGET
-    translation_enforce_fidel_loanwords: bool = (
-        DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS
-    )
+    #: Flat ``.txt`` screenplay used as ground truth for character names and for the
+    #: complete sentences the transcribed fragments are aligned to.
+    script_path: Path = DEFAULT_SCRIPT_PATH
     #: Voice-profile settings for :mod:`app.pipeline.voice_profiles`.
     voice_profile_dir: Path = DEFAULT_VOICE_PROFILE_DIR
     voice_reference_min_duration: float = DEFAULT_VOICE_REFERENCE_MIN_DURATION
@@ -854,6 +689,12 @@ class Settings:
     #: the run. Off by default: a failure should be visible, not absorbed.
     tts_continue_on_failure: bool = DEFAULT_TTS_CONTINUE_ON_FAILURE
     tts_request_rate: bool = DEFAULT_TTS_REQUEST_RATE
+    #: Longest text handed to OmniVoice in one inference pass. A longer line is split
+    #: at natural punctuation and the synthesized pieces are stitched back together.
+    tts_max_input_chars: int = DEFAULT_TTS_MAX_INPUT_CHARS
+    #: How many synthesis requests may be in flight at once. Paired with the serverside
+    #: VRAM reservation so a film-scale batch cannot spike the card.
+    tts_max_concurrency: int = DEFAULT_TTS_MAX_CONCURRENCY
     #: Timing settings for :mod:`app.pipeline.timing`: the tempo band a line may
     #: be stretched within to fit the time it has, and the silence kept before
     #: the next line so two voices are never heard at once.
@@ -862,6 +703,12 @@ class Settings:
     timing_max_overlap_seconds: float = DEFAULT_TIMING_MAX_OVERLAP_SECONDS
     timing_min_line_gap: float = DEFAULT_TIMING_MIN_LINE_GAP
     timing_trim_to_fit: bool = DEFAULT_TIMING_TRIM_TO_FIT
+    #: How far above a line's own noise floor a frame must rise to count as speech when
+    #: the original line's active vocal zone is measured.
+    timing_active_zone_margin_db: float = DEFAULT_TIMING_ACTIVE_ZONE_MARGIN_DB
+    #: A detected zone shorter than this is treated as a detection failure and the whole
+    #: original window is used instead.
+    timing_active_zone_min_seconds: float = DEFAULT_TIMING_ACTIVE_ZONE_MIN_SECONDS
     #: Mix settings for :mod:`app.pipeline.mixing`: the dialogue level and how far
     #: the music and effects are ducked under it.
     mix_dialogue_gain_db: float = DEFAULT_MIX_DIALOGUE_GAIN_DB
@@ -881,8 +728,7 @@ class Settings:
             work_dir=work_dir,
             output_dir=_read_path("OUTPUT_DIR", DEFAULT_OUTPUT_DIR),
             model_cache_dir=model_cache_dir,
-            gemini_api_key=_read_env("GEMINI_API_KEY"),
-            deepseek_api_key=_read_env("DEEPSEEK_API_KEY"),
+            translation_api_key=_read_env(TRANSLATION_API_KEY_ENV),
             huggingface_token=_read_env("HUGGINGFACE_TOKEN"),
             device=(_read_env("DEVICE", "cuda") or "cuda").lower(),
             log_level=(_read_env("LOG_LEVEL", "INFO") or "INFO").upper(),
@@ -914,61 +760,41 @@ class Settings:
             transcription_language=(
                 (_read_env("TRANSCRIPTION_LANGUAGE") or "").lower() or None
             ),
-            translation_backend=(
-                _read_env("TRANSLATION_BACKEND", DEFAULT_TRANSLATION_BACKEND)
-                or DEFAULT_TRANSLATION_BACKEND
-            ).lower(),
-            translation_provider=(
-                _read_env("TRANSLATION_PROVIDER", DEFAULT_TRANSLATION_PROVIDER)
-                or DEFAULT_TRANSLATION_PROVIDER
-            ).lower(),
             translation_model=(
-                _read_env("TRANSLATION_MODEL") or _translation_model_default()
+                _read_env("TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL)
+                or DEFAULT_TRANSLATION_MODEL
             ),
             translation_base_url=(
-                _read_env("TRANSLATION_BASE_URL") or _translation_base_url_default()
+                _read_env("TRANSLATION_BASE_URL", DEFAULT_TRANSLATION_BASE_URL)
+                or DEFAULT_TRANSLATION_BASE_URL
             ),
-            translation_batch_size=_read_int(
-                "TRANSLATION_BATCH_SIZE", DEFAULT_TRANSLATION_BATCH_SIZE
+            translation_window_lines=_read_int(
+                "TRANSLATION_WINDOW_LINES", DEFAULT_TRANSLATION_WINDOW_LINES
             ),
-            translation_thinking=(
-                _read_env("TRANSLATION_THINKING", DEFAULT_TRANSLATION_THINKING)
-                or DEFAULT_TRANSLATION_THINKING
-            ).lower(),
-            translation_fallback_provider=(
-                _read_env(
-                    "TRANSLATION_FALLBACK_PROVIDER",
-                    DEFAULT_TRANSLATION_FALLBACK_PROVIDER,
-                )
-                or DEFAULT_TRANSLATION_FALLBACK_PROVIDER
-            ).lower(),
-            translation_num_beams=_read_int(
-                "TRANSLATION_NUM_BEAMS", DEFAULT_TRANSLATION_NUM_BEAMS
+            translation_window_overlap=_read_nonnegative_int(
+                "TRANSLATION_WINDOW_OVERLAP", DEFAULT_TRANSLATION_WINDOW_OVERLAP
+            ),
+            translation_max_concurrency=_read_int(
+                "TRANSLATION_MAX_CONCURRENCY", DEFAULT_TRANSLATION_MAX_CONCURRENCY
+            ),
+            translation_gpu_memory_utilization=_read_float(
+                "TRANSLATION_GPU_MEMORY_UTILIZATION",
+                DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION,
+            ),
+            translation_temperature=_read_float(
+                "TRANSLATION_TEMPERATURE", DEFAULT_TRANSLATION_TEMPERATURE
             ),
             translation_max_new_tokens=_read_int(
                 "TRANSLATION_MAX_NEW_TOKENS", DEFAULT_TRANSLATION_MAX_NEW_TOKENS
             ),
-            translation_length_penalty=_read_float(
-                "TRANSLATION_LENGTH_PENALTY", DEFAULT_TRANSLATION_LENGTH_PENALTY
-            ),
-            translation_shorten_penalty=_read_float(
-                "TRANSLATION_SHORTEN_PENALTY", DEFAULT_TRANSLATION_SHORTEN_PENALTY
+            translation_timeout_seconds=_read_float(
+                "TRANSLATION_TIMEOUT_SECONDS", DEFAULT_TRANSLATION_TIMEOUT_SECONDS
             ),
             translation_syllables_per_second=_read_float(
                 "TRANSLATION_SYLLABLES_PER_SECOND",
                 DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND,
             ),
-            translation_max_reduction_attempts=_read_nonnegative_int(
-                "TRANSLATION_MAX_REDUCTION_ATTEMPTS",
-                DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS,
-            ),
-            translation_enforce_budget=_read_bool(
-                "TRANSLATION_ENFORCE_BUDGET", DEFAULT_TRANSLATION_ENFORCE_BUDGET
-            ),
-            translation_enforce_fidel_loanwords=_read_bool(
-                "TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
-                DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS,
-            ),
+            script_path=_read_path("SCRIPT_PATH", DEFAULT_SCRIPT_PATH),
             voice_profile_dir=_read_path("VOICE_PROFILE_DIR", work_dir / "voices"),
             voice_reference_min_duration=_read_float(
                 "VOICE_REFERENCE_MIN_DURATION", DEFAULT_VOICE_REFERENCE_MIN_DURATION
@@ -1024,6 +850,12 @@ class Settings:
             tts_request_rate=_read_bool(
                 "TTS_REQUEST_RATE", DEFAULT_TTS_REQUEST_RATE
             ),
+            tts_max_input_chars=_read_int(
+                "TTS_MAX_INPUT_CHARS", DEFAULT_TTS_MAX_INPUT_CHARS
+            ),
+            tts_max_concurrency=_read_int(
+                "TTS_MAX_CONCURRENCY", DEFAULT_TTS_MAX_CONCURRENCY
+            ),
             timing_min_tempo=_read_float("TIMING_MIN_TEMPO", DEFAULT_TIMING_MIN_TEMPO),
             timing_max_tempo=_read_float("TIMING_MAX_TEMPO", DEFAULT_TIMING_MAX_TEMPO),
             timing_max_overlap_seconds=_read_float(
@@ -1035,6 +867,13 @@ class Settings:
             timing_trim_to_fit=_read_bool(
                 "TIMING_TRIM_TO_FIT", DEFAULT_TIMING_TRIM_TO_FIT
             ),
+            timing_active_zone_margin_db=_read_float(
+                "TIMING_ACTIVE_ZONE_MARGIN_DB", DEFAULT_TIMING_ACTIVE_ZONE_MARGIN_DB
+            ),
+            timing_active_zone_min_seconds=_read_float(
+                "TIMING_ACTIVE_ZONE_MIN_SECONDS",
+                DEFAULT_TIMING_ACTIVE_ZONE_MIN_SECONDS,
+            ),
             mix_dialogue_gain_db=_read_signed_float(
                 "MIX_DIALOGUE_GAIN_DB", DEFAULT_MIX_DIALOGUE_GAIN_DB
             ),
@@ -1043,65 +882,33 @@ class Settings:
 
     # -- helpers ------------------------------------------------------------
     @property
-    def translation_provider_defaults(self) -> TranslationProvider:
-        """Return the provider record this run is configured to talk to."""
+    def translation_api_key_env(self) -> str:
+        """Return the environment variable holding the local server's token."""
 
-        return translation_provider_defaults(self.translation_provider)
+        return TRANSLATION_API_KEY_ENV
 
-    def with_available_translation_provider(self) -> "Settings":
-        """Use DeepSeek when Gemini is selected but only a DeepSeek key is present."""
+    def vllm_server_arguments(self) -> list[str]:
+        """Return the vLLM server arguments this configuration was sized for.
 
-        if (
-            self.translation_backend != "openai"
-            or self.translation_provider != "gemini"
-            or self.translation_api_key
-            or not (self.deepseek_api_key or "").strip()
-        ):
-            return self
-
-        provider = translation_provider_defaults("deepseek")
-        return replace(
-            self,
-            translation_provider=provider.name,
-            translation_model=provider.model,
-            translation_base_url=provider.base_url,
-        )
-
-    @property
-    def translation_api_key(self) -> str:
-        """Return the API key for the configured provider, or an empty string.
-
-        One accessor rather than a branch at every call site: the provider is what says
-        which variable holds the key, and the rest of the pipeline should not have to
-        know which vendor it is talking to.
+        The server is launched beside the pipeline on the GPU host. Handing it the
+        same model id and the same VRAM reservation the client was configured with is
+        what stops the two halves from disagreeing about how much headroom exists.
         """
 
-        env = self.translation_provider_defaults.api_key_env
-        if env == "GEMINI_API_KEY":
-            return (self.gemini_api_key or "").strip()
-        if env == "DEEPSEEK_API_KEY":
-            return (self.deepseek_api_key or "").strip()
-        # ``other`` names its own variable, so that a self-hosted server with its own
-        # key convention needs no code change.
-        return (_read_env(env) or "").strip()
-
-    @property
-    def translation_api_key_env(self) -> str:
-        """Return the environment variable name the provider needs."""
-
-        return self.translation_provider_defaults.api_key_env
-
-    @property
-    def has_deepseek_credentials(self) -> bool:
-        """``True`` when a DeepSeek API key is configured."""
-
-        return bool(self.deepseek_api_key)
-
-    @property
-    def has_gemini_credentials(self) -> bool:
-        """``True`` when a Gemini API key is configured."""
-
-        return bool(self.gemini_api_key)
+        return [
+            "--model",
+            self.translation_model,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--gpu-memory-utilization",
+            f"{self.translation_gpu_memory_utilization:.2f}",
+            "--max-num-seqs",
+            str(max(1, self.translation_max_concurrency)),
+            "--dtype",
+            "auto",
+        ]
 
     @property
     def has_huggingface_credentials(self) -> bool:
@@ -1110,18 +917,13 @@ class Settings:
         return bool(self.huggingface_token)
 
     def missing_credentials(self) -> list[str]:
-        """Return the names of the credentials the *configured* run still needs.
+        """Return the names of the credentials the configured run still needs.
 
-        The Hugging Face token is always needed, because the diarization pipeline it
-        authenticates is gated. The translation key belongs to the instruction-following
-        backend alone, and *which* variable holds it follows the provider: under
-        ``TRANSLATION_BACKEND=nllb`` the run never reads either, so reporting a key as
-        missing would hold up a session that is ready to go.
+        Only the Hugging Face token: the adaptation model is served from the same GPU
+        host, so no hosted-vendor key is involved anywhere in the pipeline.
         """
 
         missing: list[str] = []
-        if self.translation_backend == "openai" and not self.translation_api_key:
-            missing.append(self.translation_api_key_env)
         if not self.huggingface_token:
             missing.append("HUGGINGFACE_TOKEN")
         return missing
@@ -1145,8 +947,7 @@ class Settings:
             "work_dir": str(self.work_dir),
             "output_dir": str(self.output_dir),
             "model_cache_dir": str(self.model_cache_dir),
-            "deepseek_api_key_set": self.has_deepseek_credentials,
-            "gemini_api_key_set": self.has_gemini_credentials,
+            "translation_api_key_set": bool(self.translation_api_key),
             "huggingface_token_set": self.has_huggingface_credentials,
             "device": self.device,
             "log_level": self.log_level,
@@ -1158,26 +959,22 @@ class Settings:
             "transcription_compute_type": self.transcription_compute_type,
             "qc_pronunciation": self.qc_pronunciation,
             "transcription_language": self.transcription_language,
-            "translation_backend": self.translation_backend,
-            "translation_provider": self.translation_provider,
+            "translation_backend": "vllm",
+            "translation_provider": "local",
             "translation_api_key_env": self.translation_api_key_env,
             "translation_model": self.translation_model,
             "translation_base_url": self.translation_base_url,
-            "translation_thinking": self.translation_thinking,
-            "translation_fallback_provider": self.translation_fallback_provider,
-            "translation_batch_size": self.translation_batch_size,
-            "translation_num_beams": self.translation_num_beams,
+            "translation_window_lines": self.translation_window_lines,
+            "translation_window_overlap": self.translation_window_overlap,
+            "translation_max_concurrency": self.translation_max_concurrency,
+            "translation_gpu_memory_utilization": (
+                self.translation_gpu_memory_utilization
+            ),
+            "translation_temperature": self.translation_temperature,
             "translation_max_new_tokens": self.translation_max_new_tokens,
-            "translation_length_penalty": self.translation_length_penalty,
-            "translation_shorten_penalty": self.translation_shorten_penalty,
+            "translation_timeout_seconds": self.translation_timeout_seconds,
             "translation_syllables_per_second": self.translation_syllables_per_second,
-            "translation_max_reduction_attempts": (
-                self.translation_max_reduction_attempts
-            ),
-            "translation_enforce_budget": self.translation_enforce_budget,
-            "translation_enforce_fidel_loanwords": (
-                self.translation_enforce_fidel_loanwords
-            ),
+            "script_path": str(self.script_path),
             "voice_profile_dir": str(self.voice_profile_dir),
             "voice_reference_min_duration": self.voice_reference_min_duration,
             "voice_reference_target_duration": self.voice_reference_target_duration,
@@ -1199,11 +996,15 @@ class Settings:
             "tts_min_line_seconds": self.tts_min_line_seconds,
             "tts_continue_on_failure": self.tts_continue_on_failure,
             "tts_request_rate": self.tts_request_rate,
+            "tts_max_input_chars": self.tts_max_input_chars,
+            "tts_max_concurrency": self.tts_max_concurrency,
             "timing_min_tempo": self.timing_min_tempo,
             "timing_max_tempo": self.timing_max_tempo,
             "timing_max_overlap_seconds": self.timing_max_overlap_seconds,
             "timing_min_line_gap": self.timing_min_line_gap,
             "timing_trim_to_fit": self.timing_trim_to_fit,
+            "timing_active_zone_margin_db": self.timing_active_zone_margin_db,
+            "timing_active_zone_min_seconds": self.timing_active_zone_min_seconds,
             "mix_dialogue_gain_db": self.mix_dialogue_gain_db,
             "mix_duck_db": self.mix_duck_db,
         }
@@ -1213,7 +1014,7 @@ class Settings:
 def get_settings() -> Settings:
     """Return the process-wide, cached :class:`Settings` instance."""
 
-    return Settings.from_env().with_available_translation_provider()
+    return Settings.from_env()
 
 
 __all__ = [
@@ -1235,39 +1036,31 @@ __all__ = [
     "DEFAULT_TRANSCRIPTION_COMPUTE_TYPE",
     "DEFAULT_QC_PRONUNCIATION",
     "DEFAULT_TRANSCRIPTION_MODEL",
-    "DEFAULT_TRANSLATION_BACKEND",
-    "DEFAULT_TRANSLATION_MAX_NEW_TOKENS",
-    "DEFAULT_TRANSLATION_NUM_BEAMS",
     "DEFAULT_TRANSLATION_BASE_URL",
-    "DEFAULT_TRANSLATION_BATCH_SIZE",
-    "DEFAULT_TRANSLATION_ENFORCE_BUDGET",
-    "DEFAULT_TRANSLATION_ENFORCE_FIDEL_LOANWORDS",
-    "DEFAULT_TRANSLATION_LENGTH_PENALTY",
+    "DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION",
+    "DEFAULT_TRANSLATION_MAX_CONCURRENCY",
+    "DEFAULT_TRANSLATION_MAX_NEW_TOKENS",
     "DEFAULT_TRANSLATION_MODEL",
-    "DEFAULT_TRANSLATION_PROVIDER",
-    "DEFAULT_TRANSLATION_GEMINI_BASE_URL",
-    "DEFAULT_TRANSLATION_GEMINI_MODEL",
-    "DEFAULT_TRANSLATION_DEEPSEEK_BASE_URL",
-    "DEFAULT_TRANSLATION_DEEPSEEK_MODEL",
-    "DEFAULT_TRANSLATION_THINKING",
-    "DEFAULT_TRANSLATION_FALLBACK_PROVIDER",
-    "TRANSLATION_PROVIDERS",
-    "TRANSLATION_THINKING_LEVELS",
-    "TranslationProvider",
-    "translation_provider_defaults",
-    "DEFAULT_TRANSLATION_MAX_REDUCTION_ATTEMPTS",
-    "DEFAULT_TRANSLATION_OPENAI_MODEL",
-    "DEFAULT_TRANSLATION_SHORTEN_PENALTY",
     "DEFAULT_TRANSLATION_SYLLABLES_PER_SECOND",
+    "DEFAULT_TRANSLATION_TEMPERATURE",
+    "DEFAULT_TRANSLATION_TIMEOUT_SECONDS",
+    "DEFAULT_TRANSLATION_WINDOW_LINES",
+    "DEFAULT_TRANSLATION_WINDOW_OVERLAP",
+    "DEFAULT_SCRIPT_PATH",
+    "TRANSLATION_API_KEY_ENV",
     "DEFAULT_TTS_CONTINUE_ON_FAILURE",
     "DEFAULT_TTS_MAX_PAUSE_SECONDS",
     "DEFAULT_TTS_MIN_LINE_SECONDS",
     "DEFAULT_TTS_REQUEST_RATE",
+    "DEFAULT_TTS_MAX_INPUT_CHARS",
+    "DEFAULT_TTS_MAX_CONCURRENCY",
     "DEFAULT_TTS_MODEL",
     "DEFAULT_TIMING_MAX_OVERLAP_SECONDS",
     "DEFAULT_TIMING_MAX_TEMPO",
     "DEFAULT_TIMING_MIN_LINE_GAP",
     "DEFAULT_TIMING_TRIM_TO_FIT",
+    "DEFAULT_TIMING_ACTIVE_ZONE_MARGIN_DB",
+    "DEFAULT_TIMING_ACTIVE_ZONE_MIN_SECONDS",
     "DEFAULT_TIMING_MIN_TEMPO",
     "DEFAULT_VOICE_PROFILE_DIR",
     "DEFAULT_VOICE_REFERENCE_MAX_DURATION",

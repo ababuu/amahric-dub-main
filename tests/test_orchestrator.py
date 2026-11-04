@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import DEFAULT_TRANSLATION_GEMINI_MODEL, Settings
+from app.config import DEFAULT_TRANSLATION_MODEL, Settings
 from app.pipeline import orchestrator
 from app.pipeline.diarization import CrosstalkRegion, SpeakerSegment
 from app.pipeline.mixing import MixResult
@@ -233,14 +233,14 @@ class Stages:
         self,
         lines: object,
         *,
+        script: object = (),
         settings: Settings,
         bible: object = None,
-        enforce_budget: bool = True,
-        enforce_fidel_loanwords: bool = True,
-        maximum_reduction_attempts: int = 3,
         on_progress: object = None,
+        client: object = None,
     ) -> list[AdaptedDialogue]:
-        self._record("translation", lines, settings, bible)
+        self._record("translation", lines, bible, script, settings)
+        self.seen_script = script
         return list(self.dialogue)
 
     def build_voice_profiles_detailed(
@@ -276,10 +276,13 @@ class Stages:
         profiles: object,
         *,
         settings: Settings,
+        speaker_tokens: object = None,
+        on_progress: object = None,
     ):  # noqa: ANN201
         from app.pipeline.tts import SynthesisResult
 
         self._record("tts", dialogue, speech, profiles, settings)
+        self.seen_speaker_tokens = speaker_tokens
         spoken = list(dialogue)  # type: ignore[arg-type]
         clips = [_clip(self.root, index, line) for index, line in enumerate(spoken, start=1)]
         return SynthesisResult(
@@ -288,11 +291,18 @@ class Stages:
             designed=tuple(self.designed),  # type: ignore[arg-type]
         )
 
-    def align_dialogue(
-        self, clips: object, *, output_dir: Path, settings: Settings
-    ) -> list[AlignedClip]:
+    def iterate_aligned(
+        self,
+        clips: object,
+        *,
+        output_dir: Path,
+        settings: Settings,
+        speech_stem: Path | None = None,
+    ):  # noqa: ANN201
         self._record("timing", clips, output_dir, settings)
-        return [_aligned(self.root, clip) for clip in clips]  # type: ignore[union-attr]
+        self.seen_speech_stem = speech_stem
+        for clip in clips:  # type: ignore[union-attr]
+            yield _aligned(self.root, clip)
 
     def mix_track(
         self,
@@ -336,7 +346,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, fake: Stages) -> None:
     monkeypatch.setattr(
         orchestrator.tts, "synthesize_dialogue_detailed", fake.synthesize_dialogue_detailed
     )
-    monkeypatch.setattr(orchestrator.timing, "align_dialogue", fake.align_dialogue)
+    monkeypatch.setattr(orchestrator.timing, "iterate_aligned", fake.iterate_aligned)
     monkeypatch.setattr(orchestrator.mixing, "mix_track", fake.mix_track)
     monkeypatch.setattr(orchestrator.video, "mux_dub", fake.mux_dub)
 
@@ -363,6 +373,7 @@ def test_stage_order_is_the_documented_order() -> None:
         "separation",
         "diarization",
         "transcription",
+        "script",
         "translation",
         "voice_profiles",
         "tts",
@@ -385,7 +396,9 @@ def test_every_stage_runs_once_in_order(
 ) -> None:
     run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
 
-    assert stages.order == list(STAGE_ORDER)
+    # ``script`` is the one stage with no fake: with no screenplay present it is a
+    # no-op, so it does not record itself, but every other stage runs in order.
+    assert stages.order == [name for name in STAGE_ORDER if name != "script"]
 
 
 def test_each_stage_receives_the_previous_stage_output(
@@ -406,7 +419,10 @@ def test_each_stage_receives_the_previous_stage_output(
     placed = stages.received["timing"][0]
     assert len(placed) == len(stages.dialogue)  # type: ignore[arg-type]
     assert all(isinstance(clip, TtsClip) for clip in placed)  # type: ignore[union-attr]
-    assert stages.received["mixing"][0] == tuple(_aligned(tmp_path, clip) for clip in placed)  # type: ignore[arg-type]
+    # Mixing receives a live stream of placed lines, not a copied list: consuming it is
+    # what lets the mix begin before the last line has been fitted.
+    streamed = list(stages.received["mixing"][0])  # type: ignore[arg-type]
+    assert streamed == [_aligned(tmp_path, clip) for clip in placed]
     assert stages.received["mixing"][1] == stages.received["separation"][1] / "movie_music.wav"
     assert stages.received["mixing"][2] == stages.received["separation"][1] / "movie_effects.wav"
     assert stages.received["mux"][0] == stages.received["extract"][0]
@@ -507,18 +523,22 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["run"]["final_video"] == result.to_dict()["final_video"]
     assert payload["run"]["synthesized_lines"] == len(result.clips)
     assert payload["run"]["partial"] is False
-    assert payload["run"]["diarization"] == {
-        "turns": 1,
-        "speakers": [SPEAKER],
-        "crosstalk": {"regions": 0, "seconds": 0.0, "detail": []},
+    assert payload["run"]["diarization"]["turns"] == 1
+    assert payload["run"]["diarization"]["speakers"] == [SPEAKER]
+    assert payload["run"]["diarization"]["crosstalk"] == {
+        "regions": 0,
+        "seconds": 0.0,
+        "detail": [],
     }
+    assert payload["run"]["diarization"]["speaker_corrections"] == []
+    assert payload["run"]["diarization"]["speaker_splits"] == []
     assert payload["run"]["tts"]["clips"][0]["amharic"] == stages.dialogue[0].amharic
     assert payload["run"]["voice_profiles"][SPEAKER]["reference_duration"] == 5.0
     assert payload["run"]["timing"]["lines"] == len(result.alignment)
     assert payload["run"]["timing"]["unfitted"] == 0
     assert payload["run"]["mixing"]["duck_db"] == 6.0
     assert payload["run"]["mux"]["audio_codec"] == "aac"
-    assert payload["settings"]["deepseek_api_key_set"] is False
+    assert payload["settings"]["translation_api_key_set"] is False
     assert payload["notes"]
     # Every run measures itself, so a regression is visible without re-listening.
     assert payload["qc"]["duration"]["lines"] == len(result.alignment)
@@ -538,11 +558,9 @@ def test_manifest_records_the_run(tmp_path: Path, stages: Stages) -> None:
     assert payload["provenance"]["tts_engine"] == "omnivoice"
     # Which model adapted the dialogue travels with the dub, because the terminal that
     # printed it does not survive the Pod.
-    assert payload["provenance"]["translation_backend"] == "openai"
-    assert payload["provenance"]["translation_provider"] == "gemini"
-    assert payload["provenance"]["translation_model"] == DEFAULT_TRANSLATION_GEMINI_MODEL
-    # What was *sent*, not what was configured.
-    assert payload["provenance"]["translation_thinking"] == "reasoning_effort=medium"
+    assert payload["provenance"]["translation_backend"] == "local-vllm"
+    assert payload["provenance"]["translation_model"] == DEFAULT_TRANSLATION_MODEL
+    assert "JSON mode" in payload["provenance"]["translation_describe"]
 
 
 def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -576,6 +594,48 @@ def test_crosstalk_is_reported_in_the_manifest(tmp_path: Path, monkeypatch) -> N
     ]
 
 
+def test_the_screenplay_overwrites_the_speaker_labels(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """Stage 1's whole purpose: the script names the characters, not diarization."""
+
+    script = tmp_path / "movie.txt"
+    script.write_text("JACK\nI love you.\n", encoding="utf-8")
+    settings = _settings(tmp_path, script_path=script)
+    # The adaptation stage speaks about the character the screenplay resolved, which is
+    # what a real run produces and what the voice-profile lookup is keyed by.
+    from dataclasses import replace
+
+    stages.dialogue = [replace(_dialogue(), speaker_id="Jack")]
+
+    result = run_pipeline(_source(tmp_path), settings=settings)
+
+    # The diarization output is rewritten before the sentences are assembled, so every
+    # later stage - profiles, TTS, the manifest - speaks about the character.
+    assert [turn.speaker_id for turn in result.turns] == ["Jack"]
+    assert [line.speaker_id for line in result.lines] == ["Jack"]
+    assert result.character_assignment is not None
+    assert result.character_assignment.speakers == {SPEAKER: "Jack"}
+    # The screenplay also reaches adaptation, as context for the model.
+    assert [line.character for line in stages.seen_script] == ["Jack"]
+
+
+def test_a_screenplay_without_a_matching_line_keeps_the_labels(
+    tmp_path: Path, stages: Stages
+) -> None:
+    """An honest SPEAKER_XX beats a name the script cannot support."""
+
+    script = tmp_path / "movie.txt"
+    script.write_text("SARAH\nSomething nobody in this film says.\n", encoding="utf-8")
+    settings = _settings(tmp_path, script_path=script)
+
+    result = run_pipeline(_source(tmp_path), settings=settings)
+
+    assert [turn.speaker_id for turn in result.turns] == [SPEAKER]
+    assert result.character_assignment is not None
+    assert result.character_assignment.unmatched == 1
+
+
 def test_the_dialogue_bible_is_handed_to_adaptation(
     tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -591,7 +651,7 @@ def test_the_dialogue_bible_is_handed_to_adaptation(
 
     run_pipeline(_source(tmp_path), settings=settings)
 
-    bible = stages.received["translation"][2]
+    bible = stages.received["translation"][1]
     assert isinstance(bible, CharacterBible)
     assert bible.name_of(SPEAKER) == "Selam"
 
@@ -603,34 +663,24 @@ def test_an_absent_bible_is_empty_rather_than_fatal(
 
     result = run_pipeline(_source(tmp_path), settings=_settings(tmp_path))
 
-    bible = stages.received["translation"][2]
+    bible = stages.received["translation"][1]
     assert len(bible) == 0
     assert result.dialogue
 
 
-def test_nllb_adaptation_says_what_it_cannot_do(
+def test_adaptation_reports_the_local_model_and_its_batching(
     tmp_path: Path, stages: Stages
 ) -> None:
-    """A translation backend has no use for the context, so the run says so.
+    """Two runs are compared on these words, so a bare model name is not enough."""
 
-    NLLB cannot be handed a scene, a character or a request to shorten a line. The
-    orchestrator still derives the bible and passes it, because the call is the same
-    either way, so the report has to be explicit rather than implying work happened.
-    """
-
-    from app.pipeline.dialogue_context import Character, CharacterBible
-
-    settings = _settings(tmp_path, translation_backend="nllb")
-    CharacterBible(
-        {SPEAKER: Character(speaker_id=SPEAKER, name="Selam", register="informal")}
-    ).save(settings.dialogue_bible_path)
     messages: list[str] = []
 
-    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
+    run_pipeline(_source(tmp_path), settings=_settings(tmp_path), progress=messages.append)
 
     reported = " ".join(messages)
-    assert "NLLB translates line by line" in reported
-    assert "dialogue bible" not in reported
+    assert "adaptation: local vLLM" in reported
+    assert "JSON mode" in reported
+    assert "concurrent" in reported
 
 
 def test_the_bible_is_reported_as_applied_only_when_it_is(
@@ -640,7 +690,7 @@ def test_the_bible_is_reported_as_applied_only_when_it_is(
 
     from app.pipeline.dialogue_context import Character, CharacterBible
 
-    settings = _settings(tmp_path, translation_backend="openai")
+    settings = _settings(tmp_path)
     CharacterBible(
         {SPEAKER: Character(speaker_id=SPEAKER, name="Selam", register="informal")}
     ).save(settings.dialogue_bible_path)
@@ -650,28 +700,81 @@ def test_the_bible_is_reported_as_applied_only_when_it_is(
 
     reported = " ".join(messages)
     assert "dialogue bible: 1 character(s) applied" in reported
-    assert "NLLB translates line by line" not in reported
 
 
-def test_voice_sample_files_do_not_replace_film_actor_references(
+def test_an_incomplete_sample_pair_is_reported_and_the_film_is_used(
     tmp_path: Path, stages: Stages
 ) -> None:
+    """A sample directory without its transcript cannot clone anything, and says so."""
+
     samples = tmp_path / "samples"
-    samples.mkdir()
-    (samples / "native.wav").write_bytes(b"sample")
+    # The directory is matched to the *character* name the screenplay resolved, which
+    # without a screenplay is the diarization label.
+    (samples / SPEAKER).mkdir(parents=True)
+    (samples / SPEAKER / "sample_01.wav").write_bytes(b"not really a wav")
     settings = _settings(tmp_path, voice_sample_dir=samples)
     messages: list[str] = []
 
     result = run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
 
     reported = " ".join(messages)
-    assert "voice samples" not in reported
-    assert "voice references: using the film actors" in reported
-    assert "voice_samples" not in result.stage_seconds
+    assert "no complete sample_01.wav + sample_01.txt pair" in reported
+    assert "voice references: manual samples first" in reported
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
     assert profile.reference_audio == stages.profiles[SPEAKER].reference_audio
-    assert profile.reference_text == stages.profiles[SPEAKER].reference_text
+    assert result.pre_encoded_speakers == ()
+
+
+def test_a_complete_sample_pair_is_pre_encoded_and_used(
+    tmp_path: Path, stages: Stages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual pair becomes the character's voice, encoded once and cached."""
+
+    from app.pipeline.voice_profiles import (
+        SpeakerProfile,
+        SpeakerProfileBank,
+    )
+
+    import numpy as np
+    import soundfile as sf
+
+    samples = tmp_path / "samples"
+    (samples / SPEAKER).mkdir(parents=True)
+    sf.write(
+        str(samples / SPEAKER / "sample_01.wav"),
+        np.zeros(24_000 * 5, dtype=np.float32),
+        24_000,
+    )
+    (samples / SPEAKER / "sample_01.txt").write_text("???", encoding="utf-8")
+
+    encoded: dict[str, object] = {}
+
+    def fake_precompute(characters, *, settings, encoder=None, use_cache=True):
+        profile = SpeakerProfile(
+            character=SPEAKER,
+            reference_audio=samples / SPEAKER / "sample_01.wav",
+            reference_text="???",
+            tokens="tokens",
+            sample=f"{SPEAKER}/sample_01.wav",
+        )
+        encoded.update({character: profile for character in characters})
+        return SpeakerProfileBank(profiles=encoded, notes=("pre-encoded 1",))
+
+    monkeypatch.setattr(
+        orchestrator.voice_profiles, "precompute_speaker_profiles", fake_precompute
+    )
+    settings = _settings(tmp_path, voice_sample_dir=samples)
+
+    result = run_pipeline(_source(tmp_path), settings=settings)
+
+    assert result.pre_encoded_speakers == (SPEAKER,)
+    assert stages.seen_speaker_tokens == {SPEAKER: "tokens"}
+    (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
+    (profile,) = received.values()
+    assert profile.reference_text == "???"
+    # The film's own reference is not extracted for a character a sample covers.
+    assert "reference_extraction" not in stages.received
 
 
 def test_without_samples_the_films_own_references_are_used(
@@ -684,38 +787,11 @@ def test_without_samples_the_films_own_references_are_used(
 
     run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
 
-    assert "voice samples" not in " ".join(messages)
+    assert "voice references: manual samples first" in " ".join(messages)
     (_dialogue, _speech, received, passed_settings) = stages.received["tts"]
     (profile,) = received.values()
     assert profile.reference_audio == stages.profiles["SPEAKER_00"].reference_audio
-    assert profile.reference_text != "ሰላም"
-
-
-def test_the_adaptation_report_names_the_model_and_what_it_was_asked_for(
-    tmp_path: Path, stages: Stages
-) -> None:
-    """Two runs are compared on these words, so a bare model name is not enough.
-
-    The provider decides whether the requested thinking level was available at all, so
-    the report states what was actually sent rather than what was configured.
-    """
-
-    settings = _settings(
-        tmp_path,
-        translation_backend="openai",
-        translation_provider="gemini",
-        translation_model="gemini-3.8-flash",
-        translation_thinking="off",
-        gemini_api_key="test-key",
-    )
-    messages: list[str] = []
-
-    run_pipeline(_source(tmp_path), settings=settings, progress=messages.append)
-
-    reported = " ".join(messages)
-    # ``off`` cannot be honoured by a Gemini 3 model, and the report says so.
-    assert "adaptation: gemini gemini-3.8-flash" in reported
-    assert "cannot disable reasoning" in reported
+    assert stages.seen_speaker_tokens is None
 
 
 def test_a_line_that_cannot_be_voiced_is_recorded_in_the_manifest(
@@ -859,10 +935,7 @@ def test_progress_receives_one_line_per_stage(
     reported = [message.strip() for message in messages]
     for name in STAGE_ORDER:
         assert f"-> {name}" in reported
-    assert (
-        "adaptation requests: one per batch; no rewrites, retries, or failover"
-        in reported
-    )
+    assert any("adaptation: local vLLM" in message for message in reported)
 
 
 # ---------------------------------------------------------------------------

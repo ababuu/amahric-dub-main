@@ -68,12 +68,14 @@ line still stops the run with that line named, unless
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import hashlib
 import inspect
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +92,7 @@ from app.config import (
     Settings,
     get_settings,
 )
+from app.models import load_omnivoice_network, reset_model_cache
 from app.pipeline.amharic_text import count_syllables, has_pronounceable_text
 from app.pipeline.dialogue_context import (
     PacingPlan,
@@ -122,7 +125,10 @@ CLIP_DIRECTORY_NAME = "clips"
 #: 3: OmniVoice prompts keep the reference audio untouched when its transcript is
 #: known, so takes made while silence removal could leave the reference's last word
 #: at the start of every line must not be reused.
-SYNTHESIS_RECIPE_VERSION = 3
+#: 4: the line's emotion now reaches the engine as a style instruction, a long line is
+#: split and stitched, and pre-encoded speaker prompts are used, so takes made before
+#: any of that must not be reused.
+SYNTHESIS_RECIPE_VERSION = 4
 
 #: Shortest original window a line is *reported* for, in seconds. It is not a reason to
 #: leave a line unsaid: a brief English line is normal, and the Amharic that replaces it
@@ -1113,6 +1119,91 @@ def designed_voice_identity(instruct: str) -> str:
     return "design:" + normalize_voice_design(instruct)
 
 
+#: How each closed-vocabulary emotion is expressed as an OmniVoice style instruction.
+#: The dialogue stage may only return these six values, so this table is total: an
+#: emotion the engine does not know can never reach it.
+EMOTION_STYLE_INSTRUCT: Mapping[str, str] = {
+    "neutral": "",
+    "angry": "angry, forceful delivery",
+    "sad": "sad, subdued delivery",
+    "excited": "excited, animated delivery",
+    "whisper": "whispered, hushed delivery",
+    "fearful": "fearful, trembling delivery",
+}
+
+#: Punctuation a line may be split after when it exceeds the engine's character limit,
+#: strongest pause first. Ethiopic full stop and comma lead because the text is Amharic.
+_SYNTHESIS_SPLIT_PUNCTUATION = "።፧፤፥፦!?.;:"
+
+
+def emotion_style(emotion: str | None) -> str:
+    """Return the style phrase ``emotion`` implies, or ``""`` for none."""
+
+    if not isinstance(emotion, str):
+        return ""
+    return EMOTION_STYLE_INSTRUCT.get(emotion.strip().lower(), "")
+
+
+def with_emotion(instruction: str, emotion: str | None) -> str:
+    """Return ``instruction`` with the line's emotion appended as a style.
+
+    OmniVoice's instruction channel is what carries performance. The identity still
+    comes from the cloned prompt; this is the mood layered on top of it, which is what
+    keeps an angry line angry in the same voice as the calm ones.
+    """
+
+    phrase = emotion_style(emotion)
+    base = " ".join((instruction or "").split())
+    if not phrase:
+        return base
+    if emotion is not None and emotion.strip().lower() == "whisper" and "whisper" in base:
+        return base
+    return f"{base}, {phrase}" if base else phrase
+
+
+def split_for_synthesis(text: str, limit: int) -> tuple[str, ...]:
+    """Split ``text`` into pieces no longer than ``limit`` characters.
+
+    OmniVoice has a hard per-call character ceiling, and a longer line fails outright.
+    Splitting at the last punctuation mark inside the budget - then at whitespace, and
+    only then mid-word - puts the seam where a speaker would already pause, so the
+    stitched result reads as one performance rather than two.
+
+    Raises
+    ------
+    ConfigurationError
+        ``limit`` is not a positive integer, or ``text`` is empty.
+    """
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ConfigurationError(
+            f"TTS_MAX_INPUT_CHARS must be a positive integer, got {limit!r}"
+        )
+    if not isinstance(text, str) or not text.strip():
+        raise InvalidInputError("there is nothing to synthesize")
+
+    remaining = " ".join(text.split())
+    pieces: list[str] = []
+    while len(remaining) > limit:
+        cut = -1
+        for position in range(limit, max(0, int(limit * 0.35)), -1):
+            if remaining[position - 1] in _SYNTHESIS_SPLIT_PUNCTUATION:
+                cut = position
+                break
+        if cut < 0:
+            cut = remaining.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        piece = remaining[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        pieces.append(remaining)
+    return tuple(pieces)
+
+
 def _require_omnivoice() -> tuple[Any, Any, Any]:
     """Return ``(torch, OmniVoice, OmniVoiceGenerationConfig)``, or say what is missing."""
 
@@ -1176,8 +1267,25 @@ class VoiceCloningEngine(ABC):
         destination: Path,
         speaking_rate: float | None = None,
         reference_text: str | None = None,
+        voice_prompt: Any | None = None,
+        emotion: str | None = None,
     ) -> Path:
-        """Speak ``text`` as the voice heard in ``voice_reference``."""
+        """Speak ``text`` as the voice heard in ``voice_reference``.
+
+        ``voice_prompt`` is a pre-encoded speaker prompt from Stage 6. When it is
+        given the engine must reuse it instead of encoding the reference again, which
+        is the whole reason that stage exists.
+
+        ``emotion`` is the line's ``overall_emotion`` from the dialogue stage. An engine
+        that can act on it folds it into its style instruction; one that cannot ignores
+        it rather than failing.
+        """
+
+    @property
+    def supports_emotion(self) -> bool:
+        """``True`` when the engine applies an ``emotion`` performance instruction."""
+
+        return False
 
     @property
     def supports_voice_design(self) -> bool:
@@ -1198,6 +1306,7 @@ class VoiceCloningEngine(ABC):
         instruct: str,
         destination: Path,
         speaking_rate: float | None = None,
+        emotion: str | None = None,
     ) -> Path:
         """Speak ``text`` in a voice designed from ``instruct``, with no reference."""
 
@@ -1228,8 +1337,9 @@ class OmniVoiceEngine(VoiceCloningEngine):
       Without that, a re-run could not be compared with the run it is meant to improve.
 
     This project's configured Amharic-tuned checkpoint documents voice cloning, not
-    voice design. Per-character actor references are therefore used to keep voices
-    distinct and preserve their vocal presentation.
+    voice design, so per-character actor references are what keep voices distinct and
+    preserve their vocal presentation. A line's ``overall_emotion`` is passed as a
+    style instruction alongside the cloned prompt.
     """
 
     name = OMNIVOICE_ENGINE_NAME
@@ -1304,8 +1414,19 @@ class OmniVoiceEngine(VoiceCloningEngine):
 
         return True
 
+    @property
+    def supports_emotion(self) -> bool:
+        """``True``: the line's emotion is sent as a style instruction."""
+
+        return True
+
     def _load(self) -> tuple[Any, Any, Any]:
-        """Load the model once and return it with torch and the config class."""
+        """Load the model once and return it with torch and the config class.
+
+        The weights come from :func:`app.models.load_omnivoice_network`, which the
+        voice-profile stage uses too, so a run pays for one copy of the checkpoint
+        rather than one per stage.
+        """
 
         if self._network is not None and self._config_class is not None:
             return self._torch, self._network, self._config_class
@@ -1314,17 +1435,17 @@ class OmniVoiceEngine(VoiceCloningEngine):
         self._torch = torch
         self._config_class = config_class
 
-        dtype = getattr(torch, self._torch_dtype, None)
-        if dtype is None:
-            raise ConfigurationError(
-                f"OMNIVOICE_TORCH_DTYPE={self._torch_dtype!r} is not a torch dtype"
-            )
-
         try:
-            self._network = model_class.from_pretrained(
-                self._model, device_map=self._device, dtype=dtype
+            self._network = load_omnivoice_network(
+                self._model,
+                device=self._device,
+                dtype=self._torch_dtype,
+                model_class=model_class,
+                torch_module=torch,
             )
-        except Exception as exc:
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - named as this module's error
             raise EngineLoadError(
                 f"could not load the OmniVoice model {self._model!r}: "
                 f"{type(exc).__name__}: {exc}"
@@ -1379,17 +1500,30 @@ class OmniVoiceEngine(VoiceCloningEngine):
         destination: Path,
         speaking_rate: float | None = None,
         reference_text: str | None = None,
+        voice_prompt: Any | None = None,
+        emotion: str | None = None,
     ) -> Path:
-        """Speak ``text`` as the voice in ``voice_reference``, at ``speaking_rate``."""
+        """Speak ``text`` as the voice in ``voice_reference``, at ``speaking_rate``.
+
+        ``voice_prompt`` is the pre-encoded speaker prompt built in Stage 6. When it is
+        supplied the reference is not encoded again - the character's identity was paid
+        for once, before any line was spoken.
+        """
 
         reference = _validate_audio_file(
             Path(voice_reference), label="the voice reference"
+        )
+        prompt = (
+            voice_prompt
+            if voice_prompt is not None
+            else self._prompt_for(reference, reference_text)
         )
         return self._speak(
             text=text,
             destination=destination,
             speaking_rate=speaking_rate,
-            prompt=self._prompt_for(reference, reference_text),
+            prompt=prompt,
+            emotion=emotion,
         )
 
     def synthesize_designed(
@@ -1399,19 +1533,22 @@ class OmniVoiceEngine(VoiceCloningEngine):
         instruct: str,
         destination: Path,
         speaking_rate: float | None = None,
+        emotion: str | None = None,
     ) -> Path:
         """Speak ``text`` in the voice ``instruct`` describes, with no reference.
 
         This is OmniVoice's third mode, and it is what a character the film never gives
         a usable reference is voiced in. The design is validated against the closed
-        vocabulary first, because the model raises on anything it does not recognise.
+        vocabulary first, because the model raises on anything it does not recognise;
+        the line's emotion is then appended to the instruction, because that is how a
+        designed voice is made to sound angry or frightened.
         """
 
         return self._speak(
             text=text,
             destination=destination,
             speaking_rate=speaking_rate,
-            instruct=normalize_voice_design(instruct),
+            instruct=with_emotion(normalize_voice_design(instruct), emotion),
         )
 
     def _speak(
@@ -1422,6 +1559,7 @@ class OmniVoiceEngine(VoiceCloningEngine):
         speaking_rate: float | None,
         prompt: Any | None = None,
         instruct: str | None = None,
+        emotion: str | None = None,
     ) -> Path:
         """Generate one take, either continued from ``prompt`` or designed by ``instruct``."""
 
@@ -1449,9 +1587,10 @@ class OmniVoiceEngine(VoiceCloningEngine):
             position_temperature=5.0,
             class_temperature=0.0,
         )
-        # The two modes are alternatives: cloning takes the voice from
-        # ``voice_clone_prompt``, design from ``instruct``, and sending both would
-        # describe one voice while recording another.
+        # The two modes are alternatives for *identity*: cloning takes the voice from
+        # ``voice_clone_prompt``, design from ``instruct``. A cloned line still carries
+        # its emotion as an instruction, because identity and performance are separate
+        # things and a character must be able to sound angry in their own voice.
         request: dict[str, Any] = {
             "text": text,
             "language": OMNIVOICE_AMHARIC,
@@ -1459,6 +1598,9 @@ class OmniVoiceEngine(VoiceCloningEngine):
         }
         if prompt is not None:
             request["voice_clone_prompt"] = prompt
+            style = with_emotion("", emotion)
+            if style:
+                request["instruct"] = style
         if instruct is not None:
             request["instruct"] = instruct
         if rate is not None:
@@ -1629,6 +1771,7 @@ def reset_engine_cache() -> None:
 
     _MMS_ENGINES.clear()
     _OMNIVOICE_ENGINES.clear()
+    reset_model_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -1960,7 +2103,7 @@ def _render_clip(
     return speech_duration, lead, trail
 
 
-def _synthesize_line_single_voice(
+async def _synthesize_line_single_voice(
     index: int,
     dialogue: AdaptedDialogue,
     *,
@@ -1968,6 +2111,7 @@ def _synthesize_line_single_voice(
     directories: _TtsDirectories,
     engine: TextToSpeechEngine,
     settings: Settings,
+    gate: "_GpuGate",
 ) -> TtsClip:
     """Run a single-voice engine for one line and describe the result.
 
@@ -1980,8 +2124,16 @@ def _synthesize_line_single_voice(
 
     take = directories.takes / f"{name}.wav"
     if not _usable_audio(take):
-        engine.synthesize(text=dialogue.amharic, destination=take)
-        _require_output(take, what="take", engine=engine.name)
+        await _render_take(
+            text=dialogue.amharic,
+            take=take,
+            synthesize=lambda *, text, destination: engine.synthesize(
+                text=text, destination=destination
+            ),
+            gate=gate,
+            limit=settings.tts_max_input_chars,
+            engine=engine.name,
+        )
 
     clip_path = directories.clips / f"{name}.wav"
     speech_duration, lead, trail = _render_clip(
@@ -2054,7 +2206,110 @@ def pacing_plan_for(
     )
 
 
-def _synthesize_line_cloned(
+class _GpuGate:
+    """The client-side VRAM throttle every synthesis request passes through.
+
+    ``asyncio.gather`` alone would launch a film's whole queue at the server at once,
+    which is exactly the memory spike the GPU must never see. One semaphore bounds the
+    number of requests *in flight*, and each call is handed to a worker thread because
+    the engine is blocking GPU code. Splitting a long line into segments does not bypass
+    the ceiling: those segments are ordinary requests to the same gate.
+    """
+
+    def __init__(self, concurrency: int) -> None:
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ConfigurationError(
+                f"TTS_MAX_CONCURRENCY must be a positive integer, got {concurrency!r}"
+            )
+        self._concurrency = concurrency
+        self._semaphore = asyncio.Semaphore(concurrency)
+
+    @property
+    def concurrency(self) -> int:
+        """How many requests may be in flight at once."""
+
+        return self._concurrency
+
+    async def run(self, work: Callable[..., Any], /, **kwargs: Any) -> Any:
+        """Run one blocking engine call, off the event loop and under the semaphore."""
+
+        async with self._semaphore:
+            return await asyncio.to_thread(work, **kwargs)
+
+
+async def _render_take(
+    *,
+    text: str,
+    take: Path,
+    synthesize: Callable[..., Any],
+    gate: "_GpuGate",
+    limit: int,
+    engine: str,
+) -> None:
+    """Write one take, splitting the text when it exceeds the engine's limit.
+
+    A single segment is one request. A longer line is split at punctuation and the
+    pieces are synthesized **concurrently** through the same gate as every other line,
+    then stitched sample-by-sample in memory: the seam is a pause the punctuation
+    already asked for, so no join, click or fade is needed.
+    """
+
+    pieces = split_for_synthesis(text, limit)
+    if len(pieces) == 1:
+        await gate.run(synthesize, text=pieces[0], destination=take)
+        _require_output(take, what="take", engine=engine)
+        return
+
+    part_paths = [
+        take.with_name(f"{take.stem}.part{position:02d}.wav")
+        for position in range(len(pieces))
+    ]
+
+    async def one(piece: str, destination: Path) -> None:
+        await gate.run(synthesize, text=piece, destination=destination)
+
+    await asyncio.gather(
+        *(one(piece, path) for piece, path in zip(pieces, part_paths))
+    )
+    for path, piece in zip(part_paths, pieces):
+        if not _usable_audio(path):
+            raise MissingOutputError(
+                f"the speech engine produced no audio for segment {piece!r}"
+            )
+    _stitch_parts(part_paths, take)
+
+
+def _stitch_parts(parts: Sequence[Path], destination: Path) -> Path:
+    """Concatenate synthesized segments into one take, at one sample rate."""
+
+    pieces: list[np.ndarray] = []
+    rate: int | None = None
+    for path in parts:
+        samples, current = _read_mono(path, label="a synthesized segment")
+        if rate is None:
+            rate = current
+        elif current != rate:
+            raise InvalidAudioError(
+                f"segments were synthesized at {current} Hz and {rate} Hz; they cannot "
+                "be stitched without resampling"
+            )
+        pieces.append(samples)
+    if not pieces or rate is None:
+        raise MissingOutputError("there are no synthesized segments to stitch")
+
+    written = _write_mono(destination, np.concatenate(pieces), rate, label="stitched take")
+    for path in parts:
+        path.unlink(missing_ok=True)
+    return written
+
+
+def _emotion_of(dialogue: AdaptedDialogue) -> str | None:
+    """Return the line's emotion, or ``None`` when the engine cannot use one."""
+
+    return getattr(dialogue, "emotion", None)
+
+
+async def _synthesize_line_cloned(
     index: int,
     dialogue: AdaptedDialogue,
     *,
@@ -2064,13 +2319,14 @@ def _synthesize_line_cloned(
     profile: VoiceProfile,
     settings: Settings,
     pacing: PacingPlan,
+    gate: "_GpuGate",
+    voice_prompt: Any | None = None,
 ) -> TtsClip:
     """Speak one line as its character, cloning the voice from their reference.
 
-    The character's reference recording *is* the voice: the same reference for every
-    line of a speaker is what keeps a character recognisable across a film, which is
-    the property the performance-prompt-and-convert path approximates from the other
-    direction.
+    ``voice_prompt`` is the prompt Stage 6 pre-encoded for this character. Supplying it
+    means the reference is not encoded again here, so a film pays the encoding cost once
+    per character instead of once per line.
 
     ``VoiceProfile.reference_text`` is passed along when it is known, so the engine does
     not have to transcribe a clip the project already has a transcript for - which is
@@ -2080,13 +2336,15 @@ def _synthesize_line_cloned(
     take = directories.takes / f"{name}.wav"
     if not _usable_audio(take):
         request: dict[str, Any] = {
-            "text": dialogue.amharic,
             "voice_reference": profile.resolve_reference_audio(),
-            "destination": take,
         }
         reference_text = (profile.reference_text or "").strip()
         if reference_text:
             request["reference_text"] = reference_text
+        if voice_prompt is not None:
+            request["voice_prompt"] = voice_prompt
+        if engine.supports_emotion:
+            request["emotion"] = _emotion_of(dialogue)
 
         # Ask for a length only when the engine can honour one: an engine that cannot
         # would either ignore the request or fail on it, and the timing stage still
@@ -2096,8 +2354,16 @@ def _synthesize_line_cloned(
             if rate is not None:
                 request["speaking_rate"] = rate
 
-        engine.synthesize(**request)
-        _require_output(take, what="take", engine=engine.name)
+        await _render_take(
+            text=dialogue.amharic,
+            take=take,
+            synthesize=lambda *, text, destination: engine.synthesize(
+                text=text, destination=destination, **request
+            ),
+            gate=gate,
+            limit=settings.tts_max_input_chars,
+            engine=engine.name,
+        )
 
     return _clip_from_take(
         index,
@@ -2111,7 +2377,7 @@ def _synthesize_line_cloned(
     )
 
 
-def _synthesize_line_designed(
+async def _synthesize_line_designed(
     index: int,
     dialogue: AdaptedDialogue,
     *,
@@ -2121,6 +2387,7 @@ def _synthesize_line_designed(
     instruct: str,
     settings: Settings,
     pacing: PacingPlan,
+    gate: "_GpuGate",
 ) -> TtsClip:
     """Speak one line in the voice ``instruct`` describes, for a speaker with no reference.
 
@@ -2133,18 +2400,24 @@ def _synthesize_line_designed(
 
     take = directories.takes / f"{name}.wav"
     if not _usable_audio(take):
-        request: dict[str, Any] = {
-            "text": dialogue.amharic,
-            "instruct": instruct,
-            "destination": take,
-        }
+        request: dict[str, Any] = {"instruct": instruct}
+        if engine.supports_emotion:
+            request["emotion"] = _emotion_of(dialogue)
         if settings.tts_request_rate and engine.supports_speaking_rate:
             rate = requested_speaking_rate(dialogue, plan=pacing)
             if rate is not None:
                 request["speaking_rate"] = rate
 
-        engine.synthesize_designed(**request)
-        _require_output(take, what="take", engine=engine.name)
+        await _render_take(
+            text=dialogue.amharic,
+            take=take,
+            synthesize=lambda *, text, destination: engine.synthesize_designed(
+                text=text, destination=destination, **request
+            ),
+            gate=gate,
+            limit=settings.tts_max_input_chars,
+            engine=engine.name,
+        )
 
     return _clip_from_take(
         index,
@@ -2215,6 +2488,8 @@ def synthesize_dialogue_detailed(
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
     tts_engine: TextToSpeechEngine | VoiceCloningEngine | None = None,
+    speaker_tokens: Mapping[str, Any] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> SynthesisResult:
     """Synthesize every dubbable line, and report the ones that could not be.
 
@@ -2235,17 +2510,25 @@ def synthesize_dialogue_detailed(
         :func:`~app.pipeline.voice_profiles.save_voice_profiles`. Only
         ``reference_audio`` and ``reference_text`` are read, and only by a cloning
         engine; a single-voice engine needs no profiles at all.
+    speaker_tokens:
+        Pre-encoded speaker prompts keyed by character, from
+        :func:`app.pipeline.voice_profiles.precompute_speaker_profiles`. They are
+        hot-swapped into the engine, so the reference is encoded once per character
+        rather than once per line.
     output_dir:
         Directory for this stage's artifacts. Defaults to ``WORK_DIR/tts``;
         ``takes`` and ``clips`` sub-directories are created below it.
     settings:
         Project settings override; defaults to :func:`app.config.get_settings`.
-        ``DEVICE`` reaches the engine from here.
+        ``DEVICE`` reaches the engine from here, and ``TTS_MAX_CONCURRENCY`` is the
+        number of requests allowed in flight.
     tts_engine:
         An engine adapter to use instead of the configured one, for a test or a
         controlled comparison. What it *is* decides how it is driven: a
         :class:`VoiceCloningEngine` is passed a speaker's reference, a
         :class:`TextToSpeechEngine` is not.
+    on_progress:
+        Receives one line per finished clip.
 
     Returns
     -------
@@ -2273,6 +2556,44 @@ def synthesize_dialogue_detailed(
         one line. A failure on a *single* line is reported in the result's
         ``skipped`` rather than raised, so one unvoiceable line cannot end a run.
     """
+
+    return _run_coroutine(
+        _synthesize_dialogue_detailed_async(
+            dialogue,
+            speech_stem,
+            voice_profiles,
+            output_dir=output_dir,
+            settings=settings,
+            tts_engine=tts_engine,
+            speaker_tokens=speaker_tokens,
+            on_progress=on_progress,
+        )
+    )
+
+
+def _run_coroutine(coroutine: Any) -> Any:
+    """Run ``coroutine`` to completion, even from inside a running event loop."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coroutine).result()
+
+
+async def _synthesize_dialogue_detailed_async(
+    dialogue: Iterable[AdaptedDialogue],
+    speech_stem: str | Path | None = None,
+    voice_profiles: Mapping[str, VoiceProfile] | None = None,
+    *,
+    output_dir: str | Path | None = None,
+    settings: Settings | None = None,
+    tts_engine: TextToSpeechEngine | VoiceCloningEngine | None = None,
+    speaker_tokens: Mapping[str, Any] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> SynthesisResult:
 
     lines = _validate_dialogue(dialogue)
     if not lines:
@@ -2373,7 +2694,10 @@ def synthesize_dialogue_detailed(
         )
 
     if cloning_engine is not None:
-        artifact_model = f"{cloning_engine.name}:{cloning_engine.model}"
+        artifact_model = (
+            f"{cloning_engine.name}:"
+            f"{getattr(cloning_engine, 'model', type(cloning_engine).__name__)}"
+        )
     else:
         artifact_model = f"{engine.name}:{resolved.tts_model}"
 
@@ -2387,9 +2711,12 @@ def synthesize_dialogue_detailed(
     )
     directories.create()
 
-    clips: list[TtsClip] = []
-    skipped: list[SkippedLine] = []
+    tokens = dict(speaker_tokens or {})
+    gate = _GpuGate(resolved.tts_max_concurrency)
+
     short_windows: list[int] = []
+    work: list[int] = []
+    skipped: list[SkippedLine] = []
     for index, line in enumerate(lines):
         reason = _skip_reason(line)
         if reason is not None:
@@ -2404,45 +2731,50 @@ def synthesize_dialogue_detailed(
                 )
             )
             continue
-
         if line.duration < min_line_seconds:
             short_windows.append(index)
+        work.append(index)
 
+    if on_progress is not None:
+        on_progress(
+            f"  synthesis: {len(work)} line(s) through {gate.concurrency} concurrent "
+            f"worker(s), {len(tokens)} pre-encoded speaker prompt(s)"
+        )
+
+    completed = 0
+
+    async def one(index: int) -> TtsClip:
+        nonlocal completed
+        line = lines[index]
         try:
             if engine is not None:
-                clips.append(
-                    _synthesize_line_single_voice(
-                        index,
-                        line,
-                        name=_line_artifact_name(line, model=artifact_model),
-                        directories=directories,
-                        engine=engine,
-                        settings=resolved,
-                    )
+                clip = await _synthesize_line_single_voice(
+                    index,
+                    line,
+                    name=_line_artifact_name(line, model=artifact_model),
+                    directories=directories,
+                    engine=engine,
+                    settings=resolved,
+                    gate=gate,
                 )
-                continue
-
-            if line.speaker_id in designed:
-                clips.append(
-                    _synthesize_line_designed(
-                        index,
+            elif line.speaker_id in designed:
+                clip = await _synthesize_line_designed(
+                    index,
+                    line,
+                    name=_line_artifact_name(
                         line,
-                        name=_line_artifact_name(
-                            line,
-                            model=artifact_model,
-                            voice_identity=voice_identities[line.speaker_id],
-                        ),
-                        directories=directories,
-                        engine=cloning_engine,
-                        instruct=designed[line.speaker_id],
-                        settings=resolved,
-                        pacing=pacing,
-                    )
+                        model=artifact_model,
+                        voice_identity=voice_identities[line.speaker_id],
+                    ),
+                    directories=directories,
+                    engine=cloning_engine,
+                    instruct=designed[line.speaker_id],
+                    settings=resolved,
+                    pacing=pacing,
+                    gate=gate,
                 )
-                continue
-
-            clips.append(
-                _synthesize_line_cloned(
+            else:
+                clip = await _synthesize_line_cloned(
                     index,
                     line,
                     name=_line_artifact_name(
@@ -2455,8 +2787,9 @@ def synthesize_dialogue_detailed(
                     profile=profiles[line.speaker_id],
                     settings=resolved,
                     pacing=pacing,
+                    gate=gate,
+                    voice_prompt=tokens.get(line.speaker_id),
                 )
-            )
         except TtsError as exc:
             if not continue_on_failure:
                 # The line is identified so the failure can be found and the input
@@ -2476,6 +2809,30 @@ def synthesize_dialogue_detailed(
                     reason=f"{FAILURE_REASON_PREFIX}: {type(exc).__name__}: {exc}",
                 )
             )
+            return None  # type: ignore[return-value]
+
+        completed += 1
+        if on_progress is not None:
+            on_progress(
+                f"  synthesis: {completed}/{len(work)} line(s) done "
+                f"(line {index}, {line.speaker_id})"
+            )
+        return clip
+
+    tasks = [asyncio.create_task(one(index)) for index in work]
+    clips: list[TtsClip] = []
+    try:
+        for finished in asyncio.as_completed(tasks):
+            clip = await finished
+            if clip is not None:
+                clips.append(clip)
+    except BaseException:
+        # One unvoiceable line must not leave the rest of the film competing for the
+        # GPU while the run is already ending: cancel what is still queued.
+        for task in tasks:
+            task.cancel()
+        raise
+    clips.sort(key=lambda clip: clip.index)
 
     notes: list[str] = []
     if short_windows:
@@ -2501,7 +2858,7 @@ def synthesize_dialogue_detailed(
 
     return SynthesisResult(
         clips=tuple(clips),
-        skipped=tuple(skipped),
+        skipped=tuple(sorted(skipped, key=lambda line: line.index)),
         pacing=pacing,
         notes=tuple(notes),
         designed=tuple(
@@ -2518,6 +2875,8 @@ def synthesize_dialogue(
     *,
     settings: Settings | None = None,
     output_dir: str | Path | None = None,
+    speaker_tokens: Mapping[str, Any] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> list[TtsClip]:
     """Synthesize every dubbable line and return the clips.
 
@@ -2539,17 +2898,23 @@ def synthesize_dialogue(
             voice_profiles,
             settings=settings,
             output_dir=output_dir,
+            speaker_tokens=speaker_tokens,
+            on_progress=on_progress,
         ).clips
     )
 
 
 __all__ = [
     "CLIP_CEILING",
+    "EMOTION_STYLE_INSTRUCT",
     "MINIMUM_REPORTABLE_LINE_SECONDS",
     "MINIMUM_SPEAKABLE_SYLLABLES",
     "PerformanceControls",
     "SYNTHESIS_RECIPE_VERSION",
     "TTS_DIRECTORY_NAME",
+    "emotion_style",
+    "split_for_synthesis",
+    "with_emotion",
     "ConfigurationError",
     "EngineLoadError",
     "InvalidAudioError",
