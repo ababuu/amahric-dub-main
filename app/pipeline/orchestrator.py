@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings, get_settings
+from app.models import gpu_free_gib, release_gpu_memory
 from app.pipeline import (
     dialogue_context,
     diarization,
@@ -363,19 +364,52 @@ def _stage(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Run one stage, timing it and naming it when it fails."""
+    """Run one stage, timing it and naming it when it fails.
+
+    A driver-level CUDA out-of-memory failure is reported with the numbers that explain
+    it. That error is almost never "the card is too small": it is the vLLM server
+    holding its reservation, or a previous stage's weights still mapped, and a bare
+    ``CUDA failed with error out of memory`` sends someone looking in the wrong place.
+    """
 
     progress(f"  -> {name}")
     started = time.perf_counter()
     try:
         result = work(*args, **kwargs)
     except Exception as exc:
-        raise StageError(
-            f"the {name} stage failed with {type(exc).__name__}: {exc}"
-        ) from exc
+        message = f"the {name} stage failed with {type(exc).__name__}: {exc}"
+        if "out of memory" in str(exc).lower():
+            message += _out_of_memory_hint()
+        raise StageError(message) from exc
     finally:
         seconds[name] = time.perf_counter() - started
     return result
+
+
+def _out_of_memory_hint() -> str:
+    """Return the actionable half of a CUDA out-of-memory message."""
+
+    memory = gpu_free_gib()
+    measured = (
+        ""
+        if memory is None
+        else f" Only {memory[0]:.1f} GiB of {memory[1]:.1f} GiB was free on the GPU."
+    )
+    return (
+        f"{measured} The vLLM server reserves TRANSLATION_GPU_MEMORY_UTILIZATION of the "
+        "whole card for the entire run, and this pipeline also loads the separator, "
+        "diarizer, transcriber and speech engine on the same GPU. Lower that fraction "
+        "(and TRANSLATION_MAX_CONCURRENCY with it) and restart the server; on a 48 GiB "
+        "card, 0.72 with a 14B checkpoint leaves ~12 GiB for the rest of the pipeline."
+    )
+
+
+def _free_gpu_memory(stage: str, report: Callable[[str], None]) -> None:
+    """Return a finished stage's unreferenced VRAM to the driver."""
+
+    released = release_gpu_memory()
+    if released >= 256.0:
+        report(f"  gpu: released {released / 1024.0:.1f} GiB after {stage}")
 
 
 def _segment_dict(segment: Any) -> dict[str, Any]:
@@ -545,6 +579,11 @@ def run_pipeline(
         on_progress=report,
     )
 
+    # The separator's weights are useless once the stems exist, and the diarizer needs
+    # the card next. Releasing here is what keeps each stage's peak separate instead of
+    # accumulating every model the run has ever loaded.
+    _free_gpu_memory("separation", report)
+
     diarized = _stage(
         "diarization",
         seconds,
@@ -578,6 +617,8 @@ def run_pipeline(
             f"{diarized.crosstalk_seconds:.2f}s of simultaneous speech"
         )
 
+    _free_gpu_memory("diarization", report)
+
     lines = tuple(
         _stage(
             "transcription",
@@ -591,6 +632,9 @@ def run_pipeline(
     )
     if not lines:
         raise EmptyStageError("transcription produced no lines; nothing to adapt")
+
+    # Whisper is done with the card now; speech synthesis is many stages away.
+    _free_gpu_memory("transcription", report)
 
     # The screenplay is the only ground truth for *who* is speaking and for the
     # complete sentence a fragment belongs to. It is applied before sentences are

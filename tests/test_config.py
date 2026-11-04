@@ -105,11 +105,14 @@ def test_the_local_llm_defaults_are_a_loopback_vllm_server(_clean_env: None) -> 
         settings.translation_window_overlap < settings.translation_window_lines
     )
     assert settings.translation_max_concurrency == DEFAULT_TRANSLATION_MAX_CONCURRENCY
+    # The card is shared with the rest of the pipeline, so the server must not claim
+    # almost all of it: at 0.90 on a 48 GiB A40, transcription could not load at all.
     assert (
         settings.translation_gpu_memory_utilization
         == DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION
-        == 0.90
+        == 0.72
     )
+    assert settings.translation_gpu_memory_utilization < 0.80
 
 
 def test_the_server_arguments_match_the_client_settings(_clean_env: None) -> None:

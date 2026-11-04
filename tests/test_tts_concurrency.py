@@ -196,7 +196,7 @@ def test_a_line_without_punctuation_is_split_at_spaces() -> None:
     pieces = split_for_synthesis("word " * 40, 24)
 
     assert all(len(piece) <= 24 for piece in pieces)
-    assert all(" " not in piece.strip(" ") or True for piece in pieces)
+    assert len(pieces) > 1
 
 
 def test_a_single_long_word_is_cut() -> None:

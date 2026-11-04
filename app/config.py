@@ -168,11 +168,27 @@ DEFAULT_TRANSLATION_WINDOW_OVERLAP = 5
 #: How many windows may be in flight at once. This is the client-side half of the
 #: VRAM throttle: the server pre-allocates its cache (``--gpu-memory-utilization``),
 #: and this bounds how much request state can land on it at the same moment.
-DEFAULT_TRANSLATION_MAX_CONCURRENCY = 8
+#:
+#: Four rather than eight because the same GPU also runs the separator, diarizer,
+#: transcriber and speech engine. Every concurrent window needs its own KV cache, and
+#: on a 48 GiB card a 14B checkpoint at 0.72 utilization leaves room for about four
+#: windows of a 24-line payload - asking for eight is what turns into
+#: "No available memory for the cache blocks" at server start.
+DEFAULT_TRANSLATION_MAX_CONCURRENCY = 4
 
 #: Fraction of VRAM the vLLM server may pre-allocate. Handed to the server launcher
 #: as ``--gpu-memory-utilization``; it is never sent with a chat request.
-DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION = 0.90
+#:
+#: 0.72, not 0.90, because this is a *shared* card. vLLM reserves its fraction for the
+#: entire run, while the pipeline still has to load faster-whisper large-v3 (~3 GiB),
+#: BS-Roformer (~3 GiB), pyannote (~2 GiB) and OmniVoice (~6 GiB) beside it. At 0.90 on
+#: a 48 GiB A40 that left under 2 GiB free and transcription died with
+#: ``CUDA failed with error out of memory`` before it could load a single weight. At
+#: 0.72 the 14B checkpoint still fits with a usable KV cache, and the rest of the
+#: pipeline has roughly 13 GiB to work in.
+#:
+#: Raise it only on a card that is dedicated to the model server.
+DEFAULT_TRANSLATION_GPU_MEMORY_UTILIZATION = 0.72
 
 #: Sampling temperature for adaptation. Zero keeps the same film producing the same
 #: Amharic twice, which is what makes two runs comparable.

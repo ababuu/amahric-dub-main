@@ -90,16 +90,88 @@ def load_omnivoice_network(
     return network
 
 
-def reset_model_cache() -> None:
-    """Drop every cached network. Used by tests and by a device/model switch."""
-
-    _OMNIVOICE_NETWORKS.clear()
-
-
 def cached_models() -> tuple[tuple[str, str, str], ...]:
     """Return the keys of the models currently cached, for diagnostics."""
 
     return tuple(sorted(_OMNIVOICE_NETWORKS))
 
 
-__all__ = ["cached_models", "load_omnivoice_network", "reset_model_cache"]
+def reset_model_cache() -> None:
+    """Drop every cached network. Used by tests and by a device/model switch."""
+
+    _OMNIVOICE_NETWORKS.clear()
+
+
+def release_gpu_memory() -> float:
+    """Return unreferenced GPU memory to the driver, and report how much, in MiB.
+
+    Every stage here loads a model into VRAM and mostly does not need it afterwards: the
+    separator's weights are useless once the stems exist, pyannote's once the turns do,
+    whisper's once the transcript does. Their *objects* are dropped when the stage
+    returns, but PyTorch's caching allocator keeps the segments mapped so the next
+    allocation is cheap - which is exactly wrong on a card that also hosts the vLLM
+    server. `empty_cache` is what turns those segments back into memory the driver can
+    hand to another allocator (CTranslate2, for instance, does not use PyTorch's).
+
+    Cached models in this module are deliberately *kept*: OmniVoice is loaded by the
+    voice-profile stage and needed again by synthesis, and reloading it would cost far
+    more than the memory it frees.
+
+    Returns
+    -------
+    float
+        MiB actually released, or ``0.0`` when there is no CUDA runtime or nothing was
+        cached. Never raises: a failed cache flush must not end a run.
+    """
+
+    import gc
+
+    gc.collect()
+
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - no torch installed
+        return 0.0
+    if not torch.cuda.is_available():  # pragma: no cover - CPU-only machine
+        return 0.0
+
+    try:
+        before = float(torch.cuda.memory_reserved())
+        torch.cuda.empty_cache()
+        ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+        if ipc_collect is not None:
+            ipc_collect()
+        after = float(torch.cuda.memory_reserved())
+    except Exception:  # noqa: BLE001 - a diagnostics call must never break a run
+        return 0.0
+    return max(0.0, (before - after) / (1024.0 * 1024.0))
+
+
+def gpu_free_gib() -> tuple[float, float] | None:
+    """Return ``(free, total)`` GPU memory in GiB, or ``None`` without CUDA.
+
+    This is the number that decides whether the next model can be loaded at all, so a
+    failure is reported with it rather than leaving someone to guess.
+    """
+
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - no torch installed
+        return None
+    if not torch.cuda.is_available():  # pragma: no cover - CPU-only machine
+        return None
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception:  # noqa: BLE001 - a diagnostics call must never break a run
+        return None
+    gib = 1024.0 * 1024.0 * 1024.0
+    return free / gib, total / gib
+
+
+__all__ = [
+    "cached_models",
+    "gpu_free_gib",
+    "load_omnivoice_network",
+    "release_gpu_memory",
+    "reset_model_cache",
+]
