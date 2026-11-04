@@ -33,9 +33,33 @@ from app.config import Settings, get_settings  # noqa: E402
 
 
 def build_command(settings: Settings) -> list[str]:
-    """Return the argv that starts the server for ``settings``."""
+    """Return the argv that starts the server for ``settings``, or ``[]`` if vLLM is absent.
 
-    return ["vllm", "serve", *settings.vllm_server_arguments()]
+    Three launch paths, in order:
+
+    * the ``vllm`` console script, which is what ``pip install vllm`` normally puts on
+      ``PATH``;
+    * the module form, for an install whose script directory is not on ``PATH`` (a
+      ``--user`` install, or a venv whose ``bin`` was not activated) - the same server,
+      reached through the interpreter that has the package;
+    * nothing, which the caller reports with install instructions.
+
+    The module form deliberately uses ``vllm.entrypoints.openai.api_server`` rather
+    than ``vllm serve``: it is the entry point that has existed across every released
+    version, and every argument this launcher passes is a flag rather than a positional
+    subcommand.
+    """
+
+    arguments = settings.vllm_server_arguments()
+    executable = shutil.which("vllm")
+    if executable:
+        return [executable, "serve", *arguments]
+
+    try:
+        import vllm  # noqa: F401
+    except ImportError:
+        return []
+    return [sys.executable, "-m", "vllm.entrypoints.openai.api_server", *arguments]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,14 +79,22 @@ def main(argv: list[str] | None = None) -> int:
     command = build_command(settings)
 
     if args.print_only:
-        print(" ".join(command))
+        print(
+            " ".join(command)
+            if command
+            else "vllm serve " + " ".join(settings.vllm_server_arguments())
+        )
         return 0
 
-    if shutil.which("vllm") is None:
+    if not command:
         print(
-            "vllm is not on PATH. Install the server in the GPU environment:\n"
+            "vLLM is not installed in this environment.\n"
+            "If pip stopped with `uninstall-no-record-file` for PyJWT, the copy on this\n"
+            "image was installed by apt and has no pip metadata. Install a pip-managed\n"
+            "copy over it, then retry:\n"
+            "    pip install --ignore-installed PyJWT\n"
             "    pip install vllm\n"
-            "then re-run this launcher.",
+            "then: python scripts/serve_vllm.py",
             file=sys.stderr,
         )
         return 1
