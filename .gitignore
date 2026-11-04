@@ -33,6 +33,10 @@ data/input/*
 !data/input/.gitkeep
 # Test videos are inputs the GPU runner needs, not generated artifacts.
 !data/input/*.mp4
+# The flat .txt screenplay is an input too: it is the ground truth for character
+# names and for the sentences the transcript is aligned to, so a run without it
+# degrades to SPEAKER_XX labels. Kept small enough to commit.
+!data/input/*.txt
 
 data/working/*
 !data/working/.gitkeep
